@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AT&amp;T Fiber service problem evidence: 24 hours to 2026-10-05 09:00 CDT</title>
+<style>
+@page {
+  size: Letter;
+  margin: 0.5in 0.55in 0.6in 0.55in;
+  @bottom-left { content: "AT\000026T\000020Fiber\000020service\000020problem\000020evidence\00002c\0000202026\00002d10\00002d04\00002014\00003a00\000020to\0000202026\00002d10\00002d05\00002014\00003a00\000020UTC\00002c\000020Jordan\000020Example"; font: 7pt "Segoe UI", system-ui, Arial, sans-serif; color: #6b6a65; vertical-align: top; padding-top: 8pt; }
+  @bottom-right { content: "Page " counter(page) " of " counter(pages); font: 7pt "Segoe UI", system-ui, Arial, sans-serif; color: #6b6a65; vertical-align: top; padding-top: 8pt; }
+}
+:root {
+  color-scheme: light;
+  --ink: #0b0b0b; --ink2: #52514e; --muted: #6b6a65;
+  --rule: #d9d8d2; --grid: #e1e0d9; --axis: #c3c2b7; --wash: #f2f1ed; --present: #a9a89f; --outage: #e6e3dc;
+  --series: #2a78d6; --critical: #d03b3b; --warning: #fab219;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: #ffffff; color: var(--ink); }
+body { font: 9.2pt/1.34 "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+.sheet { width: 100%; }
+.sheet + .sheet { break-before: page; }
+.sheet + .sheet.flow { break-before: auto; margin-top: 14pt; border-top: 0.75pt solid var(--rule); }
+#details { font-size: 8.5pt; }
+#details h2 { font-size: 10.5pt; margin: 9pt 0 3pt; }
+#details h2:first-child { margin-top: 0; }
+@media screen {
+  body { background: #e9e8e3; padding: 16px 0; }
+  .sheet { background: #ffffff; width: 8.5in; max-width: 100%; margin: 0 auto 16px; padding: 0.5in 0.55in; box-shadow: 0 1px 3px rgba(0,0,0,.14); }
+}
+h1 { font-size: 15pt; line-height: 1.2; margin: 0 0 3pt; letter-spacing: -0.005em; }
+h2 { font-size: 11pt; margin: 9pt 0 3pt; padding-bottom: 2pt; border-bottom: 0.75pt solid var(--rule); break-after: avoid; }
+h3 { font-size: 9.5pt; margin: 8pt 0 3pt; break-after: avoid; }
+p { margin: 0 0 5pt; }
+.meta { color: var(--ink2); font-size: 8.5pt; margin: 0 0 7pt; }
+.meta b { color: var(--ink); font-weight: 600; }
+.nw { white-space: nowrap; }
+.ba { word-break: break-all; }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; vertical-align: top; }
+td { overflow-wrap: anywhere; }
+tr { break-inside: avoid; }
+table + table, table + p + table { margin-top: 6pt; }
+caption { caption-side: top; text-align: left; font-weight: 600; font-size: 8pt; color: var(--ink2); padding: 0 0 2pt; }
+.customer { table-layout: fixed; border-collapse: separate; border-spacing: 0; border: 0.75pt solid var(--rule); border-radius: 3pt; padding: 0 8pt 7pt; margin: 0 0 4pt; }
+.customer col.cl { width: 17%; }
+.customer col.cv { width: 33%; }
+.customer th { font-weight: 600; font-size: 8pt; color: var(--ink2); padding: 5pt 6pt 0 0; white-space: nowrap; vertical-align: baseline; }
+.customer td { padding: 5pt 10pt 0 0; font-size: 9.5pt; vertical-align: baseline; }
+.fill { display: inline-block; width: 100%; height: 2em; border-bottom: 0.75pt solid var(--ink2); }
+ol.summary { margin: 0; padding-left: 15pt; }
+ol.summary li { margin: 0 0 4pt; padding-left: 2pt; }
+ol.summary li strong, .action strong { font-weight: 650; }
+.action { border-left: 2.5pt solid var(--ink); padding: 2pt 0 2pt 8pt; margin: 2pt 0 4pt; }
+.brief { margin-top: 8pt; font-size: 8pt; color: var(--ink2); border-top: 0.75pt solid var(--rule); padding-top: 4pt; }
+.brief th { font-weight: 600; padding: 1pt 8pt 1pt 0; white-space: nowrap; width: 1%; }
+.brief td { padding: 1pt 0; }
+.st { font-weight: 600; margin-left: 1pt; }
+.footnote { font-size: 7.5pt; color: var(--muted); margin: 3pt 0 0; }
+.mono { font-family: Consolas, "Cascadia Mono", "Courier New", monospace; font-size: 7.6pt; }
+table.kv th { font-weight: 600; color: var(--ink2); font-size: 7.6pt; width: 30%; padding: 1.4pt 8pt 1.4pt 0; border-bottom: 0.5pt solid var(--grid); }
+table.kv td { font-size: 7.9pt; padding: 1.4pt 6pt 1.4pt 0; border-bottom: 0.5pt solid var(--grid); }
+table.kv2 th { width: 17%; }
+table.kv2 td { width: 33%; }
+table.data { font-size: 7.6pt; }
+table.data.compact td { padding-top: 0.5pt; padding-bottom: 0.5pt; line-height: 1.22; }
+table.data th { font-weight: 600; color: var(--ink2); border-bottom: 0.75pt solid var(--axis); padding: 2pt 5pt 2pt 0; white-space: nowrap; }
+table.data td { border-bottom: 0.5pt solid var(--grid); padding: 1.4pt 5pt 1.4pt 0; }
+table.data tbody.grp { break-inside: avoid; }
+table.events { table-layout: fixed; }
+table.events col.when { width: 27%; }
+table.events col.what { width: 17%; }
+table.events col.ref { width: 10%; }
+table.data tbody.grp td.when { border-bottom: 0.5pt solid var(--axis); }
+td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+td.path { font-family: Consolas, "Cascadia Mono", "Courier New", monospace; font-size: 7.6pt; }
+.muted { color: var(--muted); }
+.small { font-size: 8pt; }
+.flag { white-space: nowrap; }
+.flag.on::before { content: ""; display: inline-block; width: 6pt; height: 6pt; margin-right: 3pt; vertical-align: -0.5pt; border-radius: 1pt; }
+.flag.on.alarm::before { background: var(--critical); }
+.flag.on.warning::before { background: var(--warning); }
+.flag.on { font-weight: 600; }
+figure { margin: 4pt 0 6pt; break-inside: avoid; }
+figcaption { font-size: 8pt; color: var(--ink2); margin-top: 2pt; }
+svg.chart { display: block; width: 100%; height: auto; }
+svg.chart text { font-family: "Segoe UI", system-ui, Arial, sans-serif; font-size: 10px; fill: var(--ink2); }
+svg.chart .grid { stroke: var(--grid); stroke-width: 1; }
+svg.chart .axis { stroke: var(--axis); stroke-width: 1; }
+svg.chart text.tick { fill: var(--muted); font-variant-numeric: tabular-nums; }
+svg.chart text.date, svg.chart text.unit { fill: var(--muted); }
+svg.chart .series { fill: none; stroke: var(--series); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+svg.chart .spread { fill: var(--series); fill-opacity: 0.12; stroke: none; }
+svg.chart .dot, svg.chart .marker { fill: var(--series); stroke: #ffffff; stroke-width: 2; }
+svg.chart .ref { fill: none; stroke-width: 1.5; }
+svg.chart .ref.alarm { stroke: var(--critical); stroke-dasharray: 8 4; }
+svg.chart .ref.warning { stroke: var(--warning); stroke-dasharray: 0.1 4; stroke-width: 2.5; stroke-linecap: round; }
+svg.chart .outage { fill: var(--outage); }
+svg.chart .lblbg { fill: #ffffff; fill-opacity: 0.9; }
+svg.chart text.lbl { fill: var(--ink); }
+svg.chart .stripbg { fill: var(--wash); }
+svg.chart .present { fill: var(--present); }
+svg.chart .flagseg.alarm { fill: var(--critical); }
+svg.chart .flagseg.warning { fill: var(--warning); }
+svg.chart .flagseg.nolight { fill: var(--ink); }
+svg.chart .zoom { fill: none; stroke: var(--ink); stroke-width: 1; }
+svg.chart text.striplabel { fill: var(--ink2); }
+svg.chart text.empty { fill: var(--muted); font-style: italic; }
+.code { display: block; font-family: Consolas, "Cascadia Mono", "Courier New", monospace; font-size: 7.4pt; background: var(--wash); padding: 2pt 4pt; margin: 1pt 0 3pt; white-space: normal; }
+.code .arg { display: inline-block; max-width: 100%; word-break: break-all; }
+ol.verify { padding-left: 14pt; margin: 2pt 0; font-size: 8.5pt; }
+ol.verify li { margin-bottom: 3pt; break-inside: avoid; }
+ul.notes { padding-left: 14pt; margin: 2pt 0; font-size: 8pt; color: var(--ink2); }
+</style>
+</head>
+<body>
+<main>
+<section class="sheet" id="ticket">
+<h1>AT&amp;T Fiber service problem evidence: 24 hours to 2026-10-05 09:00 CDT</h1>
+<p class="meta">Window: <b><span class="nw">2026-10-04 09:00:00 CDT</span> to <span class="nw">2026-10-05 09:00:00 CDT</span></b> (<span class="nw">2026-10-04 14:00:00 UTC</span> to <span class="nw">2026-10-05 14:00:00 UTC</span>)<br>Generated <span class="nw">2026-10-05 09:00:00 CDT</span> (<span class="nw">14:00:00 UTC</span>) by <span class="nw">att-monitor</span> test</p>
+
+<table class="customer" aria-label="Customer">
+<colgroup><col class="cl"><col class="cv"><col class="cl"><col class="cv"></colgroup>
+<tr><th scope="row">Customer name</th><td>Jordan Example</td><th scope="row">AT&amp;T account number</th><td><span class="fill"></span></td></tr>
+<tr><th scope="row">Service address</th><td>123 Example St, Springfield</td><th scope="row">Contact phone</th><td><span class="fill"></span></td></tr>
+<tr><th scope="row">Best time to reach</th><td><span class="fill"></span></td><th scope="row">Notes / ticket number</th><td><span class="fill"></span></td></tr>
+</table>
+
+<h2>Summary for AT&amp;T</h2>
+<ol class="summary">
+<li><strong>The gateway&#39;s own <span class="nw">low-Rx</span> optical ALARM is active.</strong> AT&amp;T&#39;s gateway reported an optical receive (Rx) power between -31.5 and <span class="nw">-30.9 dBm</span> in 76 readings from <span class="nw">2026-10-04 22:10 CDT</span> (<span class="nw">2026-10-05 03:10 UTC</span>) to <span class="nw">2026-10-05 08:59 CDT</span> (<span class="nw">13:59 UTC</span>); the latest, <span class="nw">-31.3 dBm</span>, is snapshot #536. The first is the <span class="nw">setup-time</span> capture, made before monitoring began. Its own <span class="nw">low-Rx</span> ALARM threshold is <span class="nw">-29.5 dBm</span> and its WARNING threshold is <span class="nw">-29.2 dBm</span>: the ALARM flag was set in 76 of 76 readings (100%) and the WARNING flag in 76 of 76 (100%). Every reading was below both thresholds.</li>
+<li><strong>Fiber link state change without a gateway restart.</strong> The gateway&#39;s fiber status page dates the optical link&#39;s last state change &#34;Last Change&#34; = 1791151188 (first seen <span class="nw">2026-10-05 03:10:46 UTC</span>, the <span class="nw">setup-time</span> capture, bootstrap_import #1): <span class="nw">2026-10-04 21:59:48 UTC</span> if the gateway counts in UTC, or <span class="nw">2026-10-05 02:59:48 UTC</span> if in its local time (<span class="nw">UTC-05:00</span> per its own clock); the gateway does not say which; either way it lies inside this window. The value stayed the same in the 75 readings after it. The gateway did not restart: its uptime (snapshot #536) puts its last boot at <span class="nw">2026-10-01 22:52:37 UTC</span>, before this window, so the link changed state while the gateway kept running.</li>
+<li><strong>No outage during monitoring.</strong> No Internet outage was measured during the <span class="nw">1.2 h</span> of monitoring in this window (all 446 measurement cycles ONLINE). Monitoring covered only <span class="nw">1.2 h</span> of the <span class="nw">24 h</span> window (see Monitoring coverage).</li>
+<li><strong>The home network was healthy.</strong> This computer reached the gateway in 446 of 446 pings (0 lost), median <span class="nw">round-trip</span> <span class="nw">2.5 ms</span>; <span class="nw">Wi-Fi</span> <span class="nw">5 GHz</span>, 802.11ax, channel 149, signal <span class="nw">82-84%</span> (8 link readings, latest local_link #506); every route check (8) sent the monitored Internet destinations through the AT&amp;T gateway (no VPN or second network). The optical receive level is measured by the gateway on the fiber from AT&amp;T&#39;s network, which the home network cannot affect.</li>
+</ol>
+
+<h2>Requested action</h2>
+<div class="action"><p><strong>Please dispatch a technician to check the fiber connection.</strong> The gateway reports a received optical level below its own <span class="nw">low-Rx</span> threshold. Please measure the optical light level at the gateway&#39;s fiber port and at the fiber terminal / NID, and clean or repair the fiber connection, jumper or drop as needed until the gateway&#39;s <span class="nw">low-Rx</span> alarm clears. The fiber link also changed state without a gateway restart (see the summary). Gateway: NOKIA <span class="nw">BGW320-505</span>, serial number N00SERIAL00000, firmware 6.34.7 (from snapshot #536). AT&amp;T should be able to confirm the low receive level and the link events in its own telemetry for this device.</p></div>
+
+<h2>Monitoring coverage</h2>
+<p>Continuous monitoring (<span class="nw">10 s</span> cycles) covered <span class="nw">1.2 h</span> of this <span class="nw">24 h</span> window (5.15%), from <span class="nw">2026-10-05 07:45:47 CDT</span> (<span class="nw">12:45:47 UTC</span>) to <span class="nw">2026-10-05 08:59:57 CDT</span> (<span class="nw">13:59:57 UTC</span>), without gaps. Before <span class="nw">2026-10-05 07:45 CDT</span> (<span class="nw">12:45 UTC</span>): the evidence ledger was created only at <span class="nw">2026-10-05 12:45:47 UTC</span> (genesis #0), so the monitor was not installed before then. For the time without monitoring the evidence is the gateway&#39;s own record: its uptime (no restart since <span class="nw">2026-10-01 22:52:37 UTC</span>), its fiber Last Change value and the <span class="nw">setup-time</span> capture of <span class="nw">2026-10-05 03:10:46 UTC</span> (bootstrap_import #1).</p>
+<table class="brief">
+<tr><th scope="row">Evidence bundle<span class="st">*</span></th><td class="mono"><span class="ba">att-evidence_20261004T140000Z_20261005T140000Z_6961b23f.zip</span></td></tr>
+<tr><th scope="row">Bundle SHA-256<span class="st">*</span></th><td class="mono">1e6ed65d77d6364eeaed5a745ba5c4985ae2b700dd85d7cf7f027bdf294a33fc</td></tr>
+<tr><th scope="row">Ledger signing key</th><td class="mono">ae21 6c2e f524 7a37 82c1 35ef a279 a3e4 cdc6 1094 270f 5d2b e58c 6204 b7a6 12c9</td></tr>
+<tr><th scope="row">Verification<span class="st">*</span></th><td>OK: 512 records, 0 failures, 4 <span class="nw">time-stamps</span> <span class="nw">chain-verified</span> (<span class="nw">att-monitor</span> <span class="nw">verify-bundle</span>)</td></tr>
+</table>
+<p class="footnote">* Stated by att-monitor test when it generated this report; every other figure is computed from the signed ledger records it names (in the evidence bundle).</p>
+</section>
+
+<section class="sheet" id="details">
+<h2>Gateway</h2>
+<table class="kv kv2">
+<tr><th scope="row">Model</th><td>NOKIA <span class="nw">BGW320-505</span></td><th scope="row">Serial number</th><td>N00SERIAL00000</td></tr>
+<tr><th scope="row">Firmware</th><td>6.34.7</td><th scope="row">Hardware version</th><td>02001E0046004F</td></tr>
+<tr><th scope="row">Uptime</th><td><span class="nw">3 d 15 h</span>, last boot about <span class="nw">2026-10-01 17:52:37 CDT</span> (<span class="nw">22:52:37 UTC</span>)</td><th scope="row">Broadband connection</th><td>Up (Lightspeed)</td></tr>
+<tr><th scope="row">PON link status</th><td>OPERATION (O5), UNI up</td><th scope="row">Optical WAN status</th><td>Up, link state Up</td></tr>
+<tr><th scope="row">Optical power (Rx / Tx)</th><td><span class="nw">-31.3 dBm</span> / <span class="nw">4.8 dBm</span></td><th scope="row">Fiber state flags</th><td>Rx LOS State 1 · OPT LOS 0 · Tx Fault State 0</td></tr>
+<tr><th scope="row">Fiber Last Change (raw)</th><td>1791151188</td><th scope="row">Fiber module (SFP)</th><td>HUMAX Networks, <span class="nw">HNXGSPP-MAAMC</span>, <span class="nw">1270 nm</span></td></tr>
+<tr><th scope="row">Module temperature</th><td><span class="nw">34 °C</span></td><th scope="row">WAN IPv4 address</th><td>203.0.113.20</td></tr>
+<tr><th scope="row">AT&amp;T next hop</th><td>203.0.113.1</td><th scope="row">DNS servers</th><td>68.94.156.9, 68.94.157.9</td></tr>
+<tr><th scope="row">Source</th><td>snapshot #536 (<span class="nw">2026-10-05 13:59:59 UTC</span>)</td></tr>
+</table>
+
+<h2>Optical receive power</h2>
+<figure>
+<svg class="chart" viewBox="0 0 720 300" role="img" aria-labelledby="chart-title chart-desc">
+<title id="chart-title">Optical receive (Rx) power reported by the AT&amp;T gateway</title>
+<desc id="chart-desc">75 Rx power readings from the gateway&#39;s fiber diagnostics between 2026-10-05 07:45:57 CDT and 2026-10-05 08:59:57 CDT, from -31.5 to -30.9 dBm. Gateway low-Rx alarm threshold -29.5 dBm. Gateway low-Rx warning threshold -29.2 dBm. ALARM flag set in 75 and WARNING flag set in 75 of 75 readings. The plot shows 2026-10-05 07:42:59 CDT to 2026-10-05 09:00:00 CDT, the part of the window with readings; a bar above it shows the whole window.</desc>
+<text class="tick" x="96.0" y="11.0" text-anchor="middle">Oct 4, 09:00</text>
+<text class="tick" x="160.8" y="11.0" text-anchor="middle">12:00</text>
+<text class="tick" x="225.5" y="11.0" text-anchor="middle">15:00</text>
+<text class="tick" x="290.2" y="11.0" text-anchor="middle">18:00</text>
+<text class="tick" x="355.0" y="11.0" text-anchor="middle">21:00</text>
+<text class="tick" x="419.8" y="11.0" text-anchor="middle">Oct 5, 00:00</text>
+<text class="tick" x="484.5" y="11.0" text-anchor="middle">03:00</text>
+<text class="tick" x="549.2" y="11.0" text-anchor="middle">06:00</text>
+<text class="tick" x="614.0" y="11.0" text-anchor="middle">09:00</text>
+<rect class="stripbg" x="96.0" y="16.0" width="518.0" height="10.0"></rect>
+<rect class="present" x="586.4" y="16.0" width="27.6" height="10.0"><title>Gateway readings: 75 readings, 2026-10-05 07:45:57 CDT to 2026-10-05 08:59:57 CDT</title></rect>
+<rect class="zoom" x="584.8" y="13.5" width="30.7" height="15.0"></rect>
+<path class="marker" d="M380.5,16.0 L385.5,21.0 L380.5,26.0 L375.5,21.0 Z"><title>Setup-time capture 2026-10-04 22:10:46 CDT: Rx -31.5 dBm with the gateway&#39;s low-Rx ALARM and WARNING flags set (bootstrap_import #1, initial-snapshot/fiberstat.anon.html)</title></path><rect class="lblbg" x="386.5" y="29.0" width="76.8" height="12.5"></rect><text class="lbl" x="388.5" y="38.0" text-anchor="start">setup capture</text>
+<text class="striplabel" x="88.0" y="25.0" text-anchor="end">Whole window</text>
+<rect class="lblbg" x="540.7" y="29.0" width="76.8" height="12.5"></rect><text class="lbl" x="615.5" y="38.0" text-anchor="end">plotted below</text>
+<line class="grid" x1="96.0" x2="614.0" y1="210.0" y2="210.0"></line>
+<text class="tick" x="88.0" y="213.5" text-anchor="end">-32.0</text>
+<line class="grid" x1="96.0" x2="614.0" y1="190.0" y2="190.0"></line>
+<text class="tick" x="88.0" y="193.5" text-anchor="end">-31.5</text>
+<line class="grid" x1="96.0" x2="614.0" y1="170.0" y2="170.0"></line>
+<text class="tick" x="88.0" y="173.5" text-anchor="end">-31.0</text>
+<line class="grid" x1="96.0" x2="614.0" y1="150.0" y2="150.0"></line>
+<text class="tick" x="88.0" y="153.5" text-anchor="end">-30.5</text>
+<line class="grid" x1="96.0" x2="614.0" y1="130.0" y2="130.0"></line>
+<text class="tick" x="88.0" y="133.5" text-anchor="end">-30.0</text>
+<line class="grid" x1="96.0" x2="614.0" y1="110.0" y2="110.0"></line>
+<text class="tick" x="88.0" y="113.5" text-anchor="end">-29.5</text>
+<line class="grid" x1="96.0" x2="614.0" y1="90.0" y2="90.0"></line>
+<text class="tick" x="88.0" y="93.5" text-anchor="end">-29.0</text>
+<line class="grid" x1="96.0" x2="614.0" y1="70.0" y2="70.0"></line>
+<text class="tick" x="88.0" y="73.5" text-anchor="end">-28.5</text>
+<text class="unit" x="88.0" y="60.0" text-anchor="end">dBm</text>
+<line class="axis" x1="96.0" x2="614.0" y1="210.0" y2="210.0"></line>
+<line class="axis" x1="109.5" x2="109.5" y1="210.0" y2="214.0"></line>
+<text class="tick" x="109.5" y="266.0" text-anchor="middle">07:45</text><text class="date" x="109.5" y="278.0" text-anchor="middle">Oct 5</text>
+<line class="axis" x1="210.4" x2="210.4" y1="210.0" y2="214.0"></line>
+<text class="tick" x="210.4" y="266.0" text-anchor="middle">08:00</text>
+<line class="axis" x1="311.3" x2="311.3" y1="210.0" y2="214.0"></line>
+<text class="tick" x="311.3" y="266.0" text-anchor="middle">08:15</text>
+<line class="axis" x1="412.2" x2="412.2" y1="210.0" y2="214.0"></line>
+<text class="tick" x="412.2" y="266.0" text-anchor="middle">08:30</text>
+<line class="axis" x1="513.1" x2="513.1" y1="210.0" y2="214.0"></line>
+<text class="tick" x="513.1" y="266.0" text-anchor="middle">08:45</text>
+<line class="axis" x1="614.0" x2="614.0" y1="210.0" y2="214.0"></line>
+<text class="tick" x="614.0" y="266.0" text-anchor="middle">09:00</text>
+<line class="ref alarm" x1="96.0" x2="614.0" y1="110.0" y2="110.0"></line>
+<line class="ref warning" x1="96.0" x2="614.0" y1="98.0" y2="98.0"></line>
+<path class="series" d="M115.9,166.0 L122.6,174.0 L129.4,182.0 L136.1,190.0 L142.8,178.0 L149.5,170.0 L156.3,166.0 L163.0,174.0 L169.7,182.0 L176.5,190.0 L183.2,178.0 L189.9,170.0 L196.6,166.0 L203.4,174.0 L210.1,182.0 L216.8,190.0 L223.5,178.0 L230.3,170.0 L237.0,166.0 L243.7,174.0 L250.5,182.0 L257.2,190.0 L263.9,178.0 L270.6,170.0 L277.4,166.0 L284.1,174.0 L290.8,182.0 L297.5,190.0 L304.3,178.0 L311.0,170.0 L317.7,166.0 L324.5,174.0 L331.2,182.0 L337.9,190.0 L344.6,178.0 L351.4,170.0 L358.1,166.0 L364.8,174.0 L371.5,182.0 L378.3,190.0 L385.0,178.0 L391.7,170.0 L398.4,166.0 L405.2,174.0 L411.9,182.0 L418.6,190.0 L425.4,178.0 L432.1,170.0 L438.8,166.0 L445.5,174.0 L452.3,182.0 L459.0,190.0 L465.7,178.0 L472.4,170.0 L479.2,166.0 L485.9,174.0 L492.6,182.0 L499.4,190.0 L506.1,178.0 L512.8,170.0 L519.5,166.0 L526.3,174.0 L533.0,182.0 L539.7,190.0 L546.4,178.0 L553.2,170.0 L559.9,166.0 L566.6,174.0 L573.4,182.0 L580.1,190.0 L586.8,178.0 L593.5,170.0 L600.3,166.0 L607.0,174.0 L613.7,182.0"></path>
+<rect class="lblbg" x="100.0" y="114.0" width="228.0" height="12.5"></rect><text class="lbl" x="102.0" y="123.0" text-anchor="start">Gateway low-Rx ALARM threshold -29.5 dBm</text>
+<rect class="lblbg" x="100.0" y="84.0" width="239.2" height="12.5"></rect><text class="lbl" x="102.0" y="93.0" text-anchor="start">Gateway low-Rx WARNING threshold -29.2 dBm</text>
+<circle class="dot" cx="613.7" cy="182.0" r="4.5"><title>Latest receive level 2026-10-05 08:59:57 CDT: Rx -31.3 dBm with the gateway&#39;s low-Rx ALARM and WARNING flags set (snapshot #536)</title></circle>
+<rect class="lblbg" x="619.7" y="176.5" width="93.6" height="12.5"></rect><text class="lbl" x="621.7" y="185.5" text-anchor="start">-31.3 dBm latest</text>
+<rect class="stripbg" x="96.0" y="220.0" width="518.0" height="8.0"></rect><rect class="present" x="114.4" y="223.0" width="499.6" height="2"><title>Gateway readings: 75 readings, 2026-10-05 07:45:57 CDT to 2026-10-05 08:59:57 CDT</title></rect><rect class="flagseg alarm" x="114.4" y="220.0" width="499.6" height="8.0"><title>Gateway low-Rx ALARM flag set: 75 readings, 2026-10-05 07:45:57 CDT to 2026-10-05 08:59:57 CDT</title></rect>
+<text class="striplabel" x="88.0" y="227.5" text-anchor="end">ALARM flag</text>
+<rect class="stripbg" x="96.0" y="232.0" width="518.0" height="8.0"></rect><rect class="present" x="114.4" y="235.0" width="499.6" height="2"><title>Gateway readings: 75 readings, 2026-10-05 07:45:57 CDT to 2026-10-05 08:59:57 CDT</title></rect><rect class="flagseg warning" x="114.4" y="232.0" width="499.6" height="8.0"><title>Gateway low-Rx WARNING flag set: 75 readings, 2026-10-05 07:45:57 CDT to 2026-10-05 08:59:57 CDT</title></rect>
+<text class="striplabel" x="88.0" y="239.5" text-anchor="end">WARNING flag</text>
+<rect class="stripbg" x="96.0" y="244.0" width="518.0" height="8.0"></rect><rect class="present" x="114.4" y="247.0" width="499.6" height="2"><title>Gateway readings: 75 readings, 2026-10-05 07:45:57 CDT to 2026-10-05 08:59:57 CDT</title></rect>
+<text class="striplabel" x="88.0" y="251.5" text-anchor="end">Fiber link down</text>
+<text class="unit" x="355.0" y="294.0" text-anchor="middle">Time, CDT (UTC-05:00): the part of the window with readings, 2026-10-05 07:42 to 09:00</text>
+</svg>
+<figcaption>Blue line: the gateway&#39;s own Rx readings (75 receive levels), broken where readings are missing. Red dashes and amber dots: the gateway&#39;s own <span class="nw">low-Rx</span> ALARM and WARNING thresholds. Strips: a full block marks a reading in which the gateway set its ALARM or WARNING flag or reported its fiber link down; a thin line, a reading without that. The plot shows the part of the window with readings, <span class="nw">2026-10-05 07:42:59 CDT</span> to <span class="nw">2026-10-05 09:00:00 CDT</span>; the bar above it shows the whole window and where readings exist. The <span class="nw">setup-time</span> capture of <span class="nw">2026-10-04 22:10:46 CDT</span> (<span class="nw">2026-10-05 03:10:46 UTC</span>), Rx <span class="nw">-31.5 dBm</span> with the gateway&#39;s <span class="nw">low-Rx</span> ALARM and WARNING flags set, is marked on the bar. The table below lists 15 of the 76 readings (the selection is explained under it); every reading is in the bundle.</figcaption>
+</figure>
+<table class="data compact">
+<thead><tr><th>Time (local)</th><th>Time (UTC)</th><th class="num">Rx (dBm)</th><th>ALARM flag</th><th>WARNING flag</th><th>Record</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td><span class="nw">2026-10-04 22:10:46 CDT</span></td><td><span class="nw">2026-10-05 03:10:46 UTC</span></td><td class="num">-31.5</td><td><span class="flag on alarm">set</span></td><td><span class="flag on warning">set</span></td><td>setup capture, bootstrap_import #1</td><td>first, lowest, setup capture</td></tr>
+<tr><td><span class="nw">2026-10-05 07:45:57 CDT</span></td><td><span class="nw">2026-10-05 12:45:57 UTC</span></td><td class="num">-30.9</td><td><span class="flag on alarm">set</span></td><td><span class="flag on warning">set</span></td><td>snapshot #7</td><td>highest</td></tr>
+<tr><td><span class="nw">2026-10-05 07:49:57 CDT</span></td><td><span class="nw">2026-10-05 12:49:57 UTC</span></td><td class="num">-31.2</td><td><span class="flag on alarm">set</span></td><td><span class="flag on warning">set</span></td><td>snapshot #37</td><td></td></tr>
+<tr><td><span class="nw">2026-10-05 07:54:57 CDT</span></td><td><span class="nw">2026-10-05 12:54:57 UTC</span></td><td class="num">-31.5</td><td><span class="flag on alarm">set</span></td><td><span class="flag on warning">set</span></td><td>snapshot #72</td><td></td></tr>
+<tr><td><span class="nw">2026-10-05 07:58:57 CDT</span></td><td><span class="nw">2026-10-05 12:58:57 UTC</span></td><td class="num">-31.1</td><td><span class="flag on alarm">set</span></td><td><span class="flag on warning">set</span></td><td>snapshot #101</td><td></td></tr>
+<tr><td><span class="nw">2026-10-05 08:03:57 CDT</span></td><td><span class="nw">2026-10-05 13:03:57 UTC</span></td><td class="num">-30.9</td><td><span class="flag on alarm">set</span></td><td><span class="flag on warning">set</span></td><td>snapshot #136</td><td></td></tr>
+<tr><td><span class="nw">2026-10-05 08:07:57 CDT</span></td><td><span class="nw">2026-10-05 13:07:57 UTC</span></td><td class="num">-31.2</td><td><span class="flag on alarm">set</span></td><td><span class="flag on warning">set</span></td><td>snapshot #165</td><td></td></tr>
+<tr><td><span class="nw">2026-10-05 08:12:57 CDT</span></td><td><span class="nw">2026-10-05 13:12:57 UTC</span></td><td class="num">-31.5</td><td><span class="flag on alarm">set</span></td><td><span class="flag on warning">set</span></td><td>snapshot #200</td><td></td></tr>
+<tr><td><span class="nw">2026-10-05 08:17:57 CDT</span></td><td><span class="nw">2026-10-05 13:17:57 UTC</span></td><td class="num">-31.3</td><td><span class="flag on alarm">set</span></td><td><span class="flag on warning">set</span></td><td>snapshot #237</td><td></td></tr>
+<tr><td><span class="nw">2026-10-05 08:22:57 CDT</span></td><td><span class="nw">2026-10-05 13:22:57 UTC</span></td><td class="num">-31.1</td><td><span class="flag on alarm">set</span></td><td><span class="flag on warning">set</span></td><td>snapshot #272</td><td></td></tr>
+<tr><td><span class="nw">2026-10-05 08:31:57 CDT</span></td><td><span class="nw">2026-10-05 13:31:57 UTC</span></td><td class="num">-31.2</td><td><span class="flag on alarm">set</span></td><td><span class="flag on warning">set</span></td><td>snapshot #336</td><td></td></tr>
+<tr><td><span class="nw">2026-10-05 08:40:57 CDT</span></td><td><span class="nw">2026-10-05 13:40:57 UTC</span></td><td class="num">-31.1</td><td><span class="flag on alarm">set</span></td><td><span class="flag on warning">set</span></td><td>snapshot #400</td><td></td></tr>
+<tr><td><span class="nw">2026-10-05 08:49:57 CDT</span></td><td><span class="nw">2026-10-05 13:49:57 UTC</span></td><td class="num">-31.2</td><td><span class="flag on alarm">set</span></td><td><span class="flag on warning">set</span></td><td>snapshot #465</td><td></td></tr>
+<tr><td><span class="nw">2026-10-05 08:54:57 CDT</span></td><td><span class="nw">2026-10-05 13:54:57 UTC</span></td><td class="num">-31.5</td><td><span class="flag on alarm">set</span></td><td><span class="flag on warning">set</span></td><td>snapshot #500</td><td></td></tr>
+<tr><td><span class="nw">2026-10-05 08:59:57 CDT</span></td><td><span class="nw">2026-10-05 13:59:57 UTC</span></td><td class="num">-31.3</td><td><span class="flag on alarm">set</span></td><td><span class="flag on warning">set</span></td><td>snapshot #536</td><td>latest</td></tr>
+</tbody>
+</table><p class="small muted">15 of 76 readings are listed: the first, the latest, the lowest, the highest and the setup capture; the others fill the largest stretches between them. Every reading is in the gateway_snapshot records of the bundle.</p>
+
+<h2>Gateway events</h2>
+<table class="data compact events">
+<colgroup><col class="when"><col class="what"><col class="change"><col class="ref"></colgroup>
+<thead><tr><th>Observed (snapshots compared)</th><th>Event</th><th>Change, as the gateway reported it</th><th>gateway_event</th></tr></thead>
+<tbody class="grp">
+<tr><td class="when" rowspan="1"><span class="nw">2026-10-05 07:45:59 CDT</span> (<span class="nw">12:45:59 UTC</span>)<br><span class="muted">snapshot #7</span></td><td>Optical alarm flags</td><td>first observation → OPTICAL_RX_LOW_ALARM, OPTICAL_RX_LOW_WARNING<br><span class="muted">alarm flags already raised at the first gateway observation by this monitor; Rx <span class="nw">-30.9 dBm</span>, Tx <span class="nw">4.8 dBm</span></span></td><td>#8</td></tr>
+</tbody>
+</table><p class="small muted">1 gateway event about this monitor&#39;s own operation (certificate pinning, the gateway&#39;s notification setting) is not listed.</p>
+
+<h2>Incidents</h2>
+<p>No incident was recorded in this window.</p>
+
+<h2>Monitoring, availability and home network</h2>
+<table class="kv">
+<tr><th scope="row">Measurement cycles</th><td>446 cycles of <span class="nw">10 s</span>, <span class="nw">1.2 h</span> monitored; cycle interval from the configuration record #2</td></tr>
+<tr><th scope="row">Cycles by state</th><td>ONLINE 446</td></tr>
+<tr><th scope="row">Availability (ONLINE / classified cycles)</th><td>100% (446 of 446; truncated, never rounded up)</td></tr>
+<tr><th scope="row">Blips (failed cycles outside incidents)</th><td>none</td></tr>
+<tr><th scope="row">Pings to the gateway</th><td>446 of 446 answered (0 lost); median <span class="nw">round-trip</span> <span class="nw">2.5 ms</span> (rule threshold <span class="nw">20 ms</span>)</td></tr>
+<tr><th scope="row">Gateway answered (ICMP or TCP)</th><td>in 446 of 446 cycles</td></tr>
+<tr><th scope="row">This computer&#39;s link</th><td><span class="nw">Wi-Fi</span>, <span class="nw">5 GHz</span>, 802.11ax, channel 149; signal <span class="nw">82-84%</span> (8 readings, latest local_link #506, its RSSI <span class="nw">-58 dBm</span>)</td></tr>
+<tr><th scope="row">Route check (VPN / other network)</th><td>all 8 route checks: Internet destinations routed through the AT&amp;T gateway</td></tr>
+</table>
+<table class="data">
+<caption>Stretches of the window without measurement cycles</caption>
+<thead><tr><th>From</th><th>To</th><th class="num">Length</th><th>Explanation on record</th></tr></thead>
+<tbody>
+<tr><td><span class="nw">2026-10-04 09:00:00 CDT</span> (<span class="nw">14:00:00 UTC</span>)</td><td><span class="nw">2026-10-05 07:45:47 CDT</span> (<span class="nw">12:45:47 UTC</span>)</td><td class="num"><span class="nw">22 h 45 min</span></td><td>the evidence ledger was created only at <span class="nw">2026-10-05 12:45:47 UTC</span> (genesis #0), so the monitor was not installed before then; monitor started (service mode) at <span class="nw">2026-10-05 12:45:47 UTC</span> (record #2)</td></tr>
+</tbody>
+</table>
+
+<h2>Evidence and integrity</h2>
+<table class="kv">
+<tr><th scope="row">Evidence bundle<span class="st">*</span></th><td class="mono"><span class="ba">att-evidence_20261004T140000Z_20261005T140000Z_6961b23f.zip</span></td></tr>
+<tr><th scope="row">Bundle SHA-256<span class="st">*</span></th><td class="mono">1e6ed65d77d6364eeaed5a745ba5c4985ae2b700dd85d7cf7f027bdf294a33fc</td></tr>
+<tr><th scope="row">Verification<span class="st">*</span></th><td>OK: 512 records, 0 failures, 4 <span class="nw">time-stamps</span> <span class="nw">chain-verified</span> (<span class="nw">att-monitor</span> <span class="nw">verify-bundle</span>)</td></tr>
+<tr><th scope="row">Ledger key fingerprint</th><td class="mono">ae21 6c2e f524 7a37 82c1 35ef a279 a3e4 cdc6 1094 270f 5d2b e58c 6204 b7a6 12c9</td></tr>
+<tr><th scope="row">Ledger created</th><td><span class="nw">2026-10-05 12:45:47 UTC</span> (genesis #0) on <span class="nw">DESKTOP-TEST</span>, <span class="nw">att-monitor</span> 1.0.0</td></tr>
+<tr><th scope="row">Records of this window</th><td>537 records, #0 to #536</td></tr>
+<tr><th scope="row">Time-stamp covering this window</th><td>Free TSA, genTime <span class="nw">2026-10-05 13:45:58 UTC</span>, covers every record up to #436 (anchor #437, written <span class="nw">2026-10-05 13:45:57 UTC</span>): 437 of this window&#39;s records; the 100 records after it are protected by the hash chain and signatures until the next <span class="nw">time-stamp</span></td></tr>
+</table>
+<p class="footnote">* Stated by att-monitor test when it generated this report; every other figure is computed from the signed ledger records it names (in the evidence bundle).</p>
+<h3>Setup-time capture (gateway pages saved during installation, before the monitor existed)</h3>
+<table class="kv">
+<tr><th scope="row">Import record</th><td>bootstrap_import #1, written <span class="nw">2026-10-05 12:45:47 UTC</span>; 7 files from C:\RC\att_monitor\evidence\bootstrap</td></tr>
+<tr><th scope="row">Optical reading in the capture</th><td>Rx <span class="nw">-31.5 dBm</span> with the gateway&#39;s <span class="nw">low-Rx</span> ALARM and WARNING flags set (thresholds: ALARM <span class="nw">-29.5 dBm</span>, WARNING <span class="nw">-29.2 dBm</span>) at <span class="nw">2026-10-05 03:10:46 UTC</span> (file time, inside this window)</td></tr>
+<tr><th scope="row">Fiber Last Change in the capture</th><td>1791151188: <span class="nw">2026-10-04 21:59:48 UTC</span> if the gateway counts in UTC, or <span class="nw">2026-10-05 02:59:48 UTC</span> if in its local time (<span class="nw">UTC-05:00</span> per its own clock); the gateway does not say which; either way it lies inside this window</td></tr>
+<tr><th scope="row">Gateway uptime and clock in the capture</th><td>uptime <span class="nw">3 d 04 h</span> (last boot about <span class="nw">2026-10-01 22:52:38 UTC</span>); clock <span class="nw">2026-10-04T22:10:44</span> (<span class="nw">UTC-05:00</span>)</td></tr>
+<tr><th scope="row">Ledger time-stamp over the import record</th><td>DigiCert, Inc., genTime <span class="nw">2026-10-05 12:45:47 UTC</span> (anchor #3 covers up to #2)</td></tr>
+</table>
+<table class="data">
+<caption>Gateway pages in the capture</caption>
+<thead><tr><th>Captured page</th><th>File time</th><th>SHA-256</th><th>In a time-stamped manifest</th></tr></thead>
+<tbody>
+<tr><td class="path">initial-snapshot/broadbandstatistics.anon.html</td><td><span class="nw">2026-10-05 03:10:45 UTC</span></td><td class="mono">dae14315...c35e</td><td>listed in BOOTSTRAP-MANIFEST.sha256</td></tr>
+<tr><td class="path">initial-snapshot/fiberstat.anon.html</td><td><span class="nw">2026-10-05 03:10:46 UTC</span></td><td class="mono">f618307d...7425</td><td>listed in BOOTSTRAP-MANIFEST.sha256</td></tr>
+<tr><td class="path">initial-snapshot/sysinfo.anon.html</td><td><span class="nw">2026-10-05 03:10:44 UTC</span></td><td class="mono">9a7fd662...6dc2</td><td>listed in BOOTSTRAP-MANIFEST.sha256</td></tr>
+</tbody>
+</table>
+<table class="data">
+<caption>RFC 3161 time-stamp tokens imported with the capture</caption>
+<thead><tr><th>Token</th><th>Authority</th><th>genTime stated in the token</th><th>Covers (by SHA-256)</th></tr></thead>
+<tbody>
+<tr><td class="path">BOOTSTRAP-MANIFEST.digicert.tsr</td><td>DigiCert</td><td><span class="nw">2026-10-05 03:19:57 UTC</span></td><td class="path">BOOTSTRAP-MANIFEST.sha256</td></tr>
+<tr><td class="path">BOOTSTRAP-MANIFEST.freetsa.tsr</td><td>FreeTSA</td><td><span class="nw">2026-10-05 03:19:57 UTC</span></td><td class="path">BOOTSTRAP-MANIFEST.sha256</td></tr>
+</tbody>
+</table>
+<p class="small muted">The tokens' genTime and covered hash are read from the tokens; this report does not check their signatures. Verify them with the OpenSSL commands below.</p>
+<h3>Records behind the key facts</h3>
+<table class="data compact">
+<thead><tr><th>Fact</th><th>Record(s)</th></tr></thead>
+<tbody>
+<tr><td><span class="nw">Setup-time</span> capture of the fiber status page</td><td>bootstrap_import #1, <span class="nw">initial-snapshot</span>/fiberstat.anon.html (<span class="nw">SHA-256</span> f618307daf88e990dc0b8a7a1a8f7a7562ab5239d3bb66cf589aa12c94947425)</td></tr>
+<tr><td>Snapshots with the gateway&#39;s <span class="nw">low-Rx</span> ALARM flag set</td><td>#7, #16, #23, #30, #37, #44, and 69 more</td></tr>
+<tr><td>Gateway clock offset <span class="nw">UTC-05:00</span></td><td>its clock read <span class="nw">2026-10-05T08:59:58</span> when snapshot #536 fetched it at <span class="nw">2026-10-05 13:59:58 UTC</span></td></tr>
+</tbody>
+</table>
+<h3>How to verify</h3>
+<p class="small muted">Each command is one line; it is wrapped here only between its arguments. README.txt in the evidence bundle describes the same checks.</p>
+<ol class="verify">
+<li>With att-monitor (checks every record&#39;s hash, signature and chain link, the blobs, the time-stamp tokens and their certificate chains, and recomputes the bundle&#39;s own report):<span class="code"><span class="arg">att-monitor verify-bundle</span> <span class="arg">att-evidence_20261004T140000Z_20261005T140000Z_6961b23f.zip</span> <span class="arg">--expect-fingerprint ae216c2ef5247a3782c135efa279a3e4cdc61094270f5d2be58c6204b7a612c9</span></span></li>
+<li>With Python 3.9 or newer, using the verifier shipped inside the bundle (records, blobs, signatures with the cryptography package, time-stamps with OpenSSL):<span class="code"><span class="arg">python tools/verify_bundle.py</span> <span class="arg">att-evidence_20261004T140000Z_20261005T140000Z_6961b23f.zip</span></span></li>
+<li>A record by hand (e.g. snapshot #N): in ledger/ledger-YYYY-MM-DD.jsonl the line whose b contains &#34;seq&#34;:N has h = SHA-256 of the exact bytes of b; the next record&#39;s prev equals h.</li>
+<li>The time-stamp covering this window (anchor #437), on the extracted bundle:<span class="code"><span class="arg">openssl ts -verify</span> <span class="arg">-attime 1791207958</span> <span class="arg">-digest f82d294a49b9c63c4c50ec0c0560880b44c4560c0e86eb1cfa1d20604018bbed</span> <span class="arg">-in blobs/10e621595e83736739376963475e2022fa8284241c831ae3681466c3860657b9</span> <span class="arg">-CAfile keys/tsa-roots.pem</span></span></li>
+<li>The setup-time tokens (BOOTSTRAP-MANIFEST.digicert.tsr, BOOTSTRAP-MANIFEST.freetsa.tsr), on the extracted bundle:<span class="code"><span class="arg">openssl ts -verify</span> <span class="arg">-attime 1791170397</span> <span class="arg">-digest 0be4bf8b3102ae16d270838b79fc8aec5679e509323cdf2025a4f7d172b4a33d</span> <span class="arg">-in blobs/5dac656f29efd46fe52ae4bafcad46fd43ff37fe37565d0413996b88fb7e9cf4</span> <span class="arg">-CAfile keys/tsa-roots.pem</span></span><span class="code"><span class="arg">openssl ts -verify</span> <span class="arg">-attime 1791170397</span> <span class="arg">-digest 0be4bf8b3102ae16d270838b79fc8aec5679e509323cdf2025a4f7d172b4a33d</span> <span class="arg">-in blobs/44d733fd0bad751bf3f132c8186e9337f9c950b7593fbb7c955a83d995c5ed79</span> <span class="arg">-CAfile keys/tsa-roots.pem</span></span></li>
+</ol>
+</section>
+</main>
+</body>
+</html>

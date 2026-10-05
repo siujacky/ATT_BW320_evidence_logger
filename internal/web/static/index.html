@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="att-monitor-version" content="{{VERSION}}">
+<title>AT&amp;T Internet Monitor</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<a class="skip-link" id="skip-link" href="#main">Skip to main content</a>
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="#/">
+      <img src="/static/favicon.svg" alt="" width="28" height="28">
+      <span class="brand-text">AT&amp;T Internet Monitor<span class="brand-sub">evidence logger</span></span>
+    </a>
+    <a id="pill" class="pill" href="#/">
+      <span class="pill-text">Connecting…</span>
+    </a>
+    <nav class="nav" aria-label="Main">
+      <ul>
+        <li><a href="#/" data-route="overview">Overview</a></li>
+        <li><a href="#/incidents" data-route="incidents">Incidents</a></li>
+        <li><a href="#/gateway" data-route="gateway">Gateway</a></li>
+        <li><a href="#/evidence" data-route="evidence">Evidence</a></li>
+        <li><a href="#/records" data-route="records">Records</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+<div id="conn" class="conn-banner" role="alert" hidden></div>
+<main id="main" tabindex="-1">
+  <noscript><p class="card">This dashboard needs JavaScript. The raw JSON API is available at <a href="/api/status">/api/status</a>.</p></noscript>
+  <div id="view" aria-live="off"><p class="loading">Loading…</p></div>
+</main>
+<footer class="footer">
+  <p>
+    <span id="foot-version"></span>
+    <span class="sep" aria-hidden="true">·</span>
+    <span>Times are shown in your local time zone; hover over a time to see UTC.</span>
+    <span class="sep" aria-hidden="true">·</span>
+    <span id="foot-updated">Not updated yet</span>
+  </p>
+</footer>
+<div id="live" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+</body>
+</html>

@@ -1,0 +1,199 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html lang="en" xml:lang="en" xmlns="http://www.w3.org/1999/xhtml" >
+    <head>
+        <title>Diagnostics</title>
+        <meta http-equiv="Content-Type" content="text/html; charset=windows-1252" />
+        <meta http-equiv="Content-Style-Type" content="text/css" />
+        <meta http-equiv="Content-Script-Type" content="type" />
+        <link rel="icon" type="image/ico" href="/favicon.ico" />
+        <link rel="stylesheet" type="text/css" href="/baseINID.css" />
+        <link rel="stylesheet" type="text/css" href="/INID.css" />
+<script type="text/css"><!--
+<style id="antiClickjack" type="text/css">body{display:none;}</style>
+//-->
+</script>
+    <script language="javascript" type="text/javascript"><!--
+  adImages=new Array('/images/Block1.gif','/images/Block3.gif','/images/Block5.gif','/images/Block7.gif','/images/Block9.gif','/images/Block11.gif','/images/Block14.gif')
+  thisAd=0
+  imgCt=adImages.length
+if (self == top) {
+    var antiClickjack = document.getElementById("antiClickjack");
+    antiClickjack.parentNode.removeChild(antiClickjack);
+} else {
+    top.location = self.location;
+}
+function rotate(){
+    if (document.images) {
+        thisAd++
+            if (thisAd==imgCt){
+                thisAd=0
+            }
+        document.adBanner.src=adImages[thisAd]
+            setTimeout('rotate()',200)
+    }
+}
+function reloadPage()
+{
+    if (document.forms[0].hidden.value == "update_refresh") {
+      rotate()
+    }
+    else if (document.forms[0].hidden.value == "freshen") {
+      setTimeout("self.location.reload(true)", 10000)
+      rotate()
+    }
+}
+
+
+//-->
+</script>
+    </head>
+           <body>
+  <div id="wrapper">
+    <div id="whole-page">
+      <div id="main-content">
+        <div id="header">
+          <div id="tab-container">
+            <div id="logo-div">
+	      <img id="main-logo" src="/images/att_logo.png" alt="" style="height:42px;" />
+            </div>
+            <div style="clear: both;"></div>
+<div id="skip"><a href="#content-sub">Skip to Main Content</a></div>
+            <div id="top-navigation">
+              <div id="top-navigation-buttons">
+<a class="topnav" href="/cgi-bin/home.ha"><span>Device</span></a>
+<a class="topnav" href="/cgi-bin/broadbandstatistics.ha"><span>Broadband</span></a>
+<a class="topnav" href="/cgi-bin/lanstatistics.ha"><span>
+Home Network
+</span></a>
+
+<a class="topnav" href="/cgi-bin/voice.ha"><span>Voice</span></a>
+<a class="topnav" href="/cgi-bin/firewall.ha"><span>Firewall</span></a>
+<a class="topnav topnavselected" href="/cgi-bin/diag.ha"><span>Diagnostics</span></a>
+              <div style="clear: both;"></div>
+            </div>
+          </div>
+          <div id="secondary-nav">
+            <div id="secondary-nav-buttons">
+<a class="secondary-link sec-selected" href="/cgi-bin/diag.ha">Troubleshoot</a>
+<a class="secondary-link" href="/cgi-bin/speed.ha">Speed Test</a>
+<a class="secondary-link" href="/cgi-bin/logs.ha">Logs</a>
+<a class="secondary-link" href="/cgi-bin/update.ha">Update</a>
+<a class="secondary-link" href="/cgi-bin/reset.ha">Resets</a>
+<a class="secondary-link" href="/cgi-bin/syslog.ha">Syslog</a>
+<a class="secondary-link" href="/cgi-bin/events.ha">Event Notifications</a>
+<a class="secondary-link" href="/cgi-bin/nattable.ha">NAT Table</a>
+                  </div></div></div>
+                <div style="clear: both;"></div>
+              </div>
+        <div style="clear: both;"></div>
+      <div id="mid-section">
+          <div id="content-padding"><!-- CONTENT -->
+            <div id="content"
+><div id="content-sub">
+                <div class="first-section-header">
+                 <h1>Troubleshoot</h1></div>
+       <div class="section-content">
+         <div class="resfail" style="padding-left:3px;">
+                      </div>
+         <div class="col1">Running this test will help locate problems with your Internet Connection.<br /><br /></div>
+	    <form method="post" action="/cgi-bin/diag.ha">
+<input type="hidden" name="nonce" value="40d0d668c76b3116e20661b27ed947841c369bfa609f985a6e65cdbd90e3d1f8" />
+         <table class="diag table60"  align="center" summary="This table displays results of the Full Diagnostics Test">
+<tr><th scope="row" width="25%">Ethernet
+</th>
+<td width="25%" >-</td>
+<td width="10%"><input type="submit" name="EthDetails" class="cssbtn smallbtn" value="Details" /></td>
+</tr>
+<tr><th scope="row">Authentication</th>
+<td >-</td>
+<td><input type="submit" name="AuthDetails" class="cssbtn smallbtn" value="Details" /></td>
+</tr>
+<tr><th scope="row">IP</th>
+<td >-</td>
+<td><input type="submit" name="IPDetails" class="cssbtn smallbtn" value="Details" /></td>
+</tr>
+<tr><th scope="row">DNS</th>
+<td >-</td>
+<td><input type="submit" name="DNSDetails" class="cssbtn smallbtn" value="Details" /></td>
+</tr>
+	     </table>
+	     <br />
+         <div align="center">
+                <input type="submit" name="RunFullDiagnostics"
+                class="cssbtn largebtn" value="Run Full Diagnostics"  />
+                <input type="submit" name="SendDiagnostics"
+                class="cssbtn largebtn" value="Send Diagnostics" style="float: right;" />
+         </div>
+	     <hr class="reshr" noshade="noshade" />
+	     <h2>Test Internet Access</h2>
+	     <div align="center" style="margin-left:30px; width:90%;">
+	       <div class="desc">Enter an Internet Address in the 'Address' field and click on the button of the test to perform.<br /><br /></div>
+	       <div class="col1">
+	              <label for="webaddress">Address</label>&nbsp;&nbsp;
+	              <input id="webaddress" type="text" name="WebAddress" size="40"
+			       maxlength="63" value=""  />
+	              <br /><span class="example">e.g. 192.0.2.1, www.example.com, yourhostname</span><br /><br />
+	       </div>
+           <div class="col1">
+            <fieldset><legend>Preferred protocol</legend>Preferred protocol&nbsp;&nbsp;
+<input id="IPv4" type="radio" name="protopref" value="IPv4"
+ checked="checked"  /><label for="IPv4">IPv4</label>
+<input id="IPv6" type="radio" name="protopref" value="IPv6"
+   /><label for="IPv6">IPv6</label>
+                  &nbsp;&nbsp;</fieldset>
+
+	              <input type="submit" name="Ping"
+			      class="cssbtn smallbtn btnspacer" value="Ping"  />
+	              <input type="submit" name="Trace"
+			      class="cssbtn smallbtn btnspacer" value="Traceroute"  />
+	              <input type="submit" name="Lookup"
+			      class="cssbtn smallbtn" value="NSLookup"  />
+                  <br /><br />
+           </div>
+         </div>
+         <hr class="reshr" noshade="noshade" />
+         <div id="pw" style="width:83%;" align="center">
+              <div>
+                    <strong><label for="progress">Progress Window</label></strong><br />
+                   <textarea id="progress" name="ProgressWindow" rows="15" cols="70" readonly="readonly">                    </textarea>
+              </div>
+          </div>
+     </form>
+    </div>
+                </div>
+              </div>
+            </div>
+ <!-- isWANUP -->
+            <div id="help">
+              <div id="help-sub">
+              <h2>Help</h2><br />
+      <p>This &quot;Multi-layer&quot; diagnostic examines the functionality of the device from the physical connections to the application traffic being sent by users through the device. This sequence of tests takes approximately one minute to generate results. Each test generates one of the following result codes:</p>
+          <ul><li><strong>Pass:</strong> The test was successful.</li>
+          <li><strong>Fail:</strong> The test was unsuccessful.</li>
+          <li><strong>Skipped:</strong> The test was not performed because a pre-requisite test failed or the test is not appropriate.</li></ul>
+        <strong>&quot;Send Diagnostics&quot;</strong> to send a diagnostics report to AT&T.<br /><br />
+        <h2><strong>Test Internet Access</strong></h2>
+        <p>Enter an IP address, URL, or hostname in the &quot;Address&quot; field and click on:<br />
+	  <strong>&quot;Ping&quot;</strong> to see if this device can loop a message back and forth to the remote host.<br /><br />
+      <strong>&quot;Traceroute&quot;</strong> to see what route or nodes the packet goes through to get to the remote host.<br /><br />
+      <strong>&quot;NSLookup&quot;</strong> to see if the host name is translated by a Name Server to an IP address.<br /><br />
+       Results will be displayed in the &quot;Progress Window&quot; as they are generated.
+       <br /> <br />
+       <strong>Note:</strong> Preferred protocol is applicable only when a URL or hostname is entered in the Address field.
+      </p>
+              </div> <!-- help-sub -->
+            </div> <!-- help -->
+            <div style="clear: both;"></div>
+          </div>
+        </div>
+        <div style="clear: both;"></div>
+      </div>
+      <div id="footer">
+      <div><br>
+   <span class="inner">&copy; 2016-2025 AT&T Intellectual Property. All rights reserved. AT&T and Globe logo are registered trademarks of AT&T Intellectual Property.</span>
+   <span class="sitemap"><a href="/cgi-bin/sitemap.ha">Site Map</a></span></br></div>
+   <div><span class="inner">&copy; 2016 ARRIS Enterprises LLC. All rights reserved. ARRIS is a registered trademark of ARRIS Enterprises LLC.</span></div>
+   </div>
+      </div>
+</body>
+</html>

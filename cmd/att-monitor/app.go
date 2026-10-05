@@ -1,0 +1,376 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"attmonitor/internal/anchor"
+	"attmonitor/internal/config"
+	"attmonitor/internal/contracts"
+	"attmonitor/internal/export"
+	"attmonitor/internal/gateway"
+	"attmonitor/internal/ledger"
+	"attmonitor/internal/model"
+	"attmonitor/internal/mongostore"
+	"attmonitor/internal/monitor"
+	"attmonitor/internal/probe"
+	"attmonitor/internal/sysinfo"
+	"attmonitor/internal/web"
+	"attmonitor/internal/winsvc"
+)
+
+// stack is the fully wired application. Run() is only called for service/console mode;
+// CLI commands that need ledger writes while the service is stopped use the same wiring
+// without running the scheduler.
+type stack struct {
+	dataDir string
+	paths   config.Paths
+	cfg     *config.Config
+	log     *slog.Logger
+	closeLg func()
+
+	host model.HostInfo
+	sw   model.SoftwareInfo
+
+	anchor *anchor.Client
+	ledger *ledger.Store
+	gw     *gateway.Client
+	prober *probe.Prober
+	mon    *monitor.Monitor
+	exp    *export.Exporter
+	// mongo copies the ledger into MongoDB (service and console modes, when enabled; nil
+	// otherwise). The ledger stays the source of truth; see docs/DESIGN.md §17.
+	mongo *mongostore.Replicator
+}
+
+type stackOptions struct {
+	dataDir  string
+	mode     string // "service" | "console" | "cli"
+	extraLog slog.Handler
+	console  bool // also log to stderr
+}
+
+func userAgent() string { return "att-monitor/" + version }
+
+// openStack wires every component. The caller must call close().
+func openStack(o stackOptions) (*stack, error) {
+	s := &stack{dataDir: o.dataDir, paths: config.PathsFor(o.dataDir)}
+	if o.mode == "cli" {
+		// CLI commands write into an EXISTING ledger only: a mistyped --data must never create a
+		// second ledger with a new key and quietly put operator notes or custody records there.
+		if !hasLedger(s.paths.Ledger) {
+			return nil, fmt.Errorf("no evidence ledger found in %s (is the service using a different --data directory?)", o.dataDir)
+		}
+	}
+	if err := s.paths.MkdirAll(); err != nil {
+		return nil, fmt.Errorf("data directory %s: %w", o.dataDir, err)
+	}
+	var keysACLErr error
+	if o.mode == "service" {
+		// Running as LocalSystem: (re)assert the private ACL on keys\ before any secret is
+		// created or read. Console mode as a normal user must not lock itself out of its keys.
+		keysACLErr = winsvc.SecurePrivateDir(s.paths.Keys)
+	}
+	cfg, err := config.LoadOrCreate(s.paths.Config)
+	if err != nil {
+		return nil, err
+	}
+	s.cfg = cfg
+
+	lg, closeLg, err := newLogger(s.paths.Logs, o.mode, o.console, o.extraLog)
+	if err != nil {
+		return nil, err
+	}
+	s.log, s.closeLg = lg, closeLg
+	if keysACLErr != nil {
+		lg.Error("could not secure the keys directory", "dir", s.paths.Keys, "err", keysACLErr)
+	}
+
+	s.host = sysinfo.Host()
+	s.sw = sysinfo.Software(version, commit, monitor.RulesVersion)
+
+	s.anchor = anchor.New(anchor.Options{
+		URLs:      cfg.Anchoring.TSAURLs,
+		Timeout:   cfg.Anchoring.Timeout.Duration,
+		UserAgent: userAgent(),
+		Logger:    lg.With("component", "anchor"),
+	})
+
+	s.ledger, err = ledger.Open(ledger.Options{
+		Paths:         s.paths,
+		Host:          s.host,
+		Software:      s.sw,
+		TokenVerifier: s.anchor,
+		FastInterval:  cfg.Probes.FastInterval.Duration,
+		Logger:        lg.With("component", "ledger"),
+	})
+	if err != nil {
+		s.close()
+		return nil, fmt.Errorf("open evidence ledger: %w", err)
+	}
+	if s.ledger.Created() {
+		lg.Info("new evidence ledger created", "fingerprint", s.ledger.Fingerprint())
+	}
+	if o.mode != "cli" {
+		s.importBootstrapOnce()
+	}
+
+	s.gw = gateway.New(gateway.Options{
+		Host:             cfg.Gateway.Host,
+		Scheme:           cfg.Gateway.Scheme,
+		PinnedCertSHA256: cfg.Gateway.PinnedCertSHA256,
+		Timeout:          cfg.Gateway.Timeout.Duration,
+		AccessCode:       cfg.AccessCode,
+		UserAgent:        userAgent(),
+		Logger:           lg.With("component", "gateway"),
+	})
+	s.prober = probe.New(probe.Options{
+		Logger:    lg.With("component", "probe"),
+		UserAgent: userAgent(),
+		GatewayIP: cfg.Gateway.Host, // hijack detection: answers pointing at the gateway itself
+	})
+
+	var anchorer contracts.Anchorer
+	if cfg.Anchoring.Enabled {
+		anchorer = s.anchor
+	}
+	var mongoStatus func() model.MongoStatus
+	if o.mode != "cli" && cfg.Mongo.Enabled {
+		s.mongo, err = mongostore.New(mongostore.Options{
+			URI:        cfg.Mongo.URI,
+			Database:   cfg.Mongo.Database,
+			Reader:     s.ledger,
+			StoreBlobs: cfg.Mongo.StoreBlobs,
+			Interval:   cfg.Mongo.Interval.Duration,
+			Logger:     lg.With("component", "mongo"),
+		})
+		if err != nil {
+			// The copy is a convenience: evidence collection goes on without it.
+			lg.Error("MongoDB copy disabled", "err", err)
+			s.mongo = nil
+		} else {
+			mongoStatus = s.mongo.Status
+		}
+	}
+	s.mon, err = monitor.New(monitor.Options{
+		Config:      cfg,
+		SaveConfig:  func(c *config.Config) error { return config.Save(s.paths.Config, c) },
+		Ledger:      s.ledger,
+		Reader:      s.ledger,
+		Verifier:    s.ledger,
+		Gateway:     s.gw,
+		Prober:      s.prober,
+		Anchorer:    anchorer,
+		Software:    s.sw,
+		Host:        s.host,
+		Mode:        o.mode,
+		Listen:      cfg.Web.Listen,
+		DataDir:     o.dataDir,
+		StateDir:    s.paths.State,
+		Logger:      lg.With("component", "monitor"),
+		MongoStatus: mongoStatus,
+	})
+	if err != nil {
+		s.close()
+		return nil, fmt.Errorf("monitor: %w", err)
+	}
+	s.exp = export.New(export.Options{
+		Dir:           s.paths.Exports,
+		Reader:        s.ledger,
+		Verifier:      s.ledger,
+		Actions:       s.mon,
+		TokenVerifier: s.anchor, // per-anchor chain verdict: only chain-trusted tokens prove time
+		// keys/tsa-roots.pem lets anyone run `openssl ts -verify -attime … -CAfile keys/tsa-roots.pem`.
+		ExtraFiles: map[string][]byte{"keys/tsa-roots.pem": tsaRootsPEM},
+		Software:   s.sw,
+		Logger:     lg.With("component", "export"),
+	})
+	return s, nil
+}
+
+// importBootstrapOnce imports cfg.BootstrapDir if no bootstrap_import record exists yet. The
+// import belongs right after genesis, so only the first records are searched; a failed import
+// is retried on the next start instead of being lost.
+func (s *stack) importBootstrapOnce() {
+	dir := s.cfg.BootstrapDir
+	if dir == "" {
+		return
+	}
+	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
+		s.log.Warn("bootstrap_dir configured but not found", "dir", dir)
+		return
+	}
+	found, seen := false, 0
+	err := s.ledger.Scan(0, func(_ model.Envelope, b model.Body) error {
+		seen++
+		if b.Type == model.TypeBootstrapImport {
+			found = true
+			return contracts.ErrStop
+		}
+		if seen >= 500 {
+			return contracts.ErrStop
+		}
+		return nil
+	})
+	if err != nil {
+		s.log.Error("scanning ledger for bootstrap import", "err", err)
+		return
+	}
+	if found {
+		return
+	}
+	if seen >= 500 {
+		// Far past genesis: importing now would misrepresent when the files entered the ledger.
+		s.log.Warn("bootstrap evidence was never imported and the ledger is no longer new; not importing", "dir", dir)
+		return
+	}
+	ref, err := s.ledger.ImportBootstrap(dir)
+	if err != nil {
+		s.log.Error("bootstrap import failed (will retry at next start)", "dir", dir, "err", err)
+		return
+	}
+	s.log.Info("bootstrap evidence imported", "dir", dir, "seq", ref.Seq)
+}
+
+func (s *stack) close() {
+	if s.ledger != nil {
+		if err := s.ledger.Close(); err != nil && s.log != nil {
+			s.log.Error("closing ledger", "err", err)
+		}
+		s.ledger = nil
+	}
+	if s.closeLg != nil {
+		s.closeLg()
+		s.closeLg = nil
+	}
+}
+
+// runMonitor runs the scheduler and the dashboard until ctx is cancelled.
+func runMonitor(ctx context.Context, o stackOptions, power <-chan string) error {
+	s, err := openStack(o)
+	if err != nil {
+		return err
+	}
+	defer s.close()
+
+	srv, err := web.New(web.Options{
+		Listen:   s.cfg.Web.Listen,
+		Status:   s.mon,
+		Actions:  s.mon,
+		Reader:   s.ledger,
+		Verifier: s.ledger,
+		Exporter: s.exp,
+		Version:  version,
+		Logger:   s.log.With("component", "web"),
+	})
+	if err != nil {
+		return fmt.Errorf("web server: %w", err)
+	}
+
+	runCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+
+	var wg sync.WaitGroup
+	if power != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-runCtx.Done():
+					return
+				case ev, ok := <-power:
+					if !ok {
+						return
+					}
+					if runCtx.Err() != nil {
+						// Shutting down: the stop reason travels via context.Cause; recording a
+						// power_event now could land after monitor_stop.
+						return
+					}
+					s.mon.PowerEvent(ev)
+				}
+			}
+		}()
+	}
+
+	if s.mongo != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Like the dashboard, the MongoDB copy never stops evidence collection.
+			if err := s.mongo.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
+				s.log.Error("MongoDB copy stopped", "err", err)
+			}
+		}()
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// The dashboard is a convenience; if it cannot listen (port in use) the evidence
+		// collection must continue, so a web failure is logged, not fatal.
+		if err := srv.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
+			s.log.Error("dashboard stopped", "err", err, "listen", s.cfg.Web.Listen)
+		}
+	}()
+
+	s.log.Info("att-monitor running", "version", version, "mode", o.mode, "data", o.dataDir,
+		"dashboard", "http://"+s.cfg.Web.Listen, "fingerprint", s.ledger.Fingerprint())
+	err = s.mon.Run(runCtx)
+	cancel(errors.New("monitor stopped"))
+	wg.Wait()
+	if s.mongo != nil {
+		// One last pass copies the monitor_stop record. The budget is short because Windows
+		// allows little time at shutdown; whatever is not copied now is copied at the next start.
+		fctx, fcancel := context.WithTimeout(context.Background(), mongoFinalSync)
+		switch _, serr := s.mongo.SyncOnce(fctx); {
+		case errors.Is(serr, mongostore.ErrIntegrity):
+			s.log.Warn("MongoDB copy disagrees with the ledger; run att-monitor mongo verify", "err", serr)
+		case serr != nil:
+			s.log.Info("MongoDB copy: final pass incomplete; it continues at the next start", "err", serr)
+		}
+		if cerr := s.mongo.Close(fctx); cerr != nil {
+			s.log.Info("MongoDB copy: closing", "err", cerr)
+		}
+		fcancel()
+	}
+	if err != nil && !errors.Is(err, context.Canceled) {
+		return err
+	}
+	return nil
+}
+
+// mongoFinalSync bounds the MongoDB pass made after the monitor stops.
+const mongoFinalSync = 2 * time.Second
+
+// hasLedger reports whether dir holds at least one ledger segment.
+func hasLedger(dir string) bool {
+	for _, pat := range []string{"ledger-*.jsonl", "ledger-*.jsonl.gz"} {
+		if m, _ := filepath.Glob(filepath.Join(dir, pat)); len(m) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// defaultDataDir resolves --data or the default ProgramData location.
+func defaultDataDir(flagValue string) string {
+	if flagValue != "" {
+		abs, err := filepath.Abs(flagValue)
+		if err == nil {
+			return abs
+		}
+		return flagValue
+	}
+	return config.DefaultDataDir()
+}
+
+// now is replaced in tests.
+var now = time.Now

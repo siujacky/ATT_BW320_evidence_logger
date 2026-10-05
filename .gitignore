@@ -1,0 +1,21 @@
+# Secrets — the gateway access code and any access token must never be committed
+password.txt
+*pat*.txt
+*.key
+*.dpapi
+config.json
+
+# Build output
+/bin/
+*.exe
+*.test
+*.out
+
+# Local evidence & runtime data (keep out of source control; back it up separately).
+# Evidence captures and reports contain the gateway's serial number, addresses and the
+# household's outage history.
+/evidence/
+/reports/
+/data/
+/exports/
+*.log

@@ -1,0 +1,23 @@
+
+There is 1 interface on the system:
+
+    Name                   : WLAN
+    Description            : Qualcomm Atheros QCA9377 Wireless Network Adapter
+    GUID                   : 5d2e8c11-0a4b-4c3d-9e8f-7a6b5c4d3e2f
+    Physical address       : 00:00:5e:00:53:03
+    State                  : connected
+    SSID                   : ATTexample-2G
+    BSSID                  : 00:00:5e:00:53:2a
+    Network type           : Infrastructure
+    Radio type             : 802.11n
+    Authentication         : WPA2-Personal
+    Cipher                 : CCMP
+    Connection mode        : Auto Connect
+    Channel                : 6
+    Receive rate (Mbps)    : 144.4
+    Transmit rate (Mbps)   : 72.2
+    Signal                 : 99%
+    Profile                : ATTexample-2G
+
+    Hosted network status  : Not available
+

@@ -1,0 +1,374 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html lang="en" xml:lang="en" xmlns="http://www.w3.org/1999/xhtml" >
+    <head>
+        <title>Status</title>
+        <meta http-equiv="Content-Type" content="text/html; charset=windows-1252" />
+        <meta http-equiv="Content-Style-Type" content="text/css" />
+        <meta http-equiv="Content-Script-Type" content="type" />
+        <link rel="icon" type="image/ico" href="/favicon.ico" />
+        <link rel="stylesheet" type="text/css" href="/baseINID.css" />
+        <link rel="stylesheet" type="text/css" href="/INID.css" />
+<script type="text/css"><!--
+<style id="antiClickjack" type="text/css">body{display:none;}</style>
+//-->
+</script>
+    <script language="javascript" type="text/javascript"><!--
+  adImages=new Array('/images/Block1.gif','/images/Block3.gif','/images/Block5.gif','/images/Block7.gif','/images/Block9.gif','/images/Block11.gif','/images/Block14.gif')
+  thisAd=0
+  imgCt=adImages.length
+if (self == top) {
+    var antiClickjack = document.getElementById("antiClickjack");
+    antiClickjack.parentNode.removeChild(antiClickjack);
+} else {
+    top.location = self.location;
+}
+function rotate(){
+    if (document.images) {
+        thisAd++
+            if (thisAd==imgCt){
+                thisAd=0
+            }
+        document.adBanner.src=adImages[thisAd]
+            setTimeout('rotate()',200)
+    }
+}
+function reloadPage()
+{
+    if (document.forms[0].hidden.value == "update_refresh") {
+      rotate()
+    }
+    else if (document.forms[0].hidden.value == "freshen") {
+      setTimeout("self.location.reload(true)", 10000)
+      rotate()
+    }
+}
+
+
+//-->
+</script>
+    </head>
+           <body>
+  <div id="wrapper">
+    <div id="whole-page">
+      <div id="main-content">
+        <div id="header">
+          <div id="tab-container">
+            <div id="logo-div">
+	      <img id="main-logo" src="/images/att_logo.png" alt="" style="height:42px;" />
+            </div>
+            <div style="clear: both;"></div>
+<div id="skip"><a href="#content-sub">Skip to Main Content</a></div>
+            <div id="top-navigation">
+              <div id="top-navigation-buttons">
+<a class="topnav topnavselected" href="/cgi-bin/home.ha"><span>Device</span></a>
+<a class="topnav" href="/cgi-bin/broadbandstatistics.ha"><span>Broadband</span></a>
+<a class="topnav" href="/cgi-bin/lanstatistics.ha"><span>
+Home Network
+</span></a>
+
+<a class="topnav" href="/cgi-bin/voice.ha"><span>Voice</span></a>
+<a class="topnav" href="/cgi-bin/firewall.ha"><span>Firewall</span></a>
+<a class="topnav" href="/cgi-bin/diag.ha"><span>Diagnostics</span></a>
+              <div style="clear: both;"></div>
+            </div>
+          </div>
+          <div id="secondary-nav">
+            <div id="secondary-nav-buttons">
+<a class="secondary-link sec-selected" href="/cgi-bin/home.ha">Status</a>
+<a class="secondary-link" href="/cgi-bin/devices.ha">Device List</a>
+<a class="secondary-link" href="/cgi-bin/sysinfo.ha">System Information</a>
+<a class="secondary-link" href="/cgi-bin/routerpasswd.ha">Access Code</a>
+<a class="secondary-link" href="/cgi-bin/remoteaccess.ha">Remote Access</a>
+<a class="secondary-link" href="/cgi-bin/restart.ha">Restart Device</a>
+                  </div></div></div>
+                <div style="clear: both;"></div>
+              </div>
+        <div style="clear: both;"></div>
+      <div id="mid-section">
+          <div id="content-padding"><!-- CONTENT -->
+            <div id="content"
+ style="width:938px;"
+><div id="content-sub">
+                <div class="first-section-header">
+                            <div class="status-section">
+                                <div class="button-header-container">
+                                    <h1 class="button-header">Status</h1>
+                                    <form method="post" action="/cgi-bin/sysinfo.ha">
+<input type="hidden" name="nonce" value="6dd713521c96b1586f6317c9eafa7624494b26f2ea13296b0cf1376a0d7a73b0" />
+                                    <input type="submit" name="Sysinfo" class="cssbtn" value="More Info" />
+                                    </form>
+                                                                        <div style="clear: both;"></div>
+                                </div>
+                                                                <!-- broadband -->
+                                <div class="status-div">
+                                    <h2>Broadband</h2>
+                                    <img class="status-img" src="/images/status_broadband.png" alt="Broadband" title="Broadband" />
+                                    <form method="post" action="/cgi-bin/crestart.ha?1">
+<input type="hidden" name="nonce" value="a7ed98a6d1535561fd29a4135969f4f778170a95adc0fc84683b29015706a207" />
+                                    <div class="status-line">
+                                        <div class="status-label">Broadband Connection</div>
+                                        <div class="status-value state-good">Up
+                                    </div>
+                                                                        <div class="status-button">
+                                        <input type="submit" name="Broadband" class="cssbtn" value="Restart" />
+                                    </div>
+                                                                    </div>
+                                </form>
+                                <div style="clear: both;"></div>
+                            </div><!-- status-div -->
+                                                        <!-- wi-fi -->
+                            <div class="status-div">
+                                <h2>Wi-Fi</h2>
+                                <img class="status-img" src="/images/status_wifi.png" alt="Wi-Fi" title="Wi-Fi" />
+                                <table class="status-table" summary="Wi-Fi for each configurable SSID on each Radio">
+                                    <tr>
+                                        <th valign="top" scope="row" class="head">
+                                            2.4 GHz Frequency Status</th>
+                                        <td class="value">
+                                            <span class="state-good">Enabled
+                                            </span></td>
+                                        <td class="button">
+                                            <form method="post" action="/cgi-bin/wrestart.ha?1">
+<input type="hidden" name="nonce" value="03ff59e29af037e419a32de568109d035ba8d90818c14407cae849f90a05744c" />
+                                            <!-- This is to avoid error : User should not request this page directly -->
+                                            <form method="post" action="/cgi-bin/wrestart.ha">
+<input type="hidden" name="nonce" value="d09c07a218bf2da7d49dc745e96e24bcb5c3f235c52a643e7f91a7fdd0eb3f89" />
+                                            <input type="submit" name="WRestart1" class="cssbtn" value="Restart" />
+                                            </form>
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <th scope="row" class="label">Network Name (SSID)</th>
+                                        <td class="value">
+                                            <div class="wraptext">
+                                                 <pre>ATTexample</pre>
+                                            </div>
+                                        </td>
+                                        <td>&nbsp;</td>
+                                    </tr>
+                                    <tr>
+                                        <th scope="row" class="label">Type</th>
+                                        <td class="value">Home</td>
+                                    </tr>
+                                    <tr>
+                                                                                <th scope="row" class="label">Status</th>
+                                        <td class="value">
+                                            Enabled
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                                                                <th scope="row" class="label">Password</th>
+                                        <td class="value">
+                                            <div class="wraptext">
+                                                                                                <a href="/cgi-bin/wconfig_unified.ha">Click here for details</a>
+                                            </div>
+                                        </td>
+                                        <td>&nbsp;</td>
+                                    </tr>
+                                    <tr>
+                                                                                <th scope="row" class="label">Authentication Type</th>
+                                        <td class="value">
+                                            WPA-2
+                                        </td>
+                                        <td>&nbsp;</td>
+                                    </tr>
+                                                                        <tr>
+                                        <td>&nbsp;</td>
+                                    </tr>
+                                    <tr>
+                                        <th scope="row" class="label">Network Name (SSID)</th>
+                                        <td colspan="2" class="value2">
+                                            <div class="wraptext">
+                                               <pre>ATTexample_Guest</pre>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <th scope="row" class="label">Type</th>
+                                        <td class="value">Guest</td>
+                                    </tr>
+                                    <tr>
+                                        <th scope="row" class="label">Status</th>
+                                        <td class="value">
+                                            Disabled
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                                                                <th scope="row" class="label">Password</th>
+                                        <td class="value">
+                                            <div class="wraptext">
+                                                                                                <a href="/cgi-bin/wconfig_unified.ha">Click here for details</a>
+                                            </div>
+                                        </td>
+                                        <td>&nbsp;</td>
+                                    </tr>
+                                    <tr>
+                                                                                <th scope="row" class="label">Authentication Type</th>
+                                        <td class="value">
+                                            Disabled
+                                        </td>
+                                        <td>&nbsp;</td>
+                                    </tr>
+                                                                        <tr>
+                                        <td>&nbsp;</td>
+                                    </tr>
+                                    <tr>
+                                        <th valign="top" scope="row" class="head">
+                                            5 GHz Frequency Status</th>
+                                        <td class="value">
+                                            <span class="state-good">Enabled
+                                            </span></td>
+                                        <td class="button">
+                                            <form method="post" action="/cgi-bin/wrestart.ha?2">
+<input type="hidden" name="nonce" value="28ef175e5ada78923731decc431905b4d60be3861f2277b3e8bd4d27b0bea04c" />
+                                            <!-- This is to avoid error : User should not request this page directly -->
+                                            <form method="post" action="/cgi-bin/wrestart.ha">
+<input type="hidden" name="nonce" value="66af1a63ac2f43cb99571959af65e521cac6e4bb75da893cd35944bbfea5337e" />
+                                            <input type="submit" name="WRestart2" class="cssbtn" value="Restart" />
+                                            </form>
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                                                                <th scope="row" class="label">Network Name (SSID)</th>
+                                        <td class="value">
+                                            <div class="wraptext">
+                                                <pre>ATTexample</pre>
+                                            </div>
+                                        </td>
+                                        <td>&nbsp;</td>
+                                    </tr>
+                                    <tr>
+                                        <th scope="row" class="label">Type</th>
+                                        <td class="value">Home</td>
+                                    </tr>
+                                    <tr>
+                                                                                <th scope="row" class="label">Status</th>
+                                        <td class="value">
+                                            Enabled
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                                                                <th scope="row" class="label">Password</th>
+                                        <td class="value">
+                                            <div class="wraptext">
+                                                                                                <a href="/cgi-bin/wconfig_unified.ha">Click here for details</a>
+                                            </div>
+                                        </td>
+                                        <td>&nbsp;</td>
+                                    </tr>
+                                    <tr>
+                                        <th scope="row" class="label">Authentication Type</th>
+                                        <td class="value">
+                                            WPA-2
+                                        </td>
+                                        <td>&nbsp;</td>
+                                    </tr>
+                                    <tr>
+                                        <td>&nbsp;</td>
+                                    </tr>
+                                                                    </table>
+                                <div style="clear: both;"></div>
+                            </div><!-- status-div -->
+                                                    <!-- voice -->
+                        <div class="status-div">
+                            <h2>VoIP</h2>
+                            <!-- voice line 1 -->
+                            <img class="status-img" src="/images/status_voice.png" alt="Voice" title="Voice" />
+                            <form method="post" action="/cgi-bin/vrestart.ha?1">
+<input type="hidden" name="nonce" value="3871aa2b82c69e9d605a82624bc7a6615cf19052d6c8d41f799d11b5eda83b4d" />
+                            <!-- This is to avoid error : User should not request this page directly -->
+                            <form method="post" action="/cgi-bin/vrestart.ha">
+<input type="hidden" name="nonce" value="b1c4504a515ec7866d4404ec5da58dde4ae5af4a5b507ad8089a87baaab2592f" />
+                            <div class="status-line">
+                                                                <div class="status-label">Line 1 <span class="phonenumber">
+                                        Not Subscribed</span></div>
+                                                                    <div class="status-value state-bad"><img src="/images/error.png" alt="WARNING" />
+                                        Down                                        </div>
+                                        <div class="status-button">
+                                            <input type="submit" name="VRestart1" class="cssbtn" value="Restart" />
+                                        </div>
+                                    </div>
+                                    </form>
+                                    <div style="clear: both;"></div>
+                                    <!-- voice line 2 -->
+                                    <img class="status-img" src="/images/spacer.gif" height="1" alt="Voice" title="Voice" />
+                                    <form method="post" action="/cgi-bin/vrestart.ha?2">
+<input type="hidden" name="nonce" value="ce5bd720e7d60883ffd473c4e642ce03353f579a633ef8d469f3957410fe0fe1" />
+                                    <!-- This is to avoid error : User should not request this page directly -->
+                                    <form method="post" action="/cgi-bin/vrestart.ha">
+<input type="hidden" name="nonce" value="619c522bb8ec056b6a6850b7ab49866c6af0ca3237b7eb9cb1f52ba3be4add17" />
+                                    <div class="status-line">
+                                        <div class="status-label">Line 2 <span class="phonenumber">
+                                                Not Subscribed</span></div>
+                                                                                    <div class="status-value state-bad"><img src="/images/error.png" alt="WARNING" />
+                                                Down                                                </div>
+                                                <div class="status-button">
+                                                    <input type="submit" name="VRestart2" class="cssbtn" value="Restart" />
+                                                </div>
+                                            </div>
+                                            </form>
+                                            <div style="clear: both;"></div>
+                                        </div><!-- status-div -->
+                                                                            </div> <!-- status-section -->
+                                                                        <div class="task-section">
+                                        <h1>Common Tasks</h1>
+                                        <div class="task-list" style="min-height:256px
+;">
+                                                                                        <a href="https://myhomenetwork.att.com/#/login">Smart Home Manager - Control your home network from one easy-to-use app <span class="chevron">&#0187;</span></a><br />
+                                            <a href="http://www.att.com/esupport/">Go to AT&amp;T online support for troubleshooting and repair <span class="chevron">&#0187;</span></a><br />
+                                                                                        <a href="/cgi-bin/wconfig_unified.ha">Modify your Wi-Fi security or settings <span class="chevron">&#0187;</span></a><br />
+                                                                                        <a href="/cgi-bin/restart.ha">Restart your device <span class="chevron">&#0187;</span></a><br />
+                                                                                        <a href="devices.ha">Find a computer on your
+                                                home
+ network <span class="chevron">&#0187;</span></a><br />
+                                                                                        <a href="/cgi-bin/apphosting.ha">Adjust firewall settings
+                                                 for gaming and applications
+<span class="chevron">&#0187;</span></a><br />
+                                                                                    </div>
+                                    </div>
+                                    <div style="clear: both;"></div>
+                                    <!-- end of home -->
+                                    <div class="button-header-container">
+                                        <div class="button-header">
+                                            Home Network Devices</div>
+                                        <form method="post" action="/cgi-bin/devices.ha">
+<input type="hidden" name="nonce" value="b9deb03a30d68f6e23508470d8dfdfbd3162980dfc2ad7234136f6cd021f18f1" />
+                                        <input type="submit" name="Devices" class="cssbtn" value="More Info" />
+                                        </form>
+                                    </div>
+
+                                    <table class="table100" summary="LAN Host Discovery Table">
+                                        <tr>
+                                            <th scope="col" width="33%">Device IP Address / Name</th>
+                                            <th scope="col" width="8%">Status</th>
+                                            <th scope="col" width="12%">Connection</th>
+                                                                                            <th scope="col" width="30%">Frequency, Type, Name</th>
+                                                                                        <th scope="col" width="17%">Mesh Client</th>
+                                        </tr>
+                                        <tr><td scope="row" class="col2">minipc-1</td><td class="col2">off</td><td class="col2">Ethernet</td><td class="col2">&nbsp;</td><td class="col2">No</td></tr>
+<tr><td scope="row" class="col2">00000000-0000-0000-0000-000000000000</td><td class="col2">off</td><td class="col2">Wi-Fi</td><td class="col2">5 GHz, Home, ATTexample</td><td class="col2">No</td></tr>
+<tr><td scope="row" class="col2">192.168.1.69 / PHONE-1</td><td class="col2">on</td><td class="col2">Wi-Fi&nbsp;&nbsp;&nbsp;<img src="/images/signal-strength-5-bar.png" alt="Wi-Fi 5 bars" /></td><td class="col2"><pre class="column">5 GHz, Home, ATTexample</pre></td><td class="col2">No</td></tr>
+<tr><td scope="row" class="col2">192.168.1.71 / DESKTOP-MONITOR</td><td class="col2">on</td><td class="col2">Wi-Fi&nbsp;&nbsp;&nbsp;<img src="/images/signal-strength-4-bar.png" alt="Wi-Fi 4 bars" /></td><td class="col2"><pre class="column">5 GHz, Home, ATTexample</pre></td><td class="col2">No</td></tr>
+<tr><td scope="row" class="col2">192.168.1.72 / LAPTOP-1</td><td class="col2">off</td><td class="col2">Wi-Fi</td><td class="col2"><pre class="column">5 GHz, Home, ATTexample</pre></td><td class="col2">No</td></tr>
+<tr><td scope="row" class="col2">192.168.1.73 / DESKTOP-OTHER</td><td class="col2">off</td><td class="col2">Wi-Fi</td><td class="col2"><pre class="column">5 GHz, Home, ATTexample</pre></td><td class="col2">No</td></tr>
+<tr><td scope="row" class="col2">192.168.1.74 / PHONE-2</td><td class="col2">on</td><td class="col2">Wi-Fi&nbsp;&nbsp;&nbsp;<img src="/images/signal-strength-3-bar.png" alt="Wi-Fi 3 bars" /></td><td class="col2"><pre class="column">5 GHz, Home, ATTexample</pre></td><td class="col2">No</td></tr>
+                                    </table>
+                                                                    </div>
+                                                </div>
+              </div>
+            </div>
+ <!-- isWANUP -->
+            <div style="clear: both;"></div>
+          </div>
+        </div>
+        <div style="clear: both;"></div>
+      </div>
+      <div id="footer">
+      <div><br>
+   <span class="inner">&copy; 2016-2025 AT&T Intellectual Property. All rights reserved. AT&T and Globe logo are registered trademarks of AT&T Intellectual Property.</span>
+   <span class="sitemap"><a href="/cgi-bin/sitemap.ha">Site Map</a></span></br></div>
+   <div><span class="inner">&copy; 2016 ARRIS Enterprises LLC. All rights reserved. ARRIS is a registered trademark of ARRIS Enterprises LLC.</span></div>
+   </div>
+      </div>
+</body>
+</html>

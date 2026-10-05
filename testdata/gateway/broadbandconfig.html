@@ -1,0 +1,166 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html lang="en" xml:lang="en" xmlns="http://www.w3.org/1999/xhtml" >
+    <head>
+        <title>Configure</title>
+        <meta http-equiv="Content-Type" content="text/html; charset=windows-1252" />
+        <meta http-equiv="Content-Style-Type" content="text/css" />
+        <meta http-equiv="Content-Script-Type" content="type" />
+        <link rel="icon" type="image/ico" href="/favicon.ico" />
+        <link rel="stylesheet" type="text/css" href="/baseINID.css" />
+        <link rel="stylesheet" type="text/css" href="/INID.css" />
+<script type="text/css"><!--
+<style id="antiClickjack" type="text/css">body{display:none;}</style>
+//-->
+</script>
+    <script language="javascript" type="text/javascript"><!--
+  adImages=new Array('/images/Block1.gif','/images/Block3.gif','/images/Block5.gif','/images/Block7.gif','/images/Block9.gif','/images/Block11.gif','/images/Block14.gif')
+  thisAd=0
+  imgCt=adImages.length
+if (self == top) {
+    var antiClickjack = document.getElementById("antiClickjack");
+    antiClickjack.parentNode.removeChild(antiClickjack);
+} else {
+    top.location = self.location;
+}
+function rotate(){
+    if (document.images) {
+        thisAd++
+            if (thisAd==imgCt){
+                thisAd=0
+            }
+        document.adBanner.src=adImages[thisAd]
+            setTimeout('rotate()',200)
+    }
+}
+function reloadPage()
+{
+    if (document.forms[0].hidden.value == "update_refresh") {
+      rotate()
+    }
+    else if (document.forms[0].hidden.value == "freshen") {
+      setTimeout("self.location.reload(true)", 10000)
+      rotate()
+    }
+}
+
+
+//-->
+</script>
+    </head>
+           <body>
+  <div id="wrapper">
+    <div id="whole-page">
+      <div id="main-content">
+        <div id="header">
+          <div id="tab-container">
+            <div id="logo-div">
+	      <img id="main-logo" src="/images/att_logo.png" alt="" style="height:42px;" />
+            </div>
+            <div style="clear: both;"></div>
+<div id="skip"><a href="#content-sub">Skip to Main Content</a></div>
+            <div id="top-navigation">
+              <div id="top-navigation-buttons">
+<a class="topnav" href="/cgi-bin/home.ha"><span>Device</span></a>
+<a class="topnav topnavselected" href="/cgi-bin/broadbandstatistics.ha"><span>Broadband</span></a>
+<a class="topnav" href="/cgi-bin/lanstatistics.ha"><span>
+Home Network
+</span></a>
+
+<a class="topnav" href="/cgi-bin/voice.ha"><span>Voice</span></a>
+<a class="topnav" href="/cgi-bin/firewall.ha"><span>Firewall</span></a>
+<a class="topnav" href="/cgi-bin/diag.ha"><span>Diagnostics</span></a>
+              <div style="clear: both;"></div>
+            </div>
+          </div>
+          <div id="secondary-nav">
+            <div id="secondary-nav-buttons">
+<a class="secondary-link" href="/cgi-bin/broadbandstatistics.ha">Status</a>
+<a class="secondary-link sec-selected" href="/cgi-bin/broadbandconfig.ha">Configure</a>
+<a class="secondary-link" href="/cgi-bin/fiberstat.ha">Fiber Status</a>
+                  </div></div></div>
+                <div style="clear: both;"></div>
+              </div>
+        <div style="clear: both;"></div>
+      <div id="mid-section">
+          <div id="content-padding"><!-- CONTENT -->
+            <div id="content"
+><div id="content-sub">
+                <div class="first-section-header">
+                   <h1>Configure</h1></div>
+    
+                   <div class="section-content">
+                     <form method="post" action="/cgi-bin/broadbandconfig.ha">
+<input type="hidden" name="nonce" value="f5a7226eb4cfc2eab3531295edc649d4e4b4306ac5d1960c63acb9f9158fb19f" />
+                       <table cellpadding="2" width="75%" summary="Configuration of WAN parameters">
+                   <tr>
+                     <td class="nojavamsg" colspan="12" >
+                     <noscript>
+                       You have disabled JavaScript(TM) in your browser. When you change an item that has an Update button to the right of it, make your change, then click the Update button. This will transform the page according to the change you have made and you may then proceed.
+                     </noscript>
+                     </td>
+                  </tr>
+                     <tr><th scope="row" width="45%"><label for="wansource">Broadband Source Override</label></th>
+                         <td width="30%">
+<select id="wansource" name="source"  >
+<option value="auto"
+ selected="selected">Auto</option>
+<option value="ethernet"
+>Ethernet</option>
+<option value="fiber"
+>Fiber</option>
+                   </select>
+                         &nbsp;
+                         <noscript>
+                           <input type="submit" name="Update" class="buttonclass buttonclasssmall" value="Update" />
+                         </noscript>
+                     </td>
+                     </tr>
+                    <tr>
+                      <th scope="row"><label for="MTU">Base MTU</label></th>
+                      <td class="input_example"><input id="MTU" type="text" name="MTUW" size="4" maxlength="4" value="1500"  class="errport" /><br /><span class="example">e.g. 1500</span>
+                      </td>
+                    </tr>
+                    <tr>
+                      <th scope="row"><label for="MTU6">IPv6 MTU</label></th>
+                      <td class="input_example"><input id="MTU6" type="text" name="MTU6" size="4" maxlength="4" value="1500"  class="errport" disabled="disabled" /><br /><span class="example">e.g. 1472</span>
+                      </td>
+                    </tr>
+                       </table>
+                       <br /><br />
+                       <div>
+                           <input type="submit" name="Save" class="cssbtn smallbtn btnspacer" value="Save" />
+                           <input type="submit" name="Cancel" class="cssbtn smallbtn" value="Cancel" />
+                       </div>
+                      </form>
+                   </div>
+
+                </div>
+              </div>
+            </div>
+ <!-- isWANUP -->
+            <div id="help">
+              <div id="help-sub">
+              <h2>Help</h2><br />
+      <strong>Broadband Source Override:</strong> This field indicates the type of WAN interface in use.
+      <ul><li><strong>Auto</strong> will cause the system to attempt to figure out by trial and error what type of line is connected.</li>
+      <li><strong>Ethernet</strong> will tell the system that a WAN Ethernet interface is in use.</li>
+      <li><strong>Fiber</strong> will tell the system that a Fiberoptic interface is in use.</li>
+      </ul>
+      <strong>Base MTU:</strong> The MTU (Maximum Transmittable Unit) indicates the maximum packet size before the device will split a packet into multiple packets. The MTU range is 1280 - 1500 with IPv6 enabled.<br /><br />
+      <strong>IPv6 MTU:</strong> Any IPv6 packet larger than the IPv6 MTU will be rejected and the originator will receive a 'Packet Too Big' message. In native IPv6, the Base MTU and IPv6 MTU are configured independently. When using 6rd, the IPv6 MTU is not configurable.
+                  </div> <!-- help-sub -->
+            </div> <!-- help -->
+            <div style="clear: both;"></div>
+          </div>
+        </div>
+        <div style="clear: both;"></div>
+      </div>
+      <div id="footer">
+      <div><br>
+   <span class="inner">&copy; 2016-2025 AT&T Intellectual Property. All rights reserved. AT&T and Globe logo are registered trademarks of AT&T Intellectual Property.</span>
+   <span class="sitemap"><a href="/cgi-bin/sitemap.ha">Site Map</a></span></br></div>
+   <div><span class="inner">&copy; 2016 ARRIS Enterprises LLC. All rights reserved. ARRIS is a registered trademark of ARRIS Enterprises LLC.</span></div>
+   </div>
+      </div>
+</body>
+</html>
