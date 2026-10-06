@@ -29,6 +29,15 @@ const (
 	condSyslogReceiverDown = "SYSLOG_RECEIVER_DOWN"
 	// SYSLOG_STORE_FAILING (warning): the syslog store fails, so received messages may be lost.
 	condSyslogStoreFailing = "SYSLOG_STORE_FAILING"
+	// SYSLOG_SETTING_FAILED (warning): the monitor could not set the gateway's Syslog page as
+	// gateway.enforce_syslog or the operator wants it (the gateway client's error, the page not
+	// understood, this computer's address not known or not on the gateway's network); the next
+	// settings check tries again - also a switch-off the operator asked for.
+	condSyslogSettingFailed = "SYSLOG_SETTING_FAILED"
+	// SYSLOG_NOT_ARRIVING (info): the gateway's Syslog setting sends its log to this computer,
+	// but no message from the gateway arrived for 24 hours (at its level the gateway may log
+	// little).
+	condSyslogNotArriving = "SYSLOG_NOT_ARRIVING"
 )
 
 // An SNTP offset (median of the answers of the latest clock check that got any) beyond
@@ -153,11 +162,13 @@ func egressCondition(e *model.EgressCheck, since time.Time, seq uint64) (model.C
 
 // noAccessCodeCondition is shown while no gateway access code is stored, or the gateway client
 // reported that the stored one cannot be used (contracts.ErrGatewayNoAccessCode; detail is
-// its error) (DESIGN §9): the outage-redirect setting can then be neither checked nor enforced.
+// its error) (DESIGN §9): the gateway's settings behind its login - the outage redirect and the
+// Syslog page - can then be neither checked nor set.
 func noAccessCodeCondition(detail string) model.Condition {
-	msg := "No gateway access code is configured, so the gateway's outage-redirect setting (Broadband Status Notification) cannot be checked or enforced (att-monitor set-access-code)"
+	const settings = "the gateway's settings - the outage redirect (Broadband Status Notification) and the Syslog page - cannot be checked or set (att-monitor set-access-code)"
+	msg := "No gateway access code is configured, so " + settings
 	if detail != "" {
-		msg = "The stored gateway access code could not be used (" + detail + "), so the gateway's outage-redirect setting (Broadband Status Notification) cannot be checked or enforced (att-monitor set-access-code)"
+		msg = "The stored gateway access code could not be used (" + detail + "), so " + settings
 	}
 	return model.Condition{Code: condNoAccessCode, Severity: "info", Message: msg}
 }
@@ -193,7 +204,7 @@ func certChangedCondition(pending string, since time.Time, seq uint64) model.Con
 	c := model.Condition{
 		Code:     condGatewayCertChanged,
 		Severity: "critical",
-		Message: fmt.Sprintf("AT&T gateway presented a TLS certificate (SHA-256 %s) different from the pinned one: status pages are still read, but authenticated requests (the notification setting) are paused until the certificate is confirmed (trust-cert)",
+		Message: fmt.Sprintf("AT&T gateway presented a TLS certificate (SHA-256 %s) different from the pinned one: status pages are still read, but authenticated requests (checking and setting the outage-redirect and Syslog settings) are paused until the certificate is confirmed (trust-cert)",
 			pending),
 		Seq: seq,
 	}

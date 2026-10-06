@@ -3,7 +3,8 @@
 Status: approved by the owner's goals of 2026-10-05: "monitor the traffic and syslog and auto change
 the router send the syslog and snmp to this machine"; "for the syslog only keep last 100mb and allow
 user to choose keep how many syslog"; "if no snmp can you using Traffic counters to do a flow meter
-or snmp flow chart". Built in the phases below.
+or snmp flow chart". Built in the phases below: phase 1 is built and deployed; phase 2, the automatic
+setting of the gateway's Syslog page, is built and waits for its deployment (2.3).
 
 ## 1. What was asked, and what it means here
 
@@ -13,11 +14,11 @@ or snmp flow chart". Built in the phases below.
 | "if no snmp … use the traffic counters to do a flow meter or snmp flow chart" | An MRTG-style traffic graph (in/out bits per second over time, with current, average and maximum) built from the gateway's own counters, and a live flow meter (current Mb/s down and up) | owner |
 | "monitor … syslog" | Receive the gateway's own log messages on this PC, keep them, show and search them on the dashboard | owner |
 | "only keep last 100mb, allow user to choose" | Syslog messages are kept within a size limit, 100 MB by default, which the user can change (dashboard, CLI, config); the oldest messages go first | owner |
-| "auto change the router send the syslog … to this machine" | The monitor sets the gateway's Syslog page itself (on, this PC's address, port 514) and keeps it that way, like the outage-redirect setting | owner |
+| "auto change the router send the syslog … to this machine" | The monitor sets the gateway's Syslog page itself (on, this PC's address, port 514, the most detailed level the gateway offers) and keeps it that way, like the outage-redirect setting; the owner can stop that (dashboard, CLI) | owner - built in phase 2 |
 | "… and snmp to this machine" | SNMP polling or traps from the gateway | owner — **not possible, see §2** |
 | Evidence rules still apply | What is kept is signed, chained and time-stamped (directly, or through a recorded SHA-256); verdicts do not change without a rules-version change; authenticated gateway requests stay rare and verified | assumption, from DESIGN.md |
 
-## 2. Findings (2026-10-05, on the owner's BGW320-505, firmware 6.34.7)
+## 2. Findings (2026-10-05, on the owner's BGW320-505, firmware 6.34.7; the real Syslog page from the phase-1 deployment)
 
 | Question | Answer | Evidence |
 |---|---|---|
@@ -26,6 +27,9 @@ or snmp flow chart". Built in the phases below.
 | Where does traffic come from? | The gateway's own WAN counters on Broadband Status (IPv4 receive/transmit bytes and packets; the byte counters are 32-bit and wrap every 4 GiB), read every 60 s (15 s during incidents) and already turned into Mb/s for the classifier; per-radio Wi-Fi byte counters on Home Network Status (every 15 min); this PC's own 64-bit interface counters (`GetIfEntry2Ex`). | `testdata/gateway/broadbandstatistics.html`, `lanstatistics.html`, `internal/monitor/traffic.go` |
 | What does the gateway's own log look like today? | Diagnostics → Logs shows only the firewall log (dropped packets), about 19 entries a minute. System events (PON, DHCP, link) are what syslog adds. | `evidence/bootstrap/initial-snapshot/logs.auth.html` |
 | Is UDP 514 free on this PC? | Yes. | `netstat -ano -p UDP` |
+| What does the real Syslog page look like? | Read by the phase-1 service (read only) and kept, its nonce replaced, as `testdata/gateway/syslog_real_off.html`: a form posting to `/cgi-bin/syslog.ha` with a hidden `nonce`; *Syslog* is a drop-down list `syslog` (Off/On) that submits the form when it changes, followed by a noscript **Update** button for browsers without JavaScript; then *Server IP Address* (`location`, at most 43 characters: IPv4, IPv6 or a name), *Server Port* (`port`, 514) and *Log Level* (`level`); **Save** and **Cancel**. | the recorded page (a `gateway_event` `syslog_setting`) |
+| Can the page be set in one POST? | **No.** While Syslog is off the three fields are present but **disabled**, and a browser never submits a disabled control. The page says what to do: change the drop-down, then press **Update** ("This will transform the page according to the change you have made and you may then proceed"); the page it returns has the fields enabled; fill them in, then **Save**. The gateway client does the same (the *Update round*). How the gateway answers the Update and the Save (a 200 page or a redirect, a new nonce) has not been observed: both are handled, and only the page read back afterwards decides. | the page's own text |
+| Which log levels? | Emergency, Alert, Critical, Error (selected while off), Warning, Notice - each option's value is its text - and **no Informational, no Debug**: the most detailed level this gateway offers is **Notice**. The page's help says it sends "firewall log messages" at the chosen severity; which messages arrive is learnt once it is set. | the page |
 
 ## 3. Design
 
@@ -34,19 +38,30 @@ or snmp flow chart". Built in the phases below.
 * **Gateway client** (`internal/gateway`, built): a generic form reader that finds controls by their
   labels and posts forms back exactly as a browser without JavaScript would; `Syslog()` reads the
   page (authenticated, read-only, through the existing login policy); `SetSyslog(want)` changes only
-  the syslog controls, makes the noscript *Update* round when the page needs it, saves, reads the page
-  back and succeeds only if it shows `want`. It never posts a form it does not fully understand.
+  the syslog controls, makes the noscript *Update* round when the switch changes (the real page
+  enables its fields only then: §2), saves from the page the gateway answered with, reads the page
+  back and succeeds only if it shows `want`. It never posts a form it does not fully understand, nor
+  a disabled control, nor enables one. Tested against the real page and pages derived from it.
 * **Target:** Syslog on; Server IP = this PC's IPv4 address on the interface that reaches the
   gateway; Server Port = `syslog.port` (514); Log Level = `gateway.syslog_level`, else the level
   already set when syslog is on, else an option named like "Informational", else the most detailed
-  option that is not "Debug".
-* **Monitor:** the daily notification check reads the Syslog page in the same login session (and
-  within minutes after this PC's address changes). Each read is a `gateway_event` `syslog_setting`
-  (housekeeping) with the page as a blob. Phase 2 adds enforcement (`gateway.enforce_syslog`, default
-  on) and operator control (`att-monitor gateway syslog on|off`, API, dashboard), each change recorded
-  with the pages before and after and a `config_change`.
-* **Rollout safety:** enforcement ships only after phase 1 has read the real page on the owner's
-  gateway and the reader has been tested against that exact page (kept, sanitized, as a fixture).
+  option that is not "Debug" - **Notice** on the owner's BGW320-505 (firmware 6.34.7).
+* **Monitor** (phase 2, built): the daily notification check reads the Syslog page in the same login
+  session (and within minutes after this PC's address changes). Each read is a `gateway_event`
+  `syslog_setting` (housekeeping) with the page as a blob. With `gateway.enforce_syslog` (default on)
+  a page that shows anything else is set to the target in the same check, recorded with the pages
+  before and after (a `gateway_event` `syslog_setting` and a `config_change`); a failed attempt is a
+  `config_change` "failed: …" and the condition `SYSLOG_SETTING_FAILED`, and is tried again at the
+  next check (enforcement adds no login of its own). `SYSLOG_NOT_ARRIVING` (info) says when no message
+  from the gateway arrived for a day while it is set to send here.
+* **Operator control** (phase 2, built): `SetGatewaySyslog` - the dashboard's Syslog page and Overview
+  card ("Send the gateway's log to this PC" / "Stop sending", each confirmed first), `POST
+  /api/gateway/syslog`, `att-monitor gateway syslog on|off`. On sets the page now and keeps it so; off
+  switches it off on the gateway and stops keeping it. The choice is `gateway.enforce_syslog`, saved and
+  recorded as a `config_change` when it changes.
+* **Rollout safety:** met. Phase 1 read the real page on the owner's gateway, it is kept (sanitized) as
+  a fixture, and the reader and `SetSyslog` are tested against it; the first real change is made by the
+  deployed service (2.3), read back and recorded like every other.
 
 ### 3.2 Syslog receiver and the syslog store (kept within 100 MB)
 
@@ -118,8 +133,9 @@ or snmp flow chart". Built in the phases below.
 "gateway": { "...": "...", "enforce_syslog": true, "syslog_level": "" }
 ```
 
-`gateway.enforce_syslog` and `syslog_level` arrive with phase 2. Several monitors on one home network
-would fight over the gateway's setting: only one should enforce (README).
+`gateway.enforce_syslog` (default true; the operator's choice changes and saves it) and `syslog_level`
+(default "") came with phase 2. Several monitors on one home network would fight over the gateway's
+setting: only one should enforce (README).
 
 ### 3.5 Safety and security
 
@@ -151,16 +167,16 @@ would fight over the gateway's setting: only one should enforce (README).
 | 1.9 | Exports and verifiers: chunks in bundles, checked against their records | done |
 | 1.10 | MongoDB: `syslog` collection following the chunks and prunes; `mongo verify` | done |
 | 1.11 | CLI and install: wiring, firewall rule, `gateway syslog status`, `syslog` (list), `syslog retention`; docs | done |
-| 1.12 | Review (correctness, gateway safety and security, evidence and UX), fixes, full tests (`-race`, live MongoDB), e2e with test datagrams | |
-| 1.13 | Deploy (one UAC prompt): the service reads `syslog.ha` once (read-only) and records the page | |
+| 1.12 | Review (correctness, gateway safety and security, evidence and UX), fixes, full tests (`-race`, live MongoDB), e2e with test datagrams | done |
+| 1.13 | Deploy (one UAC prompt): the service reads `syslog.ha` once (read-only) and records the page | done: the real page (§2) |
 
 ### Phase 2 — automatic setting
 
-| # | Task |
-|---|---|
-| 2.1 | Sanitize the captured `syslog.ha` into a fixture; test the reader and `SetSyslog` against it; adjust |
-| 2.2 | Enforcement in the daily check, `gateway syslog on/off` (CLI, API, dashboard), `gateway.enforce_syslog` default on, `syslog_level` |
-| 2.3 | Review, fixes, full tests; deploy (UAC): the gateway is set (event + config_change with before/after pages), messages arrive, are kept, counted against the limit, copied to MongoDB |
+| # | Task | Status |
+|---|---|---|
+| 2.1 | Sanitize the captured `syslog.ha` into a fixture; test the reader and `SetSyslog` against it; adjust (the fields are disabled while Syslog is off: the Update round, then the Save from the transformed page) | done |
+| 2.2 | Enforcement in the daily check, `gateway syslog on/off` (CLI, API, dashboard), `gateway.enforce_syslog` default on, `syslog_level` | done |
+| 2.3 | Review, fixes, full tests; deploy (UAC): the gateway is set (event + config_change with before/after pages), messages arrive, are kept, counted against the limit, copied to MongoDB | |
 
 ### Phase 3 — reports and release
 

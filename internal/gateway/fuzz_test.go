@@ -13,7 +13,8 @@ import (
 func FuzzParsers(f *testing.F) {
 	for _, name := range []string{"sysinfo.html", "broadbandstatistics.html", "fiberstat.html", "lanstatistics.html",
 		"events_checked.html", "login_nonce.html", "hiddenpage.html", "home.html", "broadbandconfig.html",
-		"syslog_select.html", "syslog_checkbox_off.html", "syslog_checkbox_on.html", "syslog_radio.html"} {
+		"syslog_select.html", "syslog_checkbox_off.html", "syslog_checkbox_on.html", "syslog_radio.html",
+		"syslog_real_off.html", "syslog_real_on_update.html", "syslog_real_on.html"} {
 		f.Add(fixture(f, name))
 	}
 	f.Add([]byte("<form><table><tr><th>Syslog<td><select name=s><option value=1 selected>On<noscript><input type=submit name=Update></noscript></select><label for=s>Server Port</label>"))

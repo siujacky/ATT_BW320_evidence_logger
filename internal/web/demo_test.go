@@ -12,7 +12,8 @@ package web
 // that records no cycle, /demo/dnsretry a lost AT&T resolver query and its retry, /demo/clock
 // the CLOCK_OFFSET condition, /demo/cert makes the gateway present a changed certificate,
 // /demo/noaccess and /demo/anchoruntrusted show those conditions, /demo/syslog?state=... the
-// gateway syslog card's other states, /demo/syslogflood a flood of datagrams of control
+// gateway syslog card's other states, /demo/syslogfail?on=gateway|record a failing change of
+// the gateway's Syslog setting, /demo/syslogflood a flood of datagrams of control
 // characters, /demo/live?state=... the flow meter's, /demo/quit stops
 // the server (see TestDemoServer for the others). ATTMON_WEB_DEMO_STATE=outage starts in outage mode;
 // ATTMON_WEB_DEMO_HOSTILE=1 appends "<img src=x onerror=alert(1)>" to every remote-controlled
@@ -209,12 +210,23 @@ type demoWorld struct {
 
 	// The gateway's syslog (docs/syslog-snmp-traffic.md §3.2): the receiver's count since the
 	// service started (syslogSince), the newest message, the latest gateway_event syslog_setting,
-	// and the state shown (syslogState: "" = the gateway sends here; see syslogStatusLocked).
+	// and the state shown (syslogState: "" = as syslogGw and syslogEnforce say; see
+	// syslogStatusLocked).
 	syslogSince    time.Time
 	syslogReceived int64
 	syslogLast     *model.SyslogMessage
 	syslogCheck    model.Ref
 	syslogState    string
+	// The gateway's Syslog setting as last read, and whether the monitor keeps it sending to
+	// demoSyslogTarget (gateway.enforce_syslog; docs/syslog-snmp-traffic.md §3.1). SetGatewaySyslog
+	// changes both; syslogSetErr makes its next change fail on the gateway, syslogRecordErr fail
+	// after the gateway took it (the config_change cannot be written). syslogSetFail is the latest
+	// failed attempt to set the page (SYSLOG_SETTING_FAILED; nil: none since the latest success).
+	syslogGw        model.SyslogSetting
+	syslogEnforce   bool
+	syslogSetErr    string
+	syslogRecordErr string
+	syslogSetFail   *demoSetFail
 	// The syslog store: the sealed chunks, oldest first, each with its syslog_chunk record; the
 	// open chunk; the retention limits (syslog.keep_mb, keep_days); chunks named so far.
 	syslogChunks     []*demoChunk
@@ -270,6 +282,9 @@ func newDemoWorldWith(now time.Time, hostile string) *demoWorld {
 		hostile:    hostile,
 		keepMB:     config.Default().Syslog.KeepMB,
 		keepDays:   config.Default().Syslog.KeepDays,
+		// The setting the monitor found off at its first check and has kept since.
+		syslogGw:      demoSyslogOn(),
+		syslogEnforce: config.Default().Gateway.EnforceSyslog,
 	}
 	h, m := time.Hour, time.Minute
 	// The AT&T resolver fails in five consecutive checks (an incident: rules 2026.10-4 need the
@@ -361,6 +376,7 @@ func (w *demoWorld) loadBlobs() {
 	w.page["events.before"] = w.putBlob(demoFile("testdata", "gateway", "events_checked.html"))
 	w.page["events.after"] = w.putBlob(demoFile("testdata", "gateway", "events_unchecked.html"))
 	w.page["syslog"] = w.putBlob([]byte(demoSyslogPage))
+	w.page["syslog.off"] = w.putBlob(demoFile("testdata", "gateway", "syslog_real_off.html"))
 
 	w.tsr = []string{w.putBlob(demoFile("testdata", "tsa", "digicert.tsr")), w.putBlob(demoFile("testdata", "tsa", "freetsa.tsr"))}
 	w.netsh = w.putBlob([]byte(strings.ReplaceAll(`
@@ -1347,7 +1363,8 @@ func (w *demoWorld) buildLedger() {
 		}
 	}
 	w.addSyslogBatch(add, w.created.Add(-47*time.Minute), func(ts time.Time) { w.appendSyslogLocked(ts, 0, oddSyslog(ts)...) })
-	// The daily check of the gateway's Syslog page (read-only in this version), from each start.
+	// The daily check of the gateway's Syslog page, from each start: the first found it off and
+	// set it to send the gateway's log here (gateway.enforce_syslog), the others find it so.
 	for t := g.Add(3 * time.Minute); t.Before(restart); t = t.Add(24 * time.Hour) {
 		if !inGap(t) {
 			add(t, 8, func(ts time.Time) { w.syslogCheckLocked(ts) })
@@ -1728,20 +1745,54 @@ func firstBlob(snap model.GatewaySnapshot) string {
 // demoSyslogHost is the name the gateway writes into its messages.
 const demoSyslogHost = "BGW320-505"
 
-// demoSyslogLevels are the Log Level options of the gateway's Syslog page.
-var demoSyslogLevels = []string{"Emergency", "Alert", "Critical", "Error", "Warning", "Notice", "Informational", "Debug"}
+// demoSyslogLevels are the Log Level options of the gateway's Syslog page: those of the
+// BGW320-505 with firmware 6.34.7 (testdata/gateway/syslog_real_off.html), which offers neither
+// Informational nor Debug.
+var demoSyslogLevels = []string{"Emergency", "Alert", "Critical", "Error", "Warning", "Notice"}
 
-// demoSyslogPage stands in for the gateway's Syslog page (Diagnostics › Syslog, syslog.ha) as a
-// settings check stores it: synthetic, since phase 1 has not captured the real page yet.
+// demoSyslogTarget is what the demo monitor keeps the gateway's Syslog page set to: this
+// computer's address, syslog.port and the most detailed level the page offers (Notice).
+var demoSyslogTarget = model.SyslogTarget{Enabled: true, Server: "192.168.1.71", Port: 514, Level: "Notice"}
+
+// demoSyslogOn is the gateway's Syslog setting as read while it sends to demoSyslogTarget.
+func demoSyslogOn() model.SyslogSetting {
+	t := demoSyslogTarget
+	return model.SyslogSetting{Enabled: true, Server: t.Server, Port: t.Port, Level: t.Level, Levels: slices.Clone(demoSyslogLevels)}
+}
+
+// demoSyslogOff is the gateway's Syslog setting as read while it is off: the real page shows
+// its fields disabled, the port 514 and the level Error.
+func demoSyslogOff() model.SyslogSetting {
+	return model.SyslogSetting{Port: 514, Level: "Error", Levels: slices.Clone(demoSyslogLevels)}
+}
+
+// demoSyslogSummary renders a Syslog setting as the monitor's gateway_event syslog_setting
+// records it: "off" or "on -> 192.168.1.71:514, level Notice".
+func demoSyslogSummary(s model.SyslogSetting) string {
+	if !s.Enabled {
+		return "off"
+	}
+	out := "on -> " + net.JoinHostPort(s.Server, strconv.Itoa(s.Port))
+	if s.Level != "" {
+		out += ", level " + s.Level
+	}
+	return out
+}
+
+// demoSyslogPage is the gateway's Syslog page while it sends to demoSyslogTarget, as a settings
+// check stores it: the real page (testdata/gateway/syslog_real_off.html, its layout shortened)
+// with Syslog On and its fields filled in and enabled.
 const demoSyslogPage = `<!DOCTYPE html><html><head><title>Diagnostics - Syslog</title></head><body>
-<h1>Syslog</h1><p>(demo page: a stand-in for the gateway's syslog.ha)</p>
-<form method="post" action="/cgi-bin/syslog.ha"><input type="hidden" name="nonce" value="0000000000000000">
-<table>
-<tr><th><label for="enable">Syslog</label></th><td><select id="enable" name="enable"><option value="on" selected>On</option><option value="off">Off</option></select></td></tr>
-<tr><th><label for="server">Server IP Address</label></th><td><input type="text" id="server" name="server" value="192.168.1.71"></td></tr>
-<tr><th><label for="port">Server Port</label></th><td><input type="text" id="port" name="port" value="514"></td></tr>
-<tr><th><label for="level">Log Level</label></th><td><select id="level" name="level"><option>Emergency</option><option>Alert</option><option>Critical</option><option>Error</option><option>Warning</option><option>Notice</option><option selected>Informational</option><option>Debug</option></select></td></tr>
-</table><input type="submit" name="Save" value="Save"></form></body></html>
+<h1>Syslog</h1><p>(demo page: the gateway's syslog.ha, shortened)</p>
+<form method="post" action="/cgi-bin/syslog.ha"><input type="hidden" name="nonce" value="0000000000000000000000000000000000000000000000000000000000000000" />
+<table cellpadding="2" class="table100" summary="This page configures the device for syslog.">
+<tr><th scope="row"><label for="syslog">Syslog</label></th><td><select name="syslog" id="syslog" onchange="this.form.submit()"><option value="off">Off</option><option value="on" selected="selected">On</option></select>
+<noscript><input type="submit" name="Update" value="Update" /></noscript></td></tr>
+<tr><th scope="row"><label for="serverip">Server IP Address</label></th><td><input id="serverip" type="text" maxlength="43" size="43" name="location" value="192.168.1.71" /></td></tr>
+<tr><th scope="row"><label for="serverport">Server Port</label></th><td><input id="serverport" type="text" maxlength="5" size="5" name="port" value="514" /></td></tr>
+<tr><th scope="row"><label for="loglevel">Log Level</label></th><td><select name="level" id="loglevel"><option value="Emergency">Emergency</option><option value="Alert">Alert</option><option value="Critical">Critical</option><option value="Error">Error</option><option value="Warning">Warning</option><option value="Notice" selected="selected">Notice</option></select></td></tr>
+</table>
+<div><input type="submit" name="Save" value="Save" /> <input type="submit" name="Cancel" value="Cancel" /></div></form></body></html>
 `
 
 // demoSyslog is a message as the receiver records it: the datagram the gateway sent (RFC 3164,
@@ -2219,25 +2270,105 @@ func eventMessages(kind string, ts time.Time) []model.SyslogMessage {
 	return nil
 }
 
-// syslogCheckLocked records a check of the gateway's Syslog page (read-only in this version):
-// a gateway_event syslog_setting with the setting read and the page.
+// demoSyslogWhat is what the demo monitor's config_change of the gateway's Syslog page names.
+const demoSyslogWhat = "syslog.ha (Syslog, Server IP Address, Server Port, Log Level)"
+
+// demoGatewayStates are the syslogState values that show another Syslog setting of the gateway
+// (or none): a change of the setting ends them. The others show the receiver or the store.
+var demoGatewayStates = []string{"off", "offquiet", "elsewhere", "manual", "pending", "error", "errorquiet", "unknown", "notarget"}
+
+// demoSyslogSetErr is how the gateway fails a change of its Syslog page (syslogSetErr).
+const demoSyslogSetErr = "gateway: POST syslog.ha (Update): HTTP 500 Internal Server Error; Save not posted"
+
+// syslogCheckLocked records the daily check of the gateway's Syslog page: a gateway_event
+// syslog_setting with the setting read and the page. The demo monitor keeps the setting
+// (gateway.enforce_syslog): its first check found the page off and set it (syslogSetLocked),
+// the later ones find it as set.
 func (w *demoWorld) syslogCheckLocked(ts time.Time) {
-	w.syslogCheck = w.appendLocked(ts, model.TypeGatewayEvent, model.GatewayEvent{Kind: model.GwEvSyslogSetting,
-		After:  "on: 192.168.1.71:514, level Informational",
-		Detail: "read-only check of the gateway's Diagnostics › Syslog page; this version does not change the setting"}, w.page["syslog"])
+	if w.syslogCheck.Seq == 0 {
+		off, on := demoSyslogOff(), demoSyslogOn()
+		w.syslogGw = off
+		w.syslogCheck = w.appendLocked(ts, model.TypeGatewayEvent, model.GatewayEvent{Kind: model.GwEvSyslogSetting, After: "off",
+			Detail: "Syslog page (Diagnostics > Syslog) read: the gateway does not send its log to a syslog server; log levels offered: " +
+				strings.Join(demoSyslogLevels, ", ") + "; the monitor (gateway.enforce_syslog) sets it now to send its log to 192.168.1.71:514 at level Notice"},
+			w.page["syslog.off"])
+		w.syslogSetLocked(ts, model.ConfigChange{Target: "gateway", What: demoSyslogWhat, Before: demoSyslogSummary(off),
+			After: demoSyslogSummary(on), Actor: "monitor (enforce_syslog)", Result: "verified"}, on)
+		return
+	}
+	s := demoSyslogSummary(w.syslogGw)
+	w.syslogCheck = w.appendLocked(ts, model.TypeGatewayEvent, model.GatewayEvent{Kind: model.GwEvSyslogSetting, Before: s, After: s,
+		Detail: "Syslog page (Diagnostics > Syslog) read: the gateway sends its log to 192.168.1.71:514 at level Notice, which is this computer " +
+			"and the port its syslog receiver is set up for; log levels offered: " + strings.Join(demoSyslogLevels, ", ")}, w.page["syslog"])
+}
+
+// syslogPageLocked is the page the gateway shows for a Syslog setting (demoSyslogPage while on,
+// the real page while off).
+func (w *demoWorld) syslogPageLocked(s model.SyslogSetting) string {
+	if s.Enabled {
+		return w.page["syslog"]
+	}
+	return w.page["syslog.off"]
+}
+
+// syslogSetLocked records a change of the gateway's Syslog page from w.syslogGw to want, as the
+// monitor does: a gateway_event syslog_setting (before, after, what changed and who changed it),
+// then cc (a config_change), each with the pages before and after. The setting read becomes
+// want, and a failed attempt before is over.
+func (w *demoWorld) syslogSetLocked(ts time.Time, cc model.ConfigChange, want model.SyslogSetting) {
+	blobs := []string{w.syslogPageLocked(w.syslogGw)}
+	if after := w.syslogPageLocked(want); after != blobs[0] {
+		blobs = append(blobs, after)
+	}
+	detail := "Syslog page (Diagnostics > Syslog) switched off by " + cc.Actor + ": Syslog on -> off. Read back after saving, the gateway does not send its log to a syslog server."
+	if want.Enabled {
+		detail = "Syslog page (Diagnostics > Syslog) set by " + cc.Actor + ": Syslog off -> on; Server IP Address (empty) -> 192.168.1.71; Log Level Error -> Notice. " +
+			"Read back after saving, the gateway sends its log to 192.168.1.71:514 at level Notice, which is this computer and the port its syslog receiver is set up for; " +
+			"level Notice: the most detailed level the page offers, Debug aside."
+	}
+	w.syslogCheck = w.appendLocked(ts, model.TypeGatewayEvent, model.GatewayEvent{Kind: model.GwEvSyslogSetting, Before: cc.Before, After: cc.After,
+		Detail: detail + " The pages before and after the change are kept with this record."}, blobs...)
+	w.appendLocked(ts, model.TypeConfigChange, cc, blobs...)
+	w.syslogGw, w.syslogSetFail = want, nil
+}
+
+// demoSyslogState compares the gateway's Syslog setting with this computer as the monitor does
+// (Status.syslog.state and problem).
+func demoSyslogState(g model.SyslogSetting) (state, problem string) {
+	t := demoSyslogTarget
+	switch {
+	case !g.Enabled:
+		return "off", "the gateway does not send its log to a syslog server (its Syslog setting is off)"
+	case g.Server != t.Server || g.Port != t.Port:
+		return "elsewhere", fmt.Sprintf("the gateway sends its log to %s, not to this computer (%s)",
+			net.JoinHostPort(g.Server, strconv.Itoa(g.Port)), net.JoinHostPort(t.Server, strconv.Itoa(t.Port)))
+	}
+	return "ok", ""
 }
 
 // syslogStatusLocked is Status.Syslog: the receiver listening, its counters since the service
-// started, the newest message, the gateway's Syslog setting as last read and the syslog store's
-// volume. /demo/syslog shows the other states the dashboard words (syslogState; "nostore": a
-// monitor without a store).
+// started, the newest message, the gateway's Syslog setting as last read, whether the monitor
+// keeps it sending here (enforce, target) and the syslog store's volume. /demo/syslog shows the
+// other states the dashboard words (syslogState; "nostore": a monitor without a store).
 func (w *demoWorld) syslogStatusLocked() *model.SyslogStatus {
 	if w.syslogState == "none" {
 		return nil
 	}
+	g := w.syslogGw
+	g.Levels = slices.Clone(g.Levels)
 	sl := &model.SyslogStatus{Enabled: true, Listening: true, Listen: "0.0.0.0:514", Received: w.syslogReceived, Recorded: w.syslogReceived,
-		Rejected: 7, State: "ok", GatewayAt: w.syslogCheck.TS, GatewaySeq: w.syslogCheck.Seq,
-		Gateway: &model.SyslogSetting{Enabled: true, Server: "192.168.1.71", Port: 514, Level: "Informational", Levels: demoSyslogLevels}}
+		Rejected: 7, GatewayAt: w.syslogCheck.TS, GatewaySeq: w.syslogCheck.Seq, Gateway: &g, Enforce: w.syslogEnforce}
+	sl.State, sl.Problem = demoSyslogState(g)
+	if f := w.syslogSetFail; f != nil { // the state stays as read; the problem adds the failed attempt
+		if sl.Problem != "" {
+			sl.Problem += "; "
+		}
+		sl.Problem += f.short
+	}
+	// As the monitor: the target is reported once this computer's address is known, whether the
+	// setting is kept or not.
+	t := demoSyslogTarget
+	sl.Target = &t
 	if w.syslogState != "nostore" {
 		u := w.syslogUsageLocked()
 		sl.Store = &u
@@ -2255,21 +2386,37 @@ func (w *demoWorld) syslogStatusLocked() *model.SyslogStatus {
 			sl.Last = sl.Last[:cut] + "…"
 		}
 	}
+	off := demoSyslogOff()
 	switch w.syslogState {
-	case "off": // messages arrive although the setting read says off: it was set by hand since
-		sl.State, sl.Gateway = "off", &model.SyslogSetting{Levels: demoSyslogLevels}
-	case "offquiet": // off, and nothing received since the service started
-		sl.State, sl.Gateway = "off", &model.SyslogSetting{Levels: demoSyslogLevels}
+	case "off": // not kept, and read as off; messages arrive since the read: it was set by hand since
+		sl.Enforce, sl.Gateway = false, &off
+		sl.State, sl.Problem = demoSyslogState(off)
+	case "offquiet": // not kept, off, and nothing received since the service started
+		sl.Enforce, sl.Gateway = false, &off
+		sl.State, sl.Problem = demoSyslogState(off)
 		sl.Received, sl.Recorded, sl.LastAt, sl.Last = 0, 0, "", ""
-	case "elsewhere":
-		sl.State, sl.Gateway = "elsewhere", &model.SyslogSetting{Enabled: true, Server: "192.168.1.20", Port: 1514, Level: "Debug", Levels: demoSyslogLevels}
-	case "error":
-		sl.State, sl.Problem = "error", "gateway: login throttled: a login was attempted less than a minute ago"
-	case "unknown":
+	case "elsewhere": // not kept, and sends to another syslog server: nothing received since the service started
+		other := model.SyslogSetting{Enabled: true, Server: "192.168.1.20", Port: 1514, Level: "Warning", Levels: slices.Clone(demoSyslogLevels)}
+		sl.Enforce, sl.Gateway = false, &other
+		sl.State, sl.Problem = demoSyslogState(other)
+		sl.Received, sl.Recorded, sl.LastAt, sl.Last = 0, 0, "", ""
+	case "manual": // sends here, but the monitor does not keep it so (gateway.enforce_syslog false)
+		sl.Enforce = false
+	case "pending": // kept, but read as off at the start, before the monitor set it (its next check does); nothing received yet
+		sl.Gateway = &off
+		sl.State, sl.Problem = demoSyslogState(off)
+		sl.Received, sl.Recorded, sl.LastAt, sl.Last = 0, 0, "", ""
+	case "error", "errorquiet": // kept, but the latest check failed (errorquiet: and nothing received since the service started)
+		sl.State, sl.Problem = "error", "the latest settings check could not read the gateway's Syslog page: gateway: login throttled: a login was attempted less than a minute ago"
+		if w.syslogState == "errorquiet" {
+			sl.Received, sl.Recorded, sl.LastAt, sl.Last = 0, 0, "", ""
+		}
+	case "unknown": // kept, not read yet
 		sl.State, sl.Gateway, sl.GatewayAt, sl.GatewaySeq = "unknown", nil, "", 0
-		sl.Problem = "the daily settings check has not read the gateway's Syslog page yet"
-	case "enforce": // as from phase 2
-		sl.Enforce, sl.Target = true, &model.SyslogTarget{Enabled: true, Server: "192.168.1.71", Port: 514, Level: "Informational"}
+		sl.Problem = "the gateway's Syslog setting has not been read yet"
+	case "notarget": // kept, but this computer's address toward the gateway is not known yet
+		sl.Target = nil
+		sl.State, sl.Problem = "unknown", "the gateway sends its log to 192.168.1.71:514; this computer's address toward the gateway is not known yet"
 	case "nolisten":
 		sl.Listening, sl.ListenErr = false, "listen udp 0.0.0.0:514: bind: Only one usage of each socket address (protocol/network address/port) is normally permitted."
 	case "disabled":
@@ -2628,6 +2775,9 @@ func (w *demoWorld) Status() model.Status {
 		st.Conditions = append(st.Conditions, model.Condition{Code: "UNKNOWN_FLAG " + w.hostile, Severity: "warning", Message: "unknown condition"})
 	}
 	st.Syslog = w.syslogStatusLocked()
+	if f := w.syslogSetFail; f != nil { // the monitor's wording (internal/monitor syslogFailWords)
+		st.Conditions = append(st.Conditions, f.cond)
+	}
 	return hostileCopy(w.hostile, st)
 }
 
@@ -3387,7 +3537,8 @@ func TestDemoWorldEndpoints(t *testing.T) {
 	// Syslog (docs/syslog-snmp-traffic.md §3.2): the receiver's status and the latest check of the
 	// gateway's setting; the messages newest first; the window of an incident (± 5 min, as the
 	// incident page asks) holds the gateway's own account of it, or nothing.
-	if sl := st.Syslog; sl == nil || !sl.Listening || sl.State != "ok" || sl.Received == 0 || sl.Gateway == nil || !sl.Gateway.Enabled || sl.LastAt == "" {
+	if sl := st.Syslog; sl == nil || !sl.Listening || sl.State != "ok" || sl.Received == 0 || sl.Gateway == nil || !sl.Gateway.Enabled || sl.LastAt == "" ||
+		!sl.Enforce || sl.Target == nil || *sl.Target != demoSyslogTarget || !slices.Equal(sl.Gateway.Levels, demoSyslogLevels) {
 		t.Errorf("syslog status: %+v", st.Syslog)
 	} else {
 		isRecord("syslog setting check", sl.GatewaySeq, model.TypeGatewayEvent)
@@ -3484,6 +3635,58 @@ func TestDemoWorldEndpoints(t *testing.T) {
 		t.Errorf("the high-latency incident's window holds messages: %q", msgs(quiet))
 	}
 
+	// The gateway's Syslog setting (docs/syslog-snmp-traffic.md §3.1): the monitor set it at its
+	// first check and keeps it; the operator stops it, then sends the log here again. Each change
+	// is a config_change with the pages before and after, named by a gateway_event syslog_setting
+	// that the status cites.
+	var setRecs []RecordView
+	strict(ok(demoGet(t, h, "GET", "/api/records?type=config_change&limit=10", ""), 200), &setRecs)
+	enforced := slices.ContainsFunc(setRecs, func(r RecordView) bool {
+		var b struct {
+			Data model.ConfigChange `json:"data"`
+		}
+		return json.Unmarshal(r.Body, &b) == nil && b.Data.What == demoSyslogWhat && b.Data.Actor == "monitor (enforce_syslog)" &&
+			b.Data.Before == "off" && b.Data.After == "on -> 192.168.1.71:514, level Notice"
+	})
+	if !enforced {
+		t.Error("the history has no change of the gateway's Syslog page by the monitor's enforcement")
+	}
+	for _, enabled := range []bool{false, true} {
+		strict(ok(demoGet(t, h, "POST", "/api/gateway/syslog", fmt.Sprintf(`{"enabled":%v}`, enabled)), 200), &cc)
+		if cc.What != demoSyslogWhat || cc.Actor != "operator via web" || cc.Result != "verified" {
+			t.Errorf("syslog change (enabled %v) = %+v", enabled, cc)
+		}
+		strict(ok(demoGet(t, h, "GET", "/api/status", ""), 200), &st)
+		sl := st.Syslog
+		wantState := map[bool]string{true: "ok", false: "off"}[enabled]
+		if sl == nil || sl.Enforce != enabled || sl.Target == nil || *sl.Target != demoSyslogTarget || sl.Gateway == nil || sl.Gateway.Enabled != enabled ||
+			sl.State != wantState {
+			t.Fatalf("syslog status after the change (enabled %v): %+v", enabled, sl)
+		}
+		// The status cites the change's gateway_event; its config_change follows it. Both have the
+		// pages before and after.
+		var recs []RecordView
+		strict(ok(demoGet(t, h, "GET", "/api/records?limit=2&from_seq="+strconv.FormatUint(sl.GatewaySeq, 10), ""), 200), &recs)
+		var ev, ch model.Body
+		if len(recs) != 2 || json.Unmarshal(recs[0].Body, &ev) != nil || json.Unmarshal(recs[1].Body, &ch) != nil ||
+			ev.Type != model.TypeGatewayEvent || ch.Type != model.TypeConfigChange || len(ev.Blobs) != 2 || !slices.Equal(ev.Blobs, ch.Blobs) {
+			t.Fatalf("the records of the change at #%d: %+v", sl.GatewaySeq, recs)
+		}
+		var ge model.GatewayEvent
+		if json.Unmarshal(ev.Data, &ge) != nil || ge.Kind != model.GwEvSyslogSetting || ge.Before != cc.Before || ge.After != cc.After {
+			t.Errorf("syslog setting event #%d: %+v", sl.GatewaySeq, ge)
+		}
+		for _, id := range ev.Blobs { // the pages before and after
+			ok(demoGet(t, h, "GET", "/api/blobs/"+id+"/view", ""), 200)
+		}
+	}
+	// The setting as asked already: not changed, not recorded as a change.
+	strict(ok(demoGet(t, h, "POST", "/api/gateway/syslog", `{"enabled":true}`), 200), &cc)
+	if cc.Result != "unchanged: the gateway already sends its log to this computer" || cc.Before != cc.After {
+		t.Errorf("syslog change to what the gateway shows = %+v", cc)
+	}
+	ok(demoGet(t, h, "POST", "/api/gateway/syslog", `{}`), 400)
+
 	// Traffic (docs/syslog-snmp-traffic.md §3.3): a point per bucket; unknown where nothing could
 	// be read; the big download "at least"; the days with complete and partial totals.
 	for _, rng := range SeriesRanges {
@@ -3554,6 +3757,10 @@ func TestDemoWorldEndpoints(t *testing.T) {
 	strict(ok(demoGet(t, h, "POST", "/api/gateway/notification", `{"enabled":false}`), 503), &ce)
 	if !strings.Contains(ce.Error, "trust-cert") {
 		t.Errorf("notification while the certificate is unconfirmed: %q", ce.Error)
+	}
+	strict(ok(demoGet(t, h, "POST", "/api/gateway/syslog", `{"enabled":false}`), 503), &ce)
+	if !strings.Contains(ce.Error, "trust-cert") || ce.Change != nil {
+		t.Errorf("syslog setting while the certificate is unconfirmed: %+v", ce)
 	}
 	strict(ok(demoGet(t, h, "POST", "/api/gateway/trust-cert", `{"sha256":"`+demoCertSHA+`"}`), 409), &er)
 	if !strings.Contains(er.Error, "now SHA-256 "+demoNewCertSHA) {
@@ -3847,11 +4054,27 @@ func TestDemoServer(t *testing.T) {
 		w.floodSyslog(n)
 		fmt.Fprintln(rw, "ok")
 	})
-	// /demo/syslog?state=off|offquiet|elsewhere|error|unknown|enforce|nolisten|disabled|nostore|none
-	// shows the gateway syslog card in that state (no state: the gateway sends here).
+	// /demo/syslog?state=off|offquiet|elsewhere|manual|pending|error|errorquiet|unknown|notarget|nolisten|disabled|nostore|none
+	// shows the gateway syslog card in that state (no state: as the gateway's setting and its
+	// enforcement are).
 	mux.HandleFunc("/demo/syslog", func(rw http.ResponseWriter, r *http.Request) {
 		w.mu.Lock()
 		w.syslogState = r.URL.Query().Get("state")
+		w.mu.Unlock()
+		fmt.Fprintln(rw, "ok")
+	})
+	// /demo/syslogfail?on=gateway|record makes the next changes of the gateway's Syslog setting
+	// fail on the gateway, or after it took the change (recording it); no parameter restores
+	// normal behaviour.
+	mux.HandleFunc("/demo/syslogfail", func(rw http.ResponseWriter, r *http.Request) {
+		w.mu.Lock()
+		w.syslogSetErr, w.syslogRecordErr = "", ""
+		switch r.URL.Query().Get("on") {
+		case "gateway":
+			w.syslogSetErr = demoSyslogSetErr
+		case "record":
+			w.syslogRecordErr = "ledger: append config_change: The disk is full."
+		}
 		w.mu.Unlock()
 		fmt.Fprintln(rw, "ok")
 	})
@@ -3887,7 +4110,94 @@ func TestDemoServer(t *testing.T) {
 	hs.Shutdown(shCtx)
 }
 
-// SetGatewaySyslog: phase 2 of docs/syslog-snmp-traffic.md gives the demo its behaviour.
+// demoEnforceWhat is what the demo monitor's config_change of gateway.enforce_syslog names.
+const demoEnforceWhat = "gateway.enforce_syslog (the monitor keeps the gateway's Syslog page sending its log to this computer)"
+
+// demoSetFail is the demo monitor's latest failed attempt to set the gateway's Syslog page: the
+// condition that shows it (SYSLOG_SETTING_FAILED) and why in a few words, which
+// Status.syslog.problem adds.
+type demoSetFail struct {
+	cond  model.Condition
+	short string
+}
+
+// SetGatewaySyslog is the operator's choice for the gateway's Syslog page, made as the monitor
+// makes it (contracts.SyslogControl): the choice (gateway.enforce_syslog) is saved and recorded as
+// a config_change when it changes; then, after a login, the page is read and recorded and, when
+// it shows anything else, set - enabled: to send the gateway's log to this computer
+// (demoSyslogTarget), disabled: off - in the page's rounds (Update, Save, the read-back), recorded
+// as a gateway_event syslog_setting and a config_change with the pages before and after. A page
+// that already shows the choice is "unchanged" (not recorded). Like the monitor it refuses while
+// a changed certificate waits for confirmation and without an access code. syslogSetErr makes the
+// gateway fail the change (the attempt is recorded, SYSLOG_SETTING_FAILED), syslogRecordErr makes
+// it fail after the gateway took it.
 func (w *demoWorld) SetGatewaySyslog(ctx context.Context, enabled bool, actor string) (model.ConfigChange, error) {
-	return model.ConfigChange{}, errors.New("demo: not available")
+	select {
+	case <-time.After(1500 * time.Millisecond): // a login and four page loads on the real gateway
+	case <-ctx.Done():
+		return model.ConfigChange{}, ctx.Err()
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	switch {
+	case w.pendingCert != "": // as internal/monitor answers (errCertPending)
+		return model.ConfigChange{}, fmt.Errorf("authenticated gateway requests are paused: the gateway presented an unconfirmed TLS certificate (SHA-256 %s); confirm it with trust-cert: %w",
+			w.pendingCert, contracts.ErrUnavailable)
+	case w.noAccessCode:
+		return model.ConfigChange{}, fmt.Errorf("syslog setting: gateway: no access code available: %w", contracts.ErrGatewayNoAccessCode)
+	}
+	ts := time.Now()
+	if slices.Contains(demoGatewayStates, w.syslogState) {
+		// The setting shown is the one the gateway has, and is kept as shown; from now on the
+		// status follows the setting.
+		st := w.syslogStatusLocked()
+		if st.Gateway != nil {
+			w.syslogGw = *st.Gateway
+		}
+		w.syslogEnforce, w.syslogState = st.Enforce, ""
+	}
+	if w.syslogEnforce != enabled {
+		w.appendLocked(ts, model.TypeConfigChange, model.ConfigChange{Target: "monitor", What: demoEnforceWhat,
+			Before: strconv.FormatBool(w.syslogEnforce), After: strconv.FormatBool(enabled), Actor: actor, Result: "applied"})
+		w.syslogEnforce = enabled
+	}
+	// The page as read for the change.
+	cur := demoSyslogSummary(w.syslogGw)
+	w.syslogCheck = w.appendLocked(ts, model.TypeGatewayEvent, model.GatewayEvent{Kind: model.GwEvSyslogSetting, Before: cur, After: cur,
+		Detail: "Syslog page (Diagnostics > Syslog) read for the change asked for by " + actor}, w.syslogPageLocked(w.syslogGw))
+	want := demoSyslogOff()
+	if enabled {
+		want = demoSyslogOn()
+	}
+	cc := model.ConfigChange{Target: "gateway", What: demoSyslogWhat, Before: cur, After: demoSyslogSummary(want), Actor: actor, Result: "verified"}
+	if cur == cc.After {
+		cc.Result = "unchanged: the gateway already sends its log to this computer"
+		if !enabled {
+			cc.Result = "unchanged: the gateway's Syslog is already off"
+		}
+		w.syslogSetFail = nil
+		return cc, nil
+	}
+	if w.syslogSetErr != "" {
+		// The attempt is recorded; the page stays as it was, and SYSLOG_SETTING_FAILED says why.
+		cc.Result = "failed: " + w.syslogSetErr
+		ref := w.appendLocked(ts, model.TypeConfigChange, cc, w.syslogPageLocked(w.syslogGw))
+		short := "the monitor could not set it: " + w.syslogSetErr
+		msg := "The monitor could not set the gateway's Syslog page to send its log to this computer (192.168.1.71:514 at level Notice): " +
+			w.syslogSetErr + ". It tries again at the next settings check (daily, and within minutes after this computer's address toward the gateway changes)."
+		if !enabled {
+			short = "the monitor could not switch it off: " + w.syslogSetErr
+			msg = "The monitor could not switch the gateway's Syslog page off as " + actor + " asked: " + w.syslogSetErr + ". The gateway may still send its log to this computer."
+		}
+		w.syslogSetFail = &demoSetFail{short: short, cond: model.Condition{Code: "SYSLOG_SETTING_FAILED", Severity: "warning",
+			Message: msg + fmt.Sprintf(" The attempt is in record #%d.", ref.Seq), Since: ts.UTC().Format(time.RFC3339Nano), Seq: ref.Seq}}
+		return cc, errors.New(w.syslogSetErr)
+	}
+	if w.syslogRecordErr != "" {
+		// The gateway took the change; its records could not be written.
+		w.syslogGw, w.syslogSetFail = want, nil
+		return cc, fmt.Errorf("the gateway's Syslog page was set (%s), but the change could not be recorded: %w: %w", cc.After, contracts.ErrNotRecorded, errors.New(w.syslogRecordErr))
+	}
+	w.syslogSetLocked(ts, cc, want)
+	return cc, nil
 }

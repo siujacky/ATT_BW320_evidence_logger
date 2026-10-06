@@ -209,6 +209,12 @@ func TestSecurityHeadersOnEveryResponse(t *testing.T) {
 		{"syslog retention bad request", func() *http.Request {
 			return hs.request("POST", "/api/syslog/retention", strings.NewReader(`{"keep_mb":0}`), nil)
 		}, 400, false},
+		{"gateway syslog", func() *http.Request {
+			return hs.request("POST", "/api/gateway/syslog", strings.NewReader(`{"enabled":true}`), nil)
+		}, 200, false},
+		{"gateway syslog bad request", func() *http.Request {
+			return hs.request("POST", "/api/gateway/syslog", strings.NewReader(`{}`), nil)
+		}, 400, false},
 		{"live traffic", func() *http.Request { return hs.request("GET", "/api/traffic/live", nil, nil) }, 200, false},
 		{"not found", func() *http.Request { return hs.request("GET", "/nope", nil, nil) }, 404, false},
 		{"method not allowed", func() *http.Request { return hs.request("GET", "/api/verify", nil, nil) }, 405, false},
@@ -264,6 +270,8 @@ func TestNotFoundAndMethodNotAllowedAreJSON(t *testing.T) {
 		{"GET", "/api/anchor", 405, "POST"},
 		{"GET", "/api/notes", 405, "POST"},
 		{"GET", "/api/gateway/notification", 405, "POST"},
+		{"GET", "/api/gateway/syslog", 405, "POST"},
+		{"PUT", "/api/gateway/syslog", 405, "POST"},
 		{"GET", "/api/gateway/trust-cert", 405, "POST"},
 		{"GET", "/api/syslog/retention", 405, "POST"},
 		{"POST", "/api/status", 405, "GET, HEAD"},

@@ -77,10 +77,18 @@ problems are on the provider's side**, with a complete chain of custody:
   and **Low Warning = 1 (threshold −292)** — the gateway itself flags the received optical
   level as below spec. This is provider-side evidence and must be prominent.
 * `logs` is the firewall drop log (not a system event log). Diagnostics > Syslog (`syslog.ha`,
-  behind the login; controls *Syslog* on/off, *Server IP Address*, *Server Port*, *Log Level*) sends
-  the gateway's log to a syslog server. Earlier notes said it forwards only the firewall messages;
-  which messages this firmware sends is learnt from what arrives once it is set (§18). The page has
-  not been captured yet: the reader is tested on synthetic pages (testdata/gateway/README.md).
+  behind the login) sends the gateway's log to a syslog server. The page as the phase-1 service read
+  it (kept, its nonce replaced, as `testdata/gateway/syslog_real_off.html`): a form posting to
+  `/cgi-bin/syslog.ha` with a hidden `nonce`; *Syslog*, a drop-down list `syslog` Off/On that submits
+  the form when it changes, followed by a noscript **Update** button (the page: "make your change,
+  then click the Update button. This will transform the page"); *Server IP Address* (`location`, at
+  most 43 characters: IPv4, IPv6 or a name), *Server Port* (`port`, 514) and *Log Level* (`level`:
+  Emergency, Alert, Critical, Error, Warning, Notice - no Informational, no Debug), the three
+  **disabled** while Syslog is off (a browser never submits a disabled control); **Save** and
+  **Cancel**. Its help says it sends "firewall log messages" at the chosen severity; which messages
+  this firmware sends is learnt from what arrives (§18). How the gateway answers the Update and the
+  Save (a page or a redirect, a new nonce) has not been observed: the client accepts either, and only
+  the page read back afterwards counts.
 * **No SNMP**: UDP 161 answers "port unreachable" to a read-only SNMP query and none of the 49 pages
   of the site map has an SNMP setting (AT&T manages the gateway over TR-069). Traffic comes from the
   `broadbandstatistics` IPv4 counters instead (§18).
@@ -261,7 +269,7 @@ after the newest trusted time-stamp cannot be proven false by any time-stamp (st
 | `sample` | every fast cycle (10 s) | probe results + verdict (§9) |
 | `state_change` | verdict state/cause changes | from, to, at, reasons |
 | `gateway_snapshot` | gateway poll (60 s; 15 s during incidents) | page captures (status, timing, sha256, stored?, TLS cert), parsed sysinfo/broadband/fiber, derived |
-| `gateway_event` | derived transitions; plus a daily `notification_setting` confirmation (before == after, "confirmed unchanged") as evidence the redirect stayed OFF; plus a `syslog_setting` for every read of the gateway's Syslog page (§18, housekeeping) | kind (reboot, firmware_change, wan_ip_change, broadband_state, pon_state, optical_alarm, optical_link_change, counters_reset, cert_pinned, cert_changed, gateway_clock, notification_setting, syslog_setting), before/after, evidence (the page read, as a blob) |
+| `gateway_event` | derived transitions; plus a daily `notification_setting` confirmation (before == after, "confirmed unchanged") as evidence the redirect stayed OFF; plus a `syslog_setting` for every read and every change of the gateway's Syslog page (§18, housekeeping) | kind (reboot, firmware_change, wan_ip_change, broadband_state, pon_state, optical_alarm, optical_link_change, counters_reset, cert_pinned, cert_changed, gateway_clock, notification_setting, syslog_setting), before/after, evidence (the page read, or the pages before and after a change, as blobs) |
 | `service_check` | DNS + HTTP checks (60 s; 15 s during incidents) | DNS results (gateway/ISP/public resolvers, hijack detection; a failed query is retried once, so a resolver can have two results), HTTP results (TLS leaf hash) |
 | `local_link` | at start, on change, every 10 min, at incident open, and re-recorded (unchanged) during incidents or while Wi-Fi is down before the previous record goes stale | interface, type (wifi/ethernet), SSID, BSSID, signal %, RSSI, channel, rates, raw blob |
 | `traceroute` | incident open, every 5 min during, close | target, hops |
@@ -269,7 +277,7 @@ after the newest trusted time-stamp cannot be proven false by any time-stamp (st
 | `clock_jump` | wall vs monotonic divergence > 2 s between cycles; also between runs (first answered SNTP check vs the previous run's last, `between_runs`) | wall delta, mono delta, detail |
 | `incident_open` / `incident_update` / `incident_close` | §10 | incident struct |
 | `anchor` | §11 | TSA url/name, head seq/hash, token sha256 (blob), genTime, serial, policy |
-| `config_change` | gateway or monitor configuration changed (incl. the syslog retention, §18) | what, before, after, actor, evidence blobs |
+| `config_change` | gateway or monitor configuration changed (incl. the syslog retention, the gateway's Syslog page and `gateway.enforce_syslog`, §18), or an attempt failed | what, before, after, actor, result, evidence blobs |
 | `syslog_chunk` | the syslog store sealed a chunk (§18) | `model.SyslogChunk`: name, from/to (receive times of its first and last message), messages, dropped, rejected, bytes and sha256 of the uncompressed content, gz_bytes, reason (size, age, stop, recovered) |
 | `syslog_prune` | the retention limits deleted chunks (§18) | `model.SyslogPrune`: reason ("keep_mb N", "keep_days N" or both), keep_mb, keep_days, deleted [{name, sha256, from, to, messages, gz_bytes}], kept_bytes, kept_chunks |
 | `power_event` | suspend/resume/shutdown notifications | kind |
@@ -319,7 +327,9 @@ minutes after it was opened and at shutdown (each a `syslog_chunk` record), and 
 after every seal, at start, on a retention change and, with `keep_days`, at least hourly (each
 deletion a `syslog_prune` record). The gateway's Syslog page is read (authenticated) in the daily
 settings check right after the notification setting, in the same login session, and again when
-this computer's address toward the gateway changes (at most every 10 min). Traffic rates come from
+this computer's address toward the gateway changes (at most every 10 min); with
+`gateway.enforce_syslog` (default on) a page that shows anything else is then set to send the
+gateway's log to this computer, in the same session. Traffic rates come from
 the counters of the recorded snapshots; the dashboard's flow meter reads `broadbandstatistics` on
 demand only (at most every 5 s whoever asks, unrecorded).
 
@@ -388,15 +398,18 @@ succeeded").
 `OPTICAL_RX_LOW_ALARM`, `OPTICAL_RX_LOW_WARNING`, `OPTICAL_RX_HIGH_*`, `OPTICAL_TX_*`,
 `TEMPERATURE_*` — taken **only** from the gateway's own alarm flags; plus `NOTIFICATION_REDIRECT_ON`
 (the gateway's outage redirect is enabled), `GATEWAY_CERT_CHANGED` (critical: authenticated operations
-paused until the operator confirms the new certificate), `NO_ACCESS_CODE` (info: the redirect
-setting cannot be checked), `ANCHOR_UNTRUSTED` (warning: the newest time-stamps could not be
+paused until the operator confirms the new certificate), `NO_ACCESS_CODE` (info: the gateway's
+settings - the redirect, the Syslog page - cannot be checked or set), `ANCHOR_UNTRUSTED` (warning: the newest time-stamps could not be
 chain-verified, so they do not count as proof of time), `EGRESS_NOT_VIA_GATEWAY` (warning: traffic
 bypasses the gateway), `LEDGER_WRITE_FAILING` (critical: records are being refused — the service exits
 so Windows restarts it), `DISK_SPACE_LOW` (warning < 2 GiB, critical < 512 MiB), `CLOCK_OFFSET`
 (warning > 60 s, critical > 5 min SNTP offset), `SYSLOG_RECEIVER_DOWN` (warning: the syslog receiver
-cannot listen, e.g. another program uses UDP 514) and `SYSLOG_STORE_FAILING` (warning: the syslog
-store fails). Optical alarm conditions date from their first report. Syslog and the flow meter never
-change a verdict (§18).
+cannot listen, e.g. another program uses UDP 514), `SYSLOG_STORE_FAILING` (warning: the syslog
+store fails), `SYSLOG_SETTING_FAILED` (warning: the latest attempt to set the gateway's Syslog page
+failed; it is tried again at the next settings check) and `SYSLOG_NOT_ARRIVING` (info: the gateway's
+Syslog setting sends its log here, but no message from the gateway arrived for 24 hours). Optical
+alarm conditions date from their first report. Syslog and the flow meter never change a verdict
+(§18).
 
 ## 10. Incidents
 
@@ -491,6 +504,7 @@ Static assets are embedded (`embed.FS`), no external URLs (the UI must work duri
 | GET `/api/exports/{name}` | download bundle |
 | POST `/api/notes` | `{text, author}` → `operator_note` |
 | POST `/api/gateway/notification` | `{enabled:false}` → set gateway setting (config_change) |
+| POST `/api/gateway/syslog` | `{enabled, client?}` → `SetGatewaySyslog` (§18): true sends the gateway's log to this computer (the gateway's Syslog page set at once) and keeps it so (`gateway.enforce_syslog` true); false switches the page off and stops keeping it; answers the gateway's `model.ConfigChange` ("unchanged: …" when the page already showed it) |
 | POST `/api/gateway/trust-cert` | `{sha256?}` operator confirms the changed gateway TLS certificate they reviewed (refused if a different one is pending); config_change; resumes authenticated operations |
 | POST `/api/anchor` | anchor now |
 | GET `/api/syslog?from=&to=&q=&severity=&limit=` | `model.SyslogList`: the syslog store's messages received in [from, to) (default the 24 h before to; at most 31 days), newest first; q: text in the raw datagram, message, app or host (ignoring case, ≤ 200 characters); severity: 0-7 or a name, keeps that level and the more severe ones; limit 200 (≤ 5000); the list also ends before the message that would take its JSON beyond 16 MiB (`MaxSyslogAnswerBytes`; a control character is a six-byte escape); `truncated` when more matched. Each entry names its `chunk` ("" = the open chunk) and `seq`, the chunk's `syslog_chunk` record (0 while open or not found) |
@@ -502,7 +516,14 @@ API details (as implemented): `/api/records` adds `hash_ok` (h == SHA-256(b)) pe
 examined records, and `X-Next-Seq` for paging; `/api/incidents?limit=N`; `/api/incidents/{id}` keeps
 first/last records and the earliest + latest evidence when capped (`referenced` = total).
 `POST /api/gateway/notification` answers 502 when the gateway failed, 500 when the gateway reports
-the change but it could not be recorded. Single-flight operations answer 409; contracts.ErrBusy /
+the change but it could not be recorded. `POST /api/gateway/syslog` is guarded and answered the same
+way (one mapping for both). Only one authenticated gateway operation runs at a time (a change of
+either setting, or a certificate confirmation): another one answers 409. The change runs detached
+from the request for at most 3 minutes (it logs in, makes the page's Update round, saves and reads
+the page back). It answers 502 when the gateway failed, 500 when the gateway took the change (or
+already showed it, "unchanged") and what came after failed, and the sentinels as below; the answer of
+a failure carries the change the monitor reported (`{error, change}`). Without a syslog control it
+answers 404. Single-flight operations answer 409; contracts.ErrBusy /
 ErrRateLimited / ErrUnavailable map to 409 / 429 / 503. Bodies with unpaired UTF-16 surrogate escapes
 are rejected (operator text is recorded exactly as sent or not at all).
 
@@ -518,25 +539,39 @@ newest), and the next request, with the records found remembered, looks further 
 the request (2 min), and answers a failure with `{error, change}`: 500
 "applied but could not be recorded" or "in effect, but …" when the limits took effect, 503 when the
 ledger is broken, 504 on a timeout. `/api/traffic/live` has a 10 s deadline tied to the request. A
-feature the monitor does not offer (no syslog store, no retention control, no flow meter) answers 404
-with a JSON error, and the dashboard hides or explains it.
+feature the monitor does not offer (no syslog store, no syslog control - the retention, the gateway's
+Syslog setting -, no flow meter) answers 404 with a JSON error, and the dashboard hides or explains it.
 
 `Status.syslog` (`model.SyslogStatus`): the receiver (enabled, listening, address, error), counters
 since the start (received, stored, dropped, rejected), the newest message, the gateway's Syslog
-setting as last read with its `gateway_event` seq, `state` (ok: the gateway sends to this computer;
-off; elsewhere; unknown; error) with `problem`, and `store` (`model.SyslogUsage`: bytes, chunks,
-messages, open messages, oldest/newest receive time, keep_mb, keep_days). Phase 1 never enforces the
-setting: `enforce` is false and `target` absent. `Series` adds `traffic` (`model.TrafficPoint` per
+setting as last read (or changed) with its `gateway_event` seq, `state` (ok: the gateway sends to
+this computer; off; elsewhere; unknown; error: the latest read failed) with `problem` (which adds
+a failed attempt to set it; `SYSLOG_SETTING_FAILED` says the same), `enforce`
+(`gateway.enforce_syslog`: the monitor keeps the gateway sending here), `target` (the setting it
+keeps: on, this computer's IPv4 address toward the gateway, `syslog.port`, the level chosen; absent
+while that address is not known), and `store` (`model.SyslogUsage`: bytes, chunks, messages, open
+messages, oldest/newest receive time, keep_mb, keep_days). `Series` adds `traffic` (`model.TrafficPoint` per
 bucket: mean and peak WAN download/upload in Mb/s, `at_least`, this computer's rates),
 `traffic_days` (WAN volume per local day, `complete` or not) and `heavy_traffic_mbps` (80, §9).
 
 Dashboard views (hash routes): Overview (status hero with state/cause/attribution and
 reasons; cards Internet / AT&T gateway WAN / Fiber optics (Rx/Tx power vs thresholds and the
-gateway's own alarm flags) / Local link / Evidence integrity / Syslog; the live flow meter (polls
+gateway's own alarm flags) / Local link / Evidence integrity / Syslog (the receiver, the gateway's
+Syslog setting, whether it is kept, and its control: see the Syslog view); the live flow meter (polls
 `/api/traffic/live` every 5 s only while the Overview is shown and the page visible); latency chart
 per target, availability strip, MRTG-style traffic chart with its maximum/average/current legend and
 the daily totals for 1h/6h/24h/7d; recent incidents), Incidents (list + detail timeline with evidence
-links), Gateway (all parsed fields, DMI table, notification setting), Syslog (the gateway's messages
+links), Gateway (all parsed fields, DMI table, notification setting), Syslog (the syslog conditions;
+the receiver and the gateway's Syslog setting with its control, "Send the gateway's log to this PC"
+and "Stop sending" - each confirmed in a dialog that says what happens on the gateway, then its
+progress and outcome, which outlive a change of view for 10 minutes; disabled, with the reason,
+while authenticated gateway actions cannot run; while a change runs they keep the keyboard focus
+(aria-disabled, and ignored: a disabled button would lose it to the start of the page), and when
+the button the focus is on is no longer offered, the focus goes to the outcome (else the reason,
+else the other button) - and how to set the page by hand, only while the gateway does not send
+here, the monitor cannot set it (setting it failed or cannot be done) and no message arrived since
+the read; the Overview's card is the same, kept in place across status refreshes so that its
+control keeps the focus; the gateway's messages
 with search and severity filter, each linked to its chunk's `syslog_chunk` record; a row shows at
 most 500 characters of the text and 100 of the host and the app as shown (an escape counts its
 length), each with at most 16 runs of hidden characters, one element per run, and the exact
@@ -634,8 +669,9 @@ att-monitor run [--data DIR]                                foreground (console)
 att-monitor service                                         entry point used by the SCM
 att-monitor set-access-code (--file PATH | --stdin)         store DPAPI-encrypted access code
 att-monitor gateway notification [status|on|off]
-att-monitor gateway syslog [status] [--json]                Status.syslog: receiver, store, the gateway's setting
-                                                            (read only in this version; on|off are refused)
+att-monitor gateway syslog [status|on|off] [--json]         Status.syslog: receiver, store, the gateway's setting and
+                                                            whether it is kept; on: send the gateway's log to this
+                                                            computer and keep it so; off: switch it off, no longer kept
 att-monitor gateway trust-cert                              confirm a changed gateway certificate (after AT&T firmware updates)
 att-monitor syslog [--since 24h] [--grep T] [--severity L] [--limit N] [--json]
                                                             the syslog store's messages (GET /api/syslog), oldest first
@@ -662,9 +698,22 @@ stopped from config.json and the store opened read-only); with `--keep-mb` and/o
 changes them (a limit left out keeps its value) through `POST /api/syslog/retention`, or with the
 service stopped through `SetSyslogRetention` on the ledger (applied by the service at its start). A
 change that deletes messages now is confirmed first on a console; without one it needs `--yes`.
-`gateway syslog` prints `Status.syslog` and, while the gateway does not send to this computer, how to
-set it by hand. `mongo verify` also prints the syslog part of the verification (§17). The CLI opens the
-syslog store read-only; only the running monitor writes it.
+`gateway syslog` prints `Status.syslog` (`--json`: as it is), whether the monitor keeps the setting,
+and how to set it by hand only while the gateway does not send to this computer and the monitor does
+not set it - `enforce` off, or setting it failed or cannot be done (state `error`,
+`SYSLOG_SETTING_FAILED`, the page not understood, no access code, a changed certificate pending) -
+and no message arrived since the setting was read (with no `Status.syslog` at all: when
+`gateway.enforce_syslog` is off in config.json or the service cannot log in). `gateway syslog on|off` mirrors `gateway
+notification on|off`: through the running service (`POST /api/gateway/syslog`, client `cli`), or
+with the service stopped through `SetGatewaySyslog` on the ledger directly, after the same strict
+certificate check (the login only ever goes to the pinned certificate; the monitor then takes a
+reading of this computer's adapter for its address). It prints the recorded change (`--json`: the
+`config_change`) and what the monitor does from then on; a failed change prints the change the
+monitor reported and, unless the gateway took it or the service only refused a second operation
+(409, 429), how to make it by hand (`--json`: only `{error, change}`, as the service answers a
+failed change - the error, and the change reported if any); either way the command then fails
+(the error on standard error, exit status 1). `mongo verify` also prints the syslog part of the
+verification (§17). The CLI opens the syslog store read-only; only the running monitor writes it.
 
 **Guided setup** (`setup`, and a start without arguments from Explorer, detected by the process
 owning its console): without administrator rights it re-starts itself elevated (ShellExecuteEx
@@ -691,7 +740,9 @@ The `mongo` section configures the MongoDB copy (§17); its URI must not contain
 The `syslog` section configures the receiver and the store (§18): `enabled` (true), `listen`
 (":514"), `port` (514, what the gateway is to send to), `allow` (further senders), `flush_interval`
 (30s), `max_per_minute` (2000), `keep_mb` (100; 1 to 1,048,576) and `keep_days` (0 = no age limit; at
-most 3650).
+most 3650). In the `gateway` section, `enforce_syslog` (true) keeps the gateway's Syslog page sending
+to this computer and `syslog_level` ("") names the Log Level to set (§18); the monitor saves
+`enforce_syslog` when the operator changes it.
 
 ## 16. Engineering rules
 
@@ -790,9 +841,9 @@ can always be rebuilt from the ledger.
 
 ## 18. Syslog, retention and traffic
 
-The owner's goals of 2026-10-05 and the plan are in `docs/syslog-snmp-traffic.md`. Phase 1 (this
-section) receives and keeps the gateway's syslog, reads (never changes) the gateway's Syslog setting
-and shows the traffic; phase 2 sets the gateway's Syslog setting automatically. Everything here is
+The owner's goals of 2026-10-05 and the plan are in `docs/syslog-snmp-traffic.md`. This section is
+its phases 1 and 2: the monitor receives and keeps the gateway's syslog, sets the gateway's Syslog
+page to send it to this computer and keeps it so, and shows the traffic. Everything here is
 supporting evidence: `RulesVersion` stays `2026.10-4` and no verdict depends on it.
 
 **Receiver** (`internal/syslogrx`). UDP on `syslog.listen` (":514"). Datagrams are accepted only from
@@ -873,19 +924,53 @@ force"); a configuration that cannot be saved applies until the next start (the 
 with the change). With the service stopped the CLI records the change on the ledger and the service
 applies it when it starts. Editing `config.json` takes effect at the next start.
 
-**The gateway's Syslog setting** (phase 1: read only). The daily settings check reads `syslog.ha`
-right after the notification setting, in the same login session, and again when this computer's
-address toward the gateway changes (at most every 10 minutes); also when `syslog.enabled` is false.
-Each read is a `gateway_event` `syslog_setting` with the page as a blob: `after` is "off",
-"on -> <server>:<port>, level <level>", or "unknown" when the page was read but not understood (the
-page is what phase 2 needs). A read that fails is not recorded; `Status.syslog` says why. The state
-compares the setting with this computer's address toward the gateway and `syslog.port`: `ok`,
-`off`, `elsewhere`, `unknown` or `error`. `Gateway.SetSyslog` exists (tested on synthetic pages, it
-never posts a form it does not fully understand) but has no caller. Until phase 2 the owner sets the
-page by hand (README). The setting is read only on that schedule (the check runs at start, within
-`notifMinInterval` = 10 minutes, then daily), so a change made by hand shows in `state` only after
-the next read, while the messages show at once (`received`, `last_at`): the dashboard's card says
-that messages arrived since the read instead of how to set the page.
+**The gateway's Syslog setting** (read since phase 1; set and kept since phase 2). The daily settings
+check reads `syslog.ha` right after the notification setting, in the same login session, and again
+when this computer's address toward the gateway changes (at most every 10 minutes); also when
+`syslog.enabled` is false. Each read is a `gateway_event` `syslog_setting` with the page as a blob:
+`after` is "off", "on -> <server>:<port>, level <level>", or "unknown" when the page was read but not
+understood; its detail says what the monitor does with it. A read that fails is not recorded;
+`Status.syslog` says why. The state compares the setting with this computer's address toward the
+gateway and `syslog.port`: `ok`, `off`, `elsewhere`, `unknown` or `error`.
+
+With `gateway.enforce_syslog` (default true), and only while the receiver is on (`syslog.enabled`:
+pointing the gateway at a computer that does not listen would lose its messages; the operator's "on"
+is refused then), the monitor keeps the page at the *target* - Syslog on,
+Server IP Address this computer's IPv4 address toward the gateway (that of the latest local-link
+reading, or of a reading of its own while none has one), Server Port `syslog.port`, and the Log Level
+that `gateway.syslog_level` names when the page offers it, else the level already selected while
+Syslog is on, else an option named like "Informational", else the most detailed option that is not
+"Debug" (by syslog severity): Notice on the BGW320-505 with firmware 6.34.7, whose page offers
+Emergency to Notice. When a read shows anything else, the same check sets the page with
+`Gateway.SetSyslog` (§2): only the syslog controls change, as a browser without JavaScript changes
+them - when the switch changes and the page has an Update button, the form is first posted with the
+switch changed and that button, the gateway answers with the page transformed (its fields enabled
+once Syslog is on: a disabled control is never posted, nor enabled by the client), and the Save is
+posted from that page with its nonce; the page is then read back, and the change counts only when
+it shows the target. A page the client does not fully understand is never posted. A change is
+recorded as a `gateway_event` `syslog_setting` (before, after, what changed, who changed it, how the
+level was chosen) and a `config_change` (target `gateway`, what "syslog.ha (Syslog, Server IP
+Address, Server Port, Log Level)"), both with the pages before and after. A failed attempt is a
+`config_change` whose result says why ("failed: …"), and `SYSLOG_SETTING_FAILED` shows it (the
+problem in `Status.syslog` says it too) until an attempt succeeds or a check finds the target.
+Enforcement adds no login of its own: a failure waits for the next settings check, and while this
+computer's address is not known the first local-link reading that has one asks for a check. While
+the setting as recorded sends here, `SYSLOG_NOT_ARRIVING` (info) says when no message from the
+gateway arrived for 24 hours (at its level the gateway may log little).
+
+The operator's choice (`contracts.SyslogControl.SetGatewaySyslog`, `Monitor.SetGatewaySyslog`; the
+dashboard's Syslog page and Overview card, `POST /api/gateway/syslog`, `att-monitor gateway syslog
+on|off`) saves `gateway.enforce_syslog` - recorded as a `config_change` (target `monitor`) when it
+changes; nothing changes when that record cannot be written, and a configuration that cannot be
+saved applies until the next start - and then reads, records and sets the page at once: to the target
+(on) or off (off). A page that already shows the choice is answered "unchanged: …" and no change of
+the page is recorded. Like `SetGatewayNotification` it is refused while a settings check or another
+change runs (busy) and while a changed gateway certificate waits for confirmation. Several monitors
+on one home network would fight over the setting: only one should keep it. The setting is read on
+the schedule above only (the check runs at start, within `notifMinInterval` = 10 minutes, then
+daily), so a change made on the gateway by hand shows in `state` only after the next read, while the
+messages show at once (`received`, `last_at`): the dashboard's card says that messages arrived since
+the read.
 
 **Readers.** `GET /api/syslog` reads the open and the sealed chunks overlapping the period, newest
 first with bounded memory (§12); evidence bundles carry the period's chunks (§13); the MongoDB copy

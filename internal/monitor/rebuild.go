@@ -66,6 +66,10 @@ type stateCache struct {
 	// SyslogSetting: the gateway's Syslog setting as last read and recorded (absent in caches
 	// written before it existed, which no syslog_setting record precedes).
 	SyslogSetting *syslogGwRead `json:"syslog_setting,omitempty"`
+	// SyslogOffDue: who asked for a switch-off of the gateway's Syslog page that failed and waits
+	// (syslogOffDueAfter; absent when none, and in caches written before it existed, which no
+	// such switch-off precedes).
+	SyslogOffDue string `json:"syslog_off_due,omitempty"`
 }
 
 // clockRef is a recorded clock check that got an SNTP answer: its seq, ts, the median offset of
@@ -150,6 +154,7 @@ type rebuildState struct {
 	alarms          map[string]alarmMark
 	lastClock       *clockRef
 	syslogGw        *syslogGwRead // the newest gateway_event syslog_setting
+	syslogOffDue    string        // who asked for the switch-off of the Syslog page that waits
 	points          *pointStore
 	records         int
 	// The limits of the traffic history: the monitor's gap limit and pcSpanLimit.
@@ -178,7 +183,7 @@ func (rb *rebuildState) fromCache(c *stateCache) {
 		rb.alarms = map[string]alarmMark{}
 	}
 	rb.lastClock = c.LastClock
-	rb.syslogGw = c.SyslogSetting
+	rb.syslogGw, rb.syslogOffDue = c.SyslogSetting, c.SyslogOffDue
 }
 
 // addRestart remembers a restart from a reboot event (in ledger order).
@@ -290,6 +295,7 @@ func (rb *rebuildState) apply(body model.Body) {
 			}
 		case ev.Kind == model.GwEvSyslogSetting:
 			rb.syslogGw = syslogReadFromEvent(ev, body.Seq, body.TS)
+			rb.syslogOffDue = syslogOffDueAfterEvent(rb.syslogOffDue, ev)
 		}
 	case model.TypeClockCheck:
 		var cc model.ClockCheck
@@ -300,7 +306,11 @@ func (rb *rebuildState) apply(body model.Body) {
 		}
 	case model.TypeConfigChange:
 		var cc model.ConfigChange
-		if json.Unmarshal(body.Data, &cc) == nil && cc.Target == "gateway" && strings.Contains(cc.What, "bbevent") &&
+		if json.Unmarshal(body.Data, &cc) != nil {
+			return
+		}
+		rb.syslogOffDue = syslogOffDueAfter(rb.syslogOffDue, cc)
+		if cc.Target == "gateway" && strings.Contains(cc.What, "bbevent") &&
 			!strings.HasPrefix(cc.Result, "failed") && (cc.After == "on" || cc.After == "off") {
 			rb.notif = &model.NotificationState{Enabled: cc.After == "on", CheckedAt: body.TS, Seq: body.Seq}
 			rb.notifRecAt = body.TS
@@ -381,9 +391,10 @@ func (rb *rebuildState) collectPoint(body model.Body) {
 }
 
 // rebuild restores incidents, custody facts, the latest snapshots, anchor and notification
-// state, the gateway's Syslog setting as last recorded, and 7 days of samples, optical readings
-// and traffic from the ledger (docs/PACKAGES.md "internal/monitor"). Failures are logged: the
-// monitor still starts, with whatever could be read.
+// state, the gateway's Syslog setting as last recorded (and a switch-off of it that waits), and
+// 7 days of samples, optical readings and traffic from the ledger (docs/PACKAGES.md
+// "internal/monitor"). Failures are logged: the monitor still starts, with whatever could be
+// read.
 func (m *Monitor) rebuild(now time.Time) {
 	if m.reader == nil {
 		m.log.Warn("no ledger reader: monitor state not rebuilt")
@@ -477,7 +488,7 @@ func (m *Monitor) rebuild(now time.Time) {
 		}
 	}
 	m.st.prevRunClock, m.st.lastClockRef = rb.lastClock, rb.lastClock
-	m.st.syslogGw = rb.syslogGw
+	m.st.syslogGw, m.st.syslogOffDue = rb.syslogGw, rb.syslogOffDue
 	nPts, nInc := len(rb.points.pts), len(rb.incidents)
 	m.mu.Unlock()
 	m.log.Info("monitor state rebuilt from the ledger", "from_seq", from, "cache", cached, "records_scanned", rb.records,
@@ -611,7 +622,7 @@ func (m *Monitor) cacheSnapshot(fp string) (stateCache, uint64) {
 		}
 		c.Alarms = maps.Clone(m.st.alarms)
 		c.LastClock = m.st.lastClockRef
-		c.SyslogSetting = m.st.syslogGw
+		c.SyslogSetting, c.SyslogOffDue = m.st.syslogGw, m.st.syslogOffDue
 	})
 	return c, gen
 }

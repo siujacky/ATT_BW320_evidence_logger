@@ -130,13 +130,14 @@ func TestAppJSKnowsEveryCauseConditionAndProblem(t *testing.T) {
 	}
 	titles := jsConst(t, src, "COND_TITLES")
 	for _, code := range []string{"NOTIFICATION_REDIRECT_ON", "GATEWAY_CERT_CHANGED", "NO_ACCESS_CODE", "ANCHOR_UNTRUSTED",
-		"EGRESS_NOT_VIA_GATEWAY", "LEDGER_WRITE_FAILING", "DISK_SPACE_LOW", "CLOCK_OFFSET"} {
+		"EGRESS_NOT_VIA_GATEWAY", "LEDGER_WRITE_FAILING", "DISK_SPACE_LOW", "CLOCK_OFFSET",
+		"SYSLOG_RECEIVER_DOWN", "SYSLOG_STORE_FAILING", "SYSLOG_SETTING_FAILED", "SYSLOG_NOT_ARRIVING"} {
 		if !strings.Contains(titles, "    "+code+": '") {
 			t.Errorf("COND_TITLES has no title for %s", code)
 		}
 	}
 	banner, _, _ := functionSource(t, src, "conditionBanner")
-	for _, code := range []string{"EGRESS_NOT_VIA_GATEWAY", "LEDGER_WRITE_FAILING", "DISK_SPACE_LOW", "CLOCK_OFFSET"} {
+	for _, code := range []string{"EGRESS_NOT_VIA_GATEWAY", "LEDGER_WRITE_FAILING", "DISK_SPACE_LOW", "CLOCK_OFFSET", "SYSLOG_SETTING_FAILED"} {
 		if !strings.Contains(banner, "cnd.code === '"+code+"'") {
 			t.Errorf("conditionBanner does not explain %s", code)
 		}

@@ -47,9 +47,13 @@ var recordScanBudget = 250_000
 const (
 	noteTimeout         = 30 * time.Second
 	notificationTimeout = 3 * time.Minute
-	trustCertTimeout    = time.Minute
-	anchorTimeout       = 2 * time.Minute
-	exportTimeout       = 15 * time.Minute
+	// gatewaySyslogTimeout bounds a change of the gateway's Syslog setting like a change of the
+	// notification setting: a login (the gateway client allows one a minute), the page, its
+	// Update round, the Save and the read-back.
+	gatewaySyslogTimeout = notificationTimeout
+	trustCertTimeout     = time.Minute
+	anchorTimeout        = 2 * time.Minute
+	exportTimeout        = 15 * time.Minute
 )
 
 // SeriesRanges are the accepted values of GET /api/series?range=.
@@ -120,9 +124,9 @@ type NotificationRequest struct {
 }
 
 // ConfigChangeError is the body of a failed configuration change (POST
-// /api/gateway/notification, POST /api/gateway/trust-cert): Change carries whatever the
-// monitor reported about the attempt, so a client can tell "not changed" from "changed, but
-// something after it failed".
+// /api/gateway/notification, POST /api/gateway/syslog, POST /api/gateway/trust-cert, POST
+// /api/syslog/retention): Change carries whatever the monitor reported about the attempt, so a
+// client can tell "not changed" from "changed, but something after it failed".
 type ConfigChangeError struct {
 	Error  string              `json:"error"`
 	Change *model.ConfigChange `json:"change,omitempty"`
@@ -956,7 +960,7 @@ func (s *Server) handleNotification(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.gatewayMu.TryLock() {
-		writeError(w, http.StatusConflict, "a gateway setting change or certificate confirmation is already in progress")
+		writeError(w, http.StatusConflict, msgGatewayBusy)
 		return
 	}
 	defer s.gatewayMu.Unlock()
@@ -966,27 +970,45 @@ func (s *Server) handleNotification(w http.ResponseWriter, r *http.Request) {
 	change, err := s.actions.SetGatewayNotification(ctx, *req.Enabled, "operator via "+client)
 	if err != nil {
 		s.log.Warn("web: gateway notification change failed", "enabled", *req.Enabled, "result", change.Result, "err", err)
-		resp := ConfigChangeError{Error: err.Error()}
-		if change != (model.ConfigChange{}) {
-			resp.Change = &change
-		}
-		code, retryAfter := http.StatusBadGateway, time.Duration(0)
-		switch c, known := classifyErr("gateway setting change", err); {
-		case gatewayChangeReported(change.Result):
-			// The gateway took the change ("verified" or "applied"); what failed is on this
-			// PC (e.g. writing the config_change record). 502 would blame the gateway, and a
-			// client would wrongly report the setting as unchanged.
-			code = http.StatusInternalServerError
-			resp.Error = "the gateway reports the setting as changed (" + change.Result +
-				"), but the change could not be completed: " + err.Error()
-		case known:
-			code, retryAfter, resp.Error = c.code, c.retryAfter, c.msg
-		}
+		code, retryAfter, resp := gatewayChangeError("gateway setting change", change, err)
 		writeRetryAfter(w, retryAfter)
 		writeJSON(w, code, resp)
 		return
 	}
 	writeJSON(w, http.StatusOK, change)
+}
+
+// msgGatewayBusy refuses an operator action on the gateway's authenticated side while another
+// one runs (gatewayMu).
+const msgGatewayBusy = "a gateway setting change or certificate confirmation is already in progress"
+
+// gatewayChangeError maps a failed change of a gateway setting (POST /api/gateway/notification,
+// POST /api/gateway/syslog) to a status, a Retry-After (0: none) and the answer, which carries
+// the change the monitor reported, if any: 502 by default (the gateway failed); 500 when the
+// change says that the gateway took it ("verified" or "applied") or already showed it
+// ("unchanged: ...") and what failed came after, on this PC (e.g. writing a record, saving the
+// configuration) - 502 would blame the gateway, and a client would wrongly report the setting
+// as not made; otherwise the contracts' sentinels as classifyErr maps them (op names the
+// operation in their messages).
+func gatewayChangeError(op string, change model.ConfigChange, err error) (int, time.Duration, ConfigChangeError) {
+	resp := ConfigChangeError{Error: err.Error()}
+	if change != (model.ConfigChange{}) {
+		resp.Change = &change
+	}
+	code, retryAfter := http.StatusBadGateway, time.Duration(0)
+	switch c, known := classifyErr(op, err); {
+	case strings.HasPrefix(strings.ToLower(strings.TrimSpace(change.Result)), "unchanged"):
+		code = http.StatusInternalServerError
+		resp.Error = "the gateway's setting is already as asked (" + change.Result +
+			"), but the change could not be completed: " + err.Error()
+	case gatewayChangeReported(change.Result):
+		code = http.StatusInternalServerError
+		resp.Error = "the gateway reports the setting as changed (" + change.Result +
+			"), but the change could not be completed: " + err.Error()
+	case known:
+		code, retryAfter, resp.Error = c.code, c.retryAfter, c.msg
+	}
+	return code, retryAfter, resp
 }
 
 // handleTrustCert serves POST /api/gateway/trust-cert: the operator confirms the changed TLS
@@ -1020,7 +1042,7 @@ func (s *Server) handleTrustCert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.gatewayMu.TryLock() {
-		writeError(w, http.StatusConflict, "a gateway setting change or certificate confirmation is already in progress")
+		writeError(w, http.StatusConflict, msgGatewayBusy)
 		return
 	}
 	defer s.gatewayMu.Unlock()
@@ -1158,7 +1180,8 @@ func normalizeFingerprint(v string) string {
 }
 
 // gatewayChangeReported reports whether a config_change result says that the gateway took
-// the change ("verified", "applied", possibly followed by notes) rather than "failed: ...".
+// the change ("verified", "applied", possibly followed by notes) or already showed it
+// ("unchanged: ...") rather than "failed: ...".
 func gatewayChangeReported(result string) bool {
 	r := strings.ToLower(strings.TrimSpace(result))
 	return r != "" && !strings.HasPrefix(r, "failed")

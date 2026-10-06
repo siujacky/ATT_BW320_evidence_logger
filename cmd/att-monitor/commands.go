@@ -273,7 +273,7 @@ func cmdGateway(args []string) error {
 		return gatewaySyslog(os.Stdout, args[1:])
 	}
 	if len(args) == 0 || args[0] != "notification" {
-		return errors.New("usage: att-monitor gateway notification [status|on|off]\n       att-monitor gateway syslog [status] [--json]\n" +
+		return errors.New("usage: att-monitor gateway notification [status|on|off]\n       att-monitor gateway syslog [status|on|off] [--json]\n" +
 			"       att-monitor gateway trust-cert")
 	}
 	args = args[1:]

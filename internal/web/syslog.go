@@ -42,6 +42,8 @@ const (
 const (
 	msgNoSyslogStore   = "the gateway's syslog messages are not available: this att-monitor keeps no syslog store"
 	msgNoSyslogControl = "how much syslog is kept cannot be changed here: this att-monitor offers no control of a syslog store"
+	// msgNoGatewaySyslogControl answers POST /api/gateway/syslog without a syslog control.
+	msgNoGatewaySyslogControl = "the gateway's Syslog setting cannot be changed here: this att-monitor offers no control of it"
 )
 
 // syslogSeverities maps the names severity= accepts to the severity numbers of RFC 5424
@@ -563,4 +565,62 @@ func retentionError(change model.ConfigChange, err error) (int, time.Duration, s
 		return http.StatusServiceUnavailable, 0, op + ": cancelled"
 	}
 	return http.StatusInternalServerError, 0, op + ": " + err.Error()
+}
+
+// ----------------------------------------------------------------------------- the gateway's setting
+
+// GatewaySyslogRequest is the body of POST /api/gateway/syslog: the operator's choice for the
+// gateway's Syslog page (docs/syslog-snmp-traffic.md §3.1).
+type GatewaySyslogRequest struct {
+	// Enabled (required): true sends the gateway's log to this computer - Syslog on, this
+	// computer's address, syslog.port, the level chosen - and keeps it so (gateway.enforce_syslog);
+	// false switches it off on the gateway and stops keeping it.
+	Enabled *bool  `json:"enabled"`
+	Client  string `json:"client,omitempty"` // "web" or "cli"; default inferred (see clientName); becomes the actor
+}
+
+// handleGatewaySyslog serves POST /api/gateway/syslog through the syslog control's
+// SetGatewaySyslog: the monitor logs in to the gateway, sets its Syslog page (enabled: to send
+// the gateway's log to this computer, and keeps it so; disabled: off, and no longer kept), reads
+// the page back and records the change with the pages before and after; the answer is the
+// config_change. It is guarded and answered like POST /api/gateway/notification: one
+// authenticated gateway operation at a time (gatewayMu, shared with the notification setting
+// and the certificate confirmation: 409), run detached from the request (gatewaySyslogTimeout:
+// the change can take a minute or more), and a failure answered by gatewayChangeError with the
+// change the monitor reported. Without a syslog control the endpoint answers 404, for any body.
+func (s *Server) handleGatewaySyslog(w http.ResponseWriter, r *http.Request) {
+	if s.syslogCtl == nil {
+		writeError(w, http.StatusNotFound, msgNoGatewaySyslogControl)
+		return
+	}
+	var req GatewaySyslogRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Enabled == nil {
+		writeError(w, http.StatusBadRequest, "enabled (true or false) is required")
+		return
+	}
+	client, ok := clientName(req.Client, r)
+	if !ok {
+		writeError(w, http.StatusBadRequest, `client must be "web" or "cli"`)
+		return
+	}
+	if !s.gatewayMu.TryLock() {
+		writeError(w, http.StatusConflict, msgGatewayBusy)
+		return
+	}
+	defer s.gatewayMu.Unlock()
+
+	ctx, cancel := s.detached(r, gatewaySyslogTimeout)
+	defer cancel()
+	change, err := s.syslogCtl.SetGatewaySyslog(ctx, *req.Enabled, "operator via "+client)
+	if err != nil {
+		s.log.Warn("web: gateway syslog setting change failed", "enabled", *req.Enabled, "result", change.Result, "err", err)
+		code, retryAfter, resp := gatewayChangeError("gateway Syslog setting change", change, err)
+		writeRetryAfter(w, retryAfter)
+		writeJSON(w, code, resp)
+		return
+	}
+	writeJSON(w, http.StatusOK, change)
 }

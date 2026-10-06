@@ -10,6 +10,9 @@ import (
 	"fmt"
 	"io"
 	"net/netip"
+	"os"
+	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -344,16 +347,24 @@ type fakeGateway struct {
 	notifTimes []time.Time
 	setCalls   []bool
 	setErr     error
-	// syslog answers Syslog (nil: the page cannot be read, errNoSyslogPage); syslogCalls counts
-	// the reads (syslogTimes: when) and setSyslogCalls the changes, which phase 1 never makes.
+	// syslog answers Syslog (nil: the page cannot be read, errNoSyslogPage) and setSyslog answers
+	// SetSyslog (nil: refused, errNoSetSyslog); syslogCalls counts the reads (syslogTimes: when)
+	// and setSyslogWants lists what each SetSyslog asked for (setSyslogTimes: when). newSyslogSim
+	// installs both as a simulated page.
 	syslog         func() (model.SyslogSetting, []byte, error)
 	syslogCalls    int
 	syslogTimes    []time.Time
-	setSyslogCalls int
+	setSyslog      func(want model.SyslogTarget) (before, after []byte, err error)
+	setSyslogWants []model.SyslogTarget
+	setSyslogTimes []time.Time
 }
 
-// errNoSyslogPage is the fake gateway's answer to Syslog unless a test sets one.
-var errNoSyslogPage = errors.New("fake gateway: the Syslog page is not part of this test")
+// errNoSyslogPage and errNoSetSyslog are the fake gateway's answers to Syslog and SetSyslog
+// unless a test sets them.
+var (
+	errNoSyslogPage = errors.New("fake gateway: the Syslog page is not part of this test")
+	errNoSetSyslog  = errors.New("fake gateway: setting the Syslog page is not part of this test")
+)
 
 func (g *fakeGateway) Snapshot(ctx context.Context, pages []string, trigger string) (model.GatewaySnapshot, map[string][]byte, error) {
 	g.mu.Lock()
@@ -417,19 +428,184 @@ func (g *fakeGateway) Syslog(ctx context.Context) (model.SyslogSetting, []byte, 
 	return fn()
 }
 
-// SetSyslog is counted and refused: phase 1 of docs/syslog-snmp-traffic.md only reads the page.
+// SetSyslog is recorded and answered by setSyslog (refused without one: nothing posted).
 func (g *fakeGateway) SetSyslog(ctx context.Context, want model.SyslogTarget) ([]byte, []byte, error) {
 	g.mu.Lock()
-	g.setSyslogCalls++
+	g.setSyslogWants = append(g.setSyslogWants, want)
+	g.setSyslogTimes = append(g.setSyslogTimes, time.Now())
+	fn := g.setSyslog
 	g.mu.Unlock()
-	return nil, nil, errors.New("fake gateway: SetSyslog must not be called")
+	if fn == nil {
+		return nil, nil, errNoSetSyslog
+	}
+	return fn(want)
 }
 
-// syslogReads returns how often the Syslog page was read and changed.
+// syslogReads returns how often the Syslog page was read and asked to change.
 func (g *fakeGateway) syslogReads() (reads, sets int) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.syslogCalls, g.setSyslogCalls
+	return g.syslogCalls, len(g.setSyslogWants)
+}
+
+// syslogSets returns what SetSyslog was asked for, in order, and when.
+func (g *fakeGateway) syslogSets() ([]model.SyslogTarget, []time.Time) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return slices.Clone(g.setSyslogWants), slices.Clone(g.setSyslogTimes)
+}
+
+// syslogSim simulates the gateway's Syslog page behind the fake gateway: Syslog reads it, and
+// SetSyslog changes it as the gateway client does - only the syslog controls, a level by its
+// label (case aside) and never one the page does not offer, nothing posted when the page already
+// shows the request or the request is not valid - and reads it back, returning the pages before
+// and after. Until something is posted the page is the one it started with (e.g. the real page);
+// every page after that is rendered with a new nonce, as the gateway does. Tests make reads fail
+// (readErr), changes fail before anything is posted (setErr: the page before only), or changes
+// that the page read back does not show (ignore: both pages and an error).
+type syslogSim struct {
+	mu      sync.Mutex
+	setting model.SyslogSetting
+	page    []byte
+	renders int
+	readErr error
+	setErr  error
+	ignore  bool
+	posts   int // SetSyslog calls that posted a change
+}
+
+// newSyslogSim installs a simulated Syslog page showing s - as page until something is posted
+// (nil: rendered) - as g's Syslog and SetSyslog.
+func newSyslogSim(g *fakeGateway, s model.SyslogSetting, page []byte) *syslogSim {
+	sim := &syslogSim{setting: cloneSetting(s), page: page}
+	g.mu.Lock()
+	g.syslog, g.setSyslog = sim.read, sim.set
+	g.mu.Unlock()
+	return sim
+}
+
+func cloneSetting(s model.SyslogSetting) model.SyslogSetting {
+	s.Levels = slices.Clone(s.Levels)
+	return s
+}
+
+// update changes the simulation under its lock.
+func (s *syslogSim) update(f func(s *syslogSim)) {
+	s.mu.Lock()
+	f(s)
+	s.mu.Unlock()
+}
+
+// current returns the setting the page shows now and how many changes were posted.
+func (s *syslogSim) current() (model.SyslogSetting, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return cloneSetting(s.setting), s.posts
+}
+
+// pageLocked returns the page as the gateway would serve it now. Caller holds mu.
+func (s *syslogSim) pageLocked() []byte {
+	if s.page != nil && s.posts == 0 {
+		return bytes.Clone(s.page)
+	}
+	s.renders++
+	return renderSyslogPage(s.setting, s.renders)
+}
+
+func (s *syslogSim) read() (model.SyslogSetting, []byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.readErr != nil {
+		return model.SyslogSetting{}, nil, s.readErr
+	}
+	return cloneSetting(s.setting), s.pageLocked(), nil
+}
+
+func (s *syslogSim) set(want model.SyslogTarget) ([]byte, []byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.readErr != nil {
+		return nil, nil, s.readErr
+	}
+	if want.Enabled {
+		if a, err := netip.ParseAddr(want.Server); err != nil || !a.Is4() {
+			return nil, nil, fmt.Errorf("gateway: syslog server %q is not an IPv4 address", want.Server)
+		}
+		if want.Port < 1 || want.Port > 65535 {
+			return nil, nil, fmt.Errorf("gateway: syslog port %d is not a port number (1-65535)", want.Port)
+		}
+	}
+	before := s.pageLocked()
+	if s.setErr != nil {
+		return before, nil, s.setErr
+	}
+	next := cloneSetting(s.setting) // switching off changes only the switch
+	next.Enabled = want.Enabled
+	if want.Enabled {
+		next.Server, next.Port = want.Server, want.Port
+		if want.Level != "" {
+			i := slices.IndexFunc(next.Levels, func(l string) bool { return strings.EqualFold(l, want.Level) })
+			if i < 0 {
+				return before, nil, fmt.Errorf("gateway: Syslog page not understood: %q has no option %q: nothing posted", "Log Level", want.Level)
+			}
+			next.Level = next.Levels[i]
+		}
+	}
+	if reflect.DeepEqual(next, s.setting) {
+		return before, before, nil // already as requested: nothing posted
+	}
+	s.posts++
+	if s.ignore {
+		return before, s.pageLocked(), fmt.Errorf("gateway: setting not applied: Syslog reads %s (wanted %s) after saving", onOff(s.setting.Enabled), onOff(want.Enabled))
+	}
+	s.setting = next
+	return before, s.pageLocked(), nil
+}
+
+// renderSyslogPage renders a Syslog page in the shape of the gateway's (the monitor stores it,
+// it never parses it), with nonce n.
+func renderSyslogPage(s model.SyslogSetting, n int) []byte {
+	const selected = ` selected="selected"`
+	var b strings.Builder
+	fmt.Fprintf(&b, `<html><body><form method="post" action="/cgi-bin/syslog.ha"><input type="hidden" name="nonce" value="%064x" />`, n)
+	off, selOff, selOn := ` disabled="disabled"`, selected, ""
+	if s.Enabled {
+		off, selOff, selOn = "", "", selected
+	}
+	fmt.Fprintf(&b, `<label for="syslog">Syslog</label><select name="syslog" id="syslog"><option value="off"%s>Off</option><option value="on"%s>On</option></select>`,
+		selOff, selOn)
+	fmt.Fprintf(&b, `<label for="serverip">Server IP Address</label><input id="serverip" type="text" name="location" value="%s"%s />`, s.Server, off)
+	fmt.Fprintf(&b, `<label for="serverport">Server Port</label><input id="serverport" type="text" name="port" value="%d"%s />`, s.Port, off)
+	fmt.Fprintf(&b, `<label for="loglevel">Log Level</label><select name="level" id="loglevel"%s>`, off)
+	for _, l := range s.Levels {
+		sel := ""
+		if l == s.Level {
+			sel = selected
+		}
+		fmt.Fprintf(&b, `<option value="%s"%s>%s</option>`, l, sel, l)
+	}
+	b.WriteString(`</select><input type="submit" name="Save" value="Save" /></form></body></html>`)
+	return []byte(b.String())
+}
+
+// realSyslogLevels are the Log Level options of the owner's gateway (BGW320-505, firmware 6.34.7):
+// no Informational, no Debug.
+var realSyslogLevels = []string{"Emergency", "Alert", "Critical", "Error", "Warning", "Notice"}
+
+// realSyslogOff is what the gateway client reads from testdata/gateway/syslog_real_off.html, the
+// owner's gateway's Syslog page with Syslog off: its fields keep port 514 and level Error.
+func realSyslogOff() model.SyslogSetting {
+	return model.SyslogSetting{Enabled: false, Server: "", Port: 514, Level: "Error", Levels: slices.Clone(realSyslogLevels)}
+}
+
+// realSyslogPage returns the owner's gateway's Syslog page with Syslog off (the fixture).
+func realSyslogPage(t testing.TB) []byte {
+	t.Helper()
+	b, err := os.ReadFile("../../testdata/gateway/syslog_real_off.html")
+	if err != nil {
+		t.Fatalf("the real Syslog page: %v", err)
+	}
+	return b
 }
 
 func (g *fakeGateway) SetCertObserver(o contracts.CertObserver) {

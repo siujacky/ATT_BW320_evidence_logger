@@ -35,10 +35,11 @@ import (
 // deletion is chosen, recorded, and only then made. While a chunk waits for its record nothing
 // is deleted, so a chunk's record always precedes the record of its deletion.
 //
-// The gateway's own Syslog setting (Diagnostics > Syslog) is only read in phase 1 of the plan:
-// in the daily settings check, right after the notification setting and in the same login
-// session, and again within minutes after this computer's address toward the gateway changed.
-// Each read is recorded as a gateway_event syslog_setting with the page.
+// The gateway's own Syslog setting (Diagnostics > Syslog) is read in the daily settings check,
+// right after the notification setting and in the same login session, and again within minutes
+// after this computer's address toward the gateway changed. Each read is recorded as a
+// gateway_event syslog_setting with the page. With gateway.enforce_syslog the monitor keeps it
+// sending to this computer, and the operator switches that on or off (syslog_gateway.go).
 
 // syslogCounts are the syslog messages of this run (Status.Syslog): handed over by the receiver,
 // of those appended to the syslog store, and the datagrams the receiver did not keep - from the
@@ -343,7 +344,7 @@ func (m *Monitor) flushSyslog(final bool) {
 	if msgs, dropped, rejected := rx.Drain(); len(msgs) > 0 || dropped > 0 || rejected > 0 {
 		chunks, err := book.Append(msgs, dropped, rejected, now)
 		used = true
-		m.noteSyslogReceived(msgs, dropped, rejected, err == nil)
+		m.noteSyslogReceived(msgs, dropped, rejected, err == nil, now)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("storing %s: %w", plural(len(msgs), "message", "messages"), err))
 		}
@@ -516,9 +517,12 @@ func pruneReason(deleted []model.SyslogChunkRef, keepMB, keepDays int, now time.
 	return days + " and " + mb
 }
 
-// noteSyslogReceived counts what a drain handed over (Status.Syslog); stored: the store took
-// the messages.
-func (m *Monitor) noteSyslogReceived(msgs []model.SyslogMessage, dropped, rejected int, stored bool) {
+// noteSyslogReceived counts what a drain handed over at now (Status.Syslog); stored: the store
+// took the messages. A message from the gateway itself (not from syslog.allow) is noted for
+// SYSLOG_NOT_ARRIVING - the first one after the monitor set the gateway's Syslog page is logged.
+func (m *Monitor) noteSyslogReceived(msgs []model.SyslogMessage, dropped, rejected int, stored bool, now time.Time) {
+	fromGateway := slices.ContainsFunc(msgs, func(msg model.SyslogMessage) bool { return sameIP(hostOnly(msg.Src), m.set.gwHost) })
+	first := false
 	m.locked(func() {
 		c := &m.st.syslogCounts
 		c.received += int64(len(msgs))
@@ -530,7 +534,14 @@ func (m *Monitor) noteSyslogReceived(msgs []model.SyslogMessage, dropped, reject
 		if n := len(msgs); n > 0 {
 			m.st.syslogLastAt, m.st.syslogLast = msgs[n-1].RX, syslogText(msgs[n-1])
 		}
+		if fromGateway {
+			m.st.syslogGwMsgAt = now
+			first, m.st.syslogAwaitMsg = m.st.syslogAwaitMsg, false
+		}
 	})
+	if first {
+		m.log.Info("the gateway's syslog messages arrive since its Syslog page was set")
+	}
 }
 
 // syslogText is a message's text for the status: its message part (after its app), else the
@@ -667,83 +678,8 @@ func retentionText(keepMB, keepDays int) string {
 
 // ---------------------------------------------------------------------------- the gateway's setting
 
-// checkSyslogSetting reads the gateway's Syslog page (authenticated, and only read: phase 1 of
-// the plan never calls SetSyslog) and records the read as a gateway_event syslog_setting with
-// the page attached: Before is the setting as last recorded, After the setting read
-// (syslogSummary) - or "unknown" when the page was not understood, whose exact bytes are what
-// phase 2 needs. A read that fails is not recorded; Status.Syslog says why. why (may be "") says
-// what asked for the check. Caller holds notifMu.
-func (m *Monitor) checkSyslogSetting(ctx context.Context, why string) {
-	var (
-		set model.SyslogSetting
-		raw []byte
-		err error
-	)
-	m.withGatewayAuth(func() {
-		sctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-		defer cancel()
-		set, raw, err = m.gw.Syslog(sctx)
-	})
-	if ctx.Err() != nil {
-		return
-	}
-	now := m.now()
-	if err != nil && len(raw) == 0 {
-		problem := "the latest check could not read the gateway's Syslog page: " + errText(err)
-		m.locked(func() { m.st.syslogErr = problem })
-		if loud, n, since := m.syslogReadLog.fail(now, syslogReadReport); loud {
-			m.log.Warn("cannot read the gateway's Syslog page; it is read again at the next settings check", "err", err, "failures", n, "since", since)
-		} else {
-			m.log.Debug("cannot read the gateway's Syslog page", "err", err, "failures", n)
-		}
-		return
-	}
-	if rec, n, since := m.syslogReadLog.ok(); rec {
-		m.log.Info("the gateway's Syslog page can be read again", "failures", n, "since", since)
-	}
-	// The gateway client returns the page with an error only when it read the page but did not
-	// understand it (gateway.ErrSyslogPage): that read is recorded too, with the problem.
-	var blobs []string
-	if len(raw) > 0 {
-		if id, perr := m.putBlob(raw); perr == nil {
-			blobs = append(blobs, id)
-		}
-	}
-	m.mu.Lock()
-	prev, localIP := m.st.syslogGw, m.st.localIP
-	m.mu.Unlock()
-	read := &syslogGwRead{}
-	ev := model.GatewayEvent{Kind: model.GwEvSyslogSetting}
-	if prev != nil {
-		ev.Before = prev.After
-	}
-	if err == nil {
-		cp := set
-		cp.Levels = slices.Clone(set.Levels)
-		read.Setting = &cp
-		ev.After, ev.Detail = syslogSummary(set), syslogDetail(set, localIP, m.set.syslogPort, why)
-	} else {
-		read.Problem = "the gateway's Syslog page was not understood: " + errText(err)
-		ev.After = syslogUnknown
-		ev.Detail = fmt.Sprintf("Syslog page (Diagnostics > Syslog) read%s but not understood: %s; the page is kept with this record (read only: the monitor did not change the setting)",
-			whyText(why), errText(err))
-	}
-	read.After = ev.After
-	if _, aerr := m.appendApply(model.TypeGatewayEvent, ev, blobs, func(ref model.Ref) {
-		read.Seq, read.TS = ref.Seq, ref.TS
-		m.st.syslogGw, m.st.syslogErr = read, ""
-	}); aerr != nil {
-		m.locked(func() {
-			m.st.syslogErr = "the gateway's Syslog setting was read but could not be recorded in the evidence ledger: " + errText(aerr)
-		})
-		return
-	}
-	if err != nil {
-		m.log.Warn("the gateway's Syslog page was not understood; the page is recorded", "err", err)
-		return
-	}
-	m.log.Info("gateway syslog setting read", "setting", ev.After, "before", ev.Before)
-}
+// The settings check reads (and keeps) the gateway's Syslog page: checkSyslogSetting and
+// syncSyslog in syslog_gateway.go.
 
 // whyText turns what asked for a settings check into words after "read" ("" for the regular
 // check).
@@ -803,8 +739,9 @@ func syslogReadFromEvent(ev model.GatewayEvent, seq uint64, ts string) *syslogGw
 	return r
 }
 
-// syslogDetail words a read of the gateway's Syslog page for its gateway_event.
-func syslogDetail(s model.SyslogSetting, localIP string, port int, why string) string {
+// syslogDetail words a read of the gateway's Syslog page for its gateway_event; note (may be "")
+// says what the monitor does with the setting read (syslogReadNote).
+func syslogDetail(s model.SyslogSetting, localIP string, port int, why, note string) string {
 	var b strings.Builder
 	b.WriteString("Syslog page (Diagnostics > Syslog) read" + whyText(why) + ": ")
 	if !s.Enabled {
@@ -826,7 +763,9 @@ func syslogDetail(s model.SyslogSetting, localIP string, port int, why string) s
 	if len(s.Levels) > 0 {
 		b.WriteString("; log levels offered: " + truncate(strings.Join(s.Levels, ", "), 300))
 	}
-	b.WriteString("; read only: the monitor did not change the setting")
+	if note != "" {
+		b.WriteString("; " + note)
+	}
 	return b.String()
 }
 
@@ -863,11 +802,13 @@ func sameIP(a, b string) bool {
 // syslogStatusLocked returns Status.Syslog: nil when the monitor has neither a syslog receiver
 // nor a store and knows nothing of the gateway's Syslog setting. addr and lerr are what the
 // receiver's Listening reported and usage the store's volume (both read without mu); hasCode: a
-// gateway access code is stored. Phase 1 only reads the gateway's setting: Enforce is false and
-// Target nil. Caller holds mu.
-func (m *Monitor) syslogStatusLocked(addr string, lerr error, usage *model.SyslogUsage, hasCode bool) *model.SyslogStatus {
+// gateway access code is stored; enforce and level: gateway.enforce_syslog and
+// gateway.syslog_level. Target is the setting the monitor keeps (syslogTarget) once this
+// computer's address toward the gateway is known, whether it is enforced or not; Problem adds a
+// failed attempt to set it. Caller holds mu.
+func (m *Monitor) syslogStatusLocked(addr string, lerr error, usage *model.SyslogUsage, hasCode, enforce bool, level string) *model.SyslogStatus {
 	gw := m.st.syslogGw
-	if m.opts.Syslog == nil && m.opts.SyslogStore == nil && gw == nil && m.st.syslogErr == "" {
+	if m.opts.Syslog == nil && m.opts.SyslogStore == nil && gw == nil && m.st.syslogErr == "" && m.st.syslogSetFail == nil {
 		return nil
 	}
 	c := m.st.syslogCounts
@@ -887,15 +828,26 @@ func (m *Monitor) syslogStatusLocked(addr string, lerr error, usage *model.Syslo
 			s.ListenErr = m.st.rxDown
 		}
 	}
+	var page *model.SyslogSetting
 	if gw != nil {
 		if gw.Setting != nil {
 			cp := *gw.Setting
 			cp.Levels = slices.Clone(cp.Levels)
-			s.Gateway = &cp
+			s.Gateway, page = &cp, &cp
 		}
 		s.GatewayAt, s.GatewaySeq = gw.TS, gw.Seq
 	}
+	s.Enforce = enforce
+	if t, _, ok := syslogTarget(page, m.st.localIP, m.set.syslogPort, level); ok {
+		s.Target = &t
+	}
 	s.State, s.Problem = m.syslogStateLocked(hasCode)
+	if f := m.st.syslogSetFail; f != nil {
+		if s.Problem != "" {
+			s.Problem += "; "
+		}
+		s.Problem += f.short
+	}
 	return s
 }
 
@@ -919,9 +871,10 @@ func (m *Monitor) syslogStateLocked(hasCode bool) (state, problem string) {
 }
 
 // syslogConditionsLocked returns SYSLOG_RECEIVER_DOWN while the syslog pipeline runs but the
-// receiver does not listen (addr and lerr: what its Listening reported) and SYSLOG_STORE_FAILING
-// while the syslog store fails. Caller holds mu.
-func (m *Monitor) syslogConditionsLocked(addr string, lerr error) []model.Condition {
+// receiver does not listen (addr and lerr: what its Listening reported), SYSLOG_STORE_FAILING
+// while the syslog store fails, and the conditions of the gateway's Syslog setting
+// (syslogSettingConditionsLocked: SYSLOG_SETTING_FAILED, SYSLOG_NOT_ARRIVING). Caller holds mu.
+func (m *Monitor) syslogConditionsLocked(addr string, lerr error, now time.Time) []model.Condition {
 	var out []model.Condition
 	if why := cmp.Or(errText(lerr), m.st.rxDown); m.syslogOn && addr == "" && why != "" {
 		c := model.Condition{
@@ -944,5 +897,5 @@ func (m *Monitor) syslogConditionsLocked(addr string, lerr error) []model.Condit
 			Since: fmtTS(m.st.storeFailSince),
 		})
 	}
-	return out
+	return append(out, m.syslogSettingConditionsLocked(addr, now)...)
 }

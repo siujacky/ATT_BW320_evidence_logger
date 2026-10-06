@@ -367,12 +367,29 @@ func (m *Monitor) restartBootsLocked() []time.Time {
 // gateway session at a time; released even if the gateway client panics). While it runs,
 // the certificate observer knows that a TLS handshake belongs to a login: a changed
 // certificate is then refused, so the login hash never reaches an unconfirmed host.
-func (m *Monitor) withGatewayAuth(f func()) {
+//
+// While a changed gateway certificate waits for the operator's confirmation the operation is
+// refused (errCertPending) and f does not run, whatever its caller checked before: a status
+// read that meets a changed certificate has it accepted (the observer holds it pending) and
+// pinned by the gateway client, whose later requests then never ask the observer again - so
+// it must not be followed by an authenticated request. That is checked holding the gateway
+// lock, which every request to the gateway holds, so such a status read has recorded the
+// certificate by then; and the flag is raised in the same cfgMu critical section as the
+// pending certificate is read, in which the observer reads the flag: a certificate accepted
+// for a status read is pending by the check, and one met later is refused.
+func (m *Monitor) withGatewayAuth(f func()) error {
 	m.gwMu.Lock()
 	defer m.gwMu.Unlock()
+	m.cfgMu.Lock()
 	m.gwAuth.Store(true)
+	pending := m.cfg.Gateway.PendingCertSHA256
+	m.cfgMu.Unlock()
 	defer m.gwAuth.Store(false)
+	if pending != "" {
+		return errCertPending(pending)
+	}
 	f()
+	return nil
 }
 
 // pendingCert returns the changed gateway certificate waiting for the operator's
@@ -484,8 +501,9 @@ func (m *Monitor) certDecision(observed string, authenticated bool) (*model.Gate
 // decision that changes the pin state is persisted with SaveConfig and recorded as a
 // gateway_event.
 func (m *Monitor) observeCert(previous, observed string) bool {
-	authenticated := m.gwAuth.Load()
 	m.cfgMu.Lock()
+	// Read under cfgMu, where withGatewayAuth raises it and reads the pending certificate.
+	authenticated := m.gwAuth.Load()
 	ev, accept := m.certDecision(strings.ToLower(strings.TrimSpace(observed)), authenticated)
 	var saveErr error
 	pending := m.cfg.Gateway.PendingCertSHA256
@@ -711,29 +729,27 @@ func (m *Monitor) checkNotification(ctx context.Context) error { return m.checkS
 
 // checkSettings checks the gateway's settings: the outage-redirect setting (readNotification)
 // and, after a successful read of it and in the same login session, the Syslog setting
-// (checkSyslogSetting, read only). The returned error is the notification check's: it sets the
-// loop's back-off. A failed read of the Syslog page waits for the next check (Status.Syslog says
-// why), so that it never adds logins. why (may be "") says what asked for the check. It holds
-// notifMu so that an operator's SetGatewayNotification cannot interleave with the
-// read-then-enforce sequence.
+// (checkSyslogSetting: read, and with gateway.enforce_syslog set to send to this computer). The
+// returned error is the notification check's: it sets the loop's back-off. A failed read of the
+// Syslog page, or a failed attempt to set it, waits for the next check (Status.Syslog and
+// SYSLOG_SETTING_FAILED say why), so that it never adds logins. why (may be "") says what asked
+// for the check. It holds notifMu so that an operator's SetGatewayNotification or
+// SetGatewaySyslog cannot interleave with the read-then-enforce sequence. While a changed
+// gateway certificate waits for confirmation - also one a status read met after the check
+// began, which pauses the authenticated requests that follow (withGatewayAuth) - the settings
+// are not checked further.
 func (m *Monitor) checkSettings(ctx context.Context, why string) error {
 	m.notifMu.Lock()
 	defer m.notifMu.Unlock()
 	if pending := m.pendingCert(); pending != "" {
-		err := errCertPending(pending)
-		m.locked(func() {
-			ns := model.NotificationState{Err: errText(err)}
-			if p := m.st.notif; p != nil {
-				ns.Enabled, ns.Seq, ns.CheckedAt = p.Enabled, p.Seq, p.CheckedAt
-			}
-			m.st.notif = &ns
-			m.st.syslogErr = "the gateway's Syslog setting was not checked: " + errText(err)
-		})
-		return err
+		return m.settingsPaused(errCertPending(pending))
 	}
 	read, err := m.readNotification(ctx)
+	var paused *certPendingError
 	switch {
 	case ctx.Err() != nil:
+	case errors.As(err, &paused):
+		return m.settingsPaused(err)
 	case read:
 		m.checkSyslogSetting(ctx, why)
 	default:
@@ -744,19 +760,38 @@ func (m *Monitor) checkSettings(ctx context.Context, why string) error {
 	return err
 }
 
+// settingsPaused notes a settings check that authenticated requests were refused to (err: a
+// changed gateway certificate waits for confirmation): the notification and Syslog settings
+// keep what is known of them, with why they were not checked. It returns err.
+func (m *Monitor) settingsPaused(err error) error {
+	m.locked(func() {
+		ns := model.NotificationState{Err: errText(err)}
+		if p := m.st.notif; p != nil {
+			ns.Enabled, ns.Seq, ns.CheckedAt = p.Enabled, p.Seq, p.CheckedAt
+		}
+		m.st.notif = &ns
+		m.st.syslogErr = "the gateway's Syslog setting was not checked: " + errText(err)
+	})
+	return err
+}
+
 // readNotification reads the bbevent setting, records it on first observation or change, and
 // turns it off when EnforceNotificationOff is set. read reports whether the setting could be
-// read (err may still report a failure after that). Caller holds notifMu.
+// read (err may still report a failure after that). A read refused because a changed gateway
+// certificate waits for confirmation changes nothing (checkSettings says why). Caller holds
+// notifMu.
 func (m *Monitor) readNotification(ctx context.Context) (read bool, err error) {
 	var (
 		enabled bool
 		raw     []byte
 	)
-	m.withGatewayAuth(func() {
+	if aerr := m.withGatewayAuth(func() {
 		nctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer cancel()
 		enabled, raw, err = m.gw.Notification(nctx)
-	})
+	}); aerr != nil {
+		return false, aerr
+	}
 	if ctx.Err() != nil {
 		return false, ctx.Err()
 	}
@@ -832,17 +867,21 @@ func (m *Monitor) readNotification(ctx context.Context) (read bool, err error) {
 }
 
 // setNotification changes the gateway setting and records a config_change with the pages
-// before and after. extra (optional) adds text to the record's result.
+// before and after. extra (optional) adds text to the record's result. A change refused
+// because a changed gateway certificate waits for confirmation (withGatewayAuth) is a failed
+// attempt like one the gateway client refused.
 func (m *Monitor) setNotification(ctx context.Context, enabled bool, actor string, extra func(err error) string) (model.ConfigChange, error) {
 	var (
 		before, after []byte
 		err           error
 	)
-	m.withGatewayAuth(func() {
+	if aerr := m.withGatewayAuth(func() {
 		sctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer cancel()
 		before, after, err = m.gw.SetNotification(sctx, enabled)
-	})
+	}); aerr != nil {
+		err = aerr
+	}
 
 	var blobs []string
 	for _, page := range [][]byte{before, after} {

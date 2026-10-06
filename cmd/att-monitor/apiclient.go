@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"attmonitor/internal/config"
+	"attmonitor/internal/model"
 )
 
 // apiClient talks to the running service's localhost dashboard API.
@@ -99,13 +100,14 @@ func (a *apiClient) call(ctx context.Context, method, path string, in, out any) 
 		return resp.Header, err
 	}
 	if resp.StatusCode/100 != 2 {
+		se := &serviceError{Status: resp.StatusCode, Body: data, msg: fmt.Sprintf("HTTP %d", resp.StatusCode)}
 		var e struct {
 			Error string `json:"error"`
 		}
 		if json.Unmarshal(data, &e) == nil && e.Error != "" {
-			return resp.Header, fmt.Errorf("service: %s", e.Error)
+			se.msg = e.Error
 		}
-		return resp.Header, fmt.Errorf("service: HTTP %d", resp.StatusCode)
+		return resp.Header, se
 	}
 	if out == nil {
 		return resp.Header, nil
@@ -144,3 +146,30 @@ func (a *apiClient) download(ctx context.Context, path, dir, name string) (strin
 }
 
 var errNoService = errors.New("service not running")
+
+// serviceError is the service's answer to a request that failed: "service: " and its error
+// message (or the HTTP status), with the status and the exact body (e.g. a failed configuration
+// change also carries the change the monitor reported).
+type serviceError struct {
+	Status int
+	Body   []byte
+	msg    string
+}
+
+func (e *serviceError) Error() string { return "service: " + e.msg }
+
+// reportedChange returns the change a failed configuration change's answer carries
+// (web.ConfigChangeError), or nil.
+func reportedChange(err error) *model.ConfigChange {
+	var se *serviceError
+	if !errors.As(err, &se) {
+		return nil
+	}
+	var body struct {
+		Change *model.ConfigChange `json:"change"`
+	}
+	if json.Unmarshal(se.Body, &body) != nil {
+		return nil
+	}
+	return body.Change
+}

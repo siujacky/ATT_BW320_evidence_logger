@@ -306,8 +306,9 @@ func TestSyslogPipelineThroughRun(t *testing.T) {
 	stop := r.start(t)
 	waitFor(t, "the first deletion", 10*time.Second, func() bool { return len(ofType(r.led.records(""), model.TypeSyslogPrune)) > 0 })
 	st1 := r.m.Status()
+	// Enforcement is on by default; no target while this computer's address is not known.
 	if s := st1.Syslog; s == nil || !s.Enabled || !s.Listening || s.Listen != "127.0.0.1:5514" || s.ListenErr != "" ||
-		s.Received != 3 || s.Recorded != 3 || s.Dropped != 1 || s.Rejected != 2 || s.Enforce || s.Target != nil ||
+		s.Received != 3 || s.Recorded != 3 || s.Dropped != 1 || s.Rejected != 2 || !s.Enforce || s.Target != nil ||
 		s.LastAt != fmtTS(t0.Add(4*time.Minute)) || s.Last != "kernel: three" || s.Store == nil || s.Store.KeepMB != 1 {
 		t.Fatalf("syslog status %+v", st1.Syslog)
 	}
@@ -798,12 +799,14 @@ func linkAt(r *rig, ip *atomic.Value) {
 }
 
 // The Syslog page is read after a successful read of the notification setting, in the same check,
-// and recorded as a gateway_event syslog_setting with the page; it is never changed.
+// and recorded as a gateway_event syslog_setting with the page; without gateway.enforce_syslog it
+// is never changed.
 func TestSyslogSettingReadInTheSettingsCheck(t *testing.T) {
 	ctx := context.Background()
 	r := newRig(t, nil, nil)
 	r.cfg.Gateway.AccessCodeProtected = "protected-blob"
 	r.cfg.Gateway.EnforceNotificationOff = false
+	r.cfg.Gateway.EnforceSyslog = false
 	var ip atomic.Value
 	ip.Store("192.168.1.71")
 	linkAt(r, &ip)
@@ -823,7 +826,7 @@ func TestSyslogSettingReadInTheSettingsCheck(t *testing.T) {
 	}
 	ev := decode[model.GatewayEvent](t, evs[1])
 	if ev.Kind != model.GwEvSyslogSetting || ev.Before != "" || ev.After != "on -> 192.168.1.71:514, level Informational" ||
-		!strings.Contains(ev.Detail, "which is this computer") || !strings.Contains(ev.Detail, "read only") ||
+		!strings.Contains(ev.Detail, "which is this computer") || !strings.Contains(ev.Detail, "read only: gateway.enforce_syslog is off") ||
 		!strings.Contains(ev.Detail, "Informational, Debug") {
 		t.Fatalf("event %+v", ev)
 	}
@@ -831,8 +834,9 @@ func TestSyslogSettingReadInTheSettingsCheck(t *testing.T) {
 		t.Fatalf("page blob %v", evs[1].Blobs)
 	}
 	s := r.m.Status().Syslog
+	target := model.SyslogTarget{Enabled: true, Server: "192.168.1.71", Port: 514, Level: "Informational"}
 	if s == nil || s.State != syslogStateOK || s.Problem != "" || s.GatewaySeq != evs[1].Seq || s.GatewayAt != evs[1].TS ||
-		s.Gateway == nil || !reflect.DeepEqual(*s.Gateway, setting) || s.Enabled || s.Enforce || s.Target != nil {
+		s.Gateway == nil || !reflect.DeepEqual(*s.Gateway, setting) || s.Enabled || s.Enforce || s.Target == nil || *s.Target != target {
 		t.Fatalf("status %+v", s)
 	}
 
@@ -891,6 +895,7 @@ func TestSyslogSettingNeedsTheNotificationRead(t *testing.T) {
 func TestSyslogSettingNotUnderstoodOrFailed(t *testing.T) {
 	ctx := context.Background()
 	r := newRig(t, nil, nil)
+	r.cfg.Gateway.EnforceSyslog = false // TestSyslogEnforcementCannotSet: the same with enforcement
 	r.gw.syslog = func() (model.SyslogSetting, []byte, error) { return syslogOn192(), []byte(syslogPageOn), nil }
 	if err := r.m.checkNotification(ctx); err != nil {
 		t.Fatal(err)
@@ -1020,12 +1025,14 @@ func TestSyslogSummaryRoundTrip(t *testing.T) {
 }
 
 // When this computer's address toward the gateway changes, the settings check runs again -
-// not sooner than the floor after the previous check, and once for a burst of changes.
+// not sooner than the floor after the previous check, and once for a burst of changes
+// (TestSyslogEnforcedAfterAddressChange: the same with enforcement).
 func TestSyslogSettingReadAgainAfterAddressChange(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	r := newRig(t, nil, nil)
 	r.cfg.Gateway.AccessCodeProtected = "protected-blob"
+	r.cfg.Gateway.EnforceSyslog = false
 	const floor = 300 * time.Millisecond
 	r.m.notifMinInterval = floor
 	var ip atomic.Value

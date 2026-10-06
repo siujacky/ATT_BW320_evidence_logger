@@ -14,8 +14,9 @@ service ticket**, backed by an evidence bundle that anyone can verify.
 
 > Not affiliated with or endorsed by AT&T. "AT&T", "BGW320" and the gateway's page names belong to
 > their owners. The monitor reads the gateway's own pages (its status pages need no login; with the
-> Device Access Code it reads the outage-redirect and Syslog settings about once a day) and changes one
-> gateway setting (the outage redirect, see below).
+> Device Access Code it checks the outage-redirect and Syslog settings about once a day) and keeps two
+> gateway settings as it needs them: the outage redirect off, and the Syslog page sending the gateway's
+> log to this PC (see below).
 
 ---
 
@@ -55,9 +56,9 @@ service ticket**, backed by an evidence bundle that anyone can verify.
 * **Traffic**: how much the household sends and receives through the gateway, from the gateway's own
   WAN byte and packet counters (read with every snapshot), and this PC's own traffic from its network
   adapter's counters, shown as an MRTG-style chart, daily totals and a live flow meter.
-* **The gateway's own log (syslog)**, once the gateway is set to send it to this PC: every message is
-  received and kept (the newest 100 MB by default), and the ledger records the SHA-256 of every chunk
-  of messages and every deletion.
+* **The gateway's own log (syslog)**: the monitor sets the gateway to send it to this PC and keeps it
+  so; every message is received and kept (the newest 100 MB by default), and the ledger records the
+  SHA-256 of every chunk of messages and every deletion.
 * **A verdict per cycle**: `ONLINE`, `DEGRADED`, `ISP_OUTAGE` or `LOCAL_FAULT`, with a cause (for
   example `FIBER_LINK_DOWN`: the gateway itself reports its fiber link down) and an attribution
   (provider, local, undetermined). Rules are conservative: a gateway restart, a VPN, a Wi-Fi drop, PC
@@ -97,8 +98,8 @@ flowchart LR
 * Windows 10 or 11 (the service runs as LocalSystem), on a PC connected to the AT&T gateway. A wired
   Ethernet connection makes the evidence stronger.
 * An AT&T BGW320 gateway and its **Device Access Code** (printed on the gateway's label). The code is
-  needed only to switch the outage redirect off and to read the gateway's Syslog setting; everything
-  else uses pages that need no login.
+  needed only for the gateway's settings - to keep the outage redirect off and the Syslog page sending
+  the gateway's log to this PC; everything else uses pages that need no login.
 * [Go](https://go.dev/dl/) 1.27 or newer to build (the build fetches the right toolchain if needed).
 * Optional: [MongoDB Community Server](https://www.mongodb.com/try/download/community) running
   locally (the default `mongodb://127.0.0.1:27017`) for the queryable copy.
@@ -118,8 +119,9 @@ flowchart LR
 
 Setup checks the code with the gateway (a read-only login), installs and starts the service, adds a
 Windows Firewall rule that lets the gateway's syslog messages in (see [The gateway's
-syslog](#the-gateways-syslog)), shows your **evidence key** and opens the dashboard. Write the key down
-or email it to yourself: it identifies your evidence. If the code is mistyped, setup asks again; the
+syslog](#the-gateways-syslog)), shows your **evidence key** and opens the dashboard. Within about 10
+minutes the service sets the gateway's Syslog page to send the gateway's log to this PC. Write the key
+down or email it to yourself: it identifies your evidence. If the code is mistyped, setup asks again; the
 gateway allows one login attempt per minute, so it waits when needed, and after three rejections it
 stops trying for an hour, so the gateway's login is never locked.
 
@@ -226,25 +228,62 @@ The BGW320 can send its own log messages to a syslog server on the home network 
 Syslog). The monitor is that server: it receives them on UDP port 514, only from the gateway's address
 (`syslog.allow` adds other senders), keeps every message exactly as it arrived with the time this PC
 received it, and shows them on the dashboard's **Syslog** page (with search and a severity filter) and
-with `att-monitor syslog`.
+with `att-monitor syslog`. (SNMP is still not possible: the BGW320 offers none, see
+[Traffic](#traffic-mrtg-style-chart-and-flow-meter-no-snmp-needed).)
 
-### Set the gateway to send its log here
+### The monitor sets the gateway to send its log here, and keeps it so
 
-This version **reads** the gateway's Syslog setting (once a day with the outage-redirect check,
-within 10 minutes after the service starts, and again when this PC's address changes) and records
-every reading, but it does **not change** it: setting it automatically comes in a later version.
-Until then, set it on the gateway once:
+Like the outage redirect, the monitor keeps the gateway's **Syslog** page as it needs it. In its daily
+settings check (the first within 10 minutes after the service starts, and again within minutes after
+this PC's address changes) it reads the page and records it; when the page shows anything else it sets
+it to:
 
-1. Open https://192.168.1.254, go to **Diagnostics → Syslog** and sign in with the Device Access Code.
-2. Switch **Syslog** on, enter this PC's IPv4 address as **Server IP Address** and `514` as **Server
-   Port**, and save. `att-monitor gateway syslog` prints the address to enter.
-3. The messages confirm it at once: within a minute the Syslog card on the dashboard (and
-   `att-monitor gateway syslog`) counts them as received and shows the newest. The **setting** they
-   show is the one last read, so it still says "off" (or names the old address) until the service
-   reads the page again: at the next daily check, or within 10 minutes after `att-monitor stop` and
-   `att-monitor start`.
-4. The gateway sends to an address, not to a computer: a fixed address for this PC (a DHCP reservation
-   on the gateway) keeps the setting right.
+* **Syslog**: On;
+* **Server IP Address**: this PC's IPv4 address on the gateway's network;
+* **Server Port**: `514` (`syslog.port`);
+* **Log Level**: the most detailed level the gateway offers - **Notice** on the BGW320-505 with firmware
+  6.34.7, which offers Emergency, Alert, Critical, Error, Warning and Notice (no Informational, no
+  Debug). A level named in `gateway.syslog_level` comes first, and a level already set while Syslog is
+  on is kept.
+
+It changes nothing else on the page, and does it the way a browser without JavaScript does: the page
+enables its fields only once Syslog is On, so the monitor first switches Syslog on with the page's
+*Update* button, then fills in the fields and saves. It then reads the page back: a change counts only
+if the gateway shows it, and a page the monitor does not fully understand is never posted. Every reading
+is recorded in the ledger with the page, and every change with the pages before and after (a
+`gateway_event` and a `config_change`). A failed attempt is recorded too, shows as *The gateway's Syslog
+page could not be set*, and is tried again at the next check. While the gateway is set to send here but
+no message from it arrives for a day, the dashboard says so (at level Notice the gateway may log
+little).
+
+**Changing it.** The dashboard's **Syslog** page (and the Syslog card on the Overview) shows the setting
+and whether the monitor keeps it: *Send the gateway's log to this PC* sets it now and keeps it so; *Stop
+sending* switches Syslog off on the gateway and stops keeping it. Each asks first, saying what will
+happen on the gateway, and shows the outcome; the choice is saved (`gateway.enforce_syslog`) and
+recorded. The same from the command line:
+
+```powershell
+att-monitor gateway syslog          # the setting, whether it is kept, the receiver and the store
+att-monitor gateway syslog on       # send the gateway's log to this PC, and keep it so
+att-monitor gateway syslog off      # switch it off on the gateway, and stop keeping it
+```
+
+To have the monitor only read the page, without switching it off, set `gateway.enforce_syslog` to
+`false` in `config.json` and restart the service. Uninstalling leaves the gateway's setting as it is:
+stop the sending first (*Stop sending*, or `att-monitor gateway syslog off`) if the gateway should no
+longer send its log to this PC.
+
+**By hand.** When the monitor cannot set the page (no access code stored, or its attempt failed - the
+dashboard and `att-monitor gateway syslog` then say how), set it on the gateway itself: open
+https://192.168.1.254, go to **Diagnostics → Syslog** and sign in with the Device Access Code; set
+**Syslog** to On (the page then enables its other fields), enter this PC's IPv4 address as **Server IP
+Address** and `514` as **Server Port**, and save. `att-monitor gateway syslog` prints the address to
+enter. The messages confirm it at once: within a minute the Syslog card counts them as received.
+
+The gateway sends to an address, not to a computer: the monitor sets the page again after this PC's
+address changes, and a fixed address for this PC (a DHCP reservation on the gateway) avoids the gap.
+Several monitors on one home network would fight over the setting: let only one keep it
+(`gateway.enforce_syslog` false on the others).
 
 ### Kept within a size limit, with every chunk on record
 
@@ -304,21 +343,25 @@ and incidents do not depend on them.
 * **Overview**: the current state in plain words with its cause and attribution and the reasons behind
   it; cards for the Internet, the gateway's WAN, the fiber optics (Rx/Tx power against the gateway's own
   thresholds), the local link, evidence integrity (including the MongoDB copy) and the gateway's
-  syslog; the live flow meter; latency, loss, availability, traffic (MRTG-style, with daily totals) and
-  optical charts from 1 hour to 7 days; recent incidents.
+  syslog (with its Syslog setting and the buttons that change it); the live flow meter; latency, loss,
+  availability, traffic (MRTG-style, with daily totals) and optical charts from 1 hour to 7 days;
+  recent incidents.
 * **Incidents**: every outage with its timeline and evidence (raw gateway pages, traceroutes, DNS
   results) and a one-click evidence export.
 * **Gateway**: every value read from the gateway, the fiber module diagnostics and the redirect setting.
-* **Syslog**: the gateway's log messages with search and a severity filter, each linked to the ledger
-  record of its chunk (a very long message is shortened in the list; *Exact datagram* under it shows
-  all of it); the space the syslog store uses and how much of it to keep.
+* **Syslog**: the receiver and the gateway's Syslog setting - whether the monitor keeps it sending here,
+  with *Send the gateway's log to this PC* and *Stop sending*; the gateway's log messages with search
+  and a severity filter, each linked to the ledger record of its chunk (a very long message is
+  shortened in the list; *Exact datagram* under it shows all of it); the space the syslog store uses
+  and how much of it to keep.
 * **Evidence**: ledger head, key fingerprint, time-stamps, *Verify now*, exports and operator notes
   (for example "Called AT&T, ticket 12345").
 * **Records**: the raw ledger, record by record.
 * Banners warn about the gateway's optical alarm, a changed gateway certificate (authenticated actions
   pause until you confirm it, which you should do only after an AT&T update), a VPN or second network
   bypassing the gateway, low disk space, a wrong PC clock, a ledger that refuses records, a syslog
-  receiver that cannot listen (another program on UDP 514) or a syslog store that fails.
+  receiver that cannot listen (another program on UDP 514), a syslog store that fails, a gateway Syslog
+  page that could not be set, or no syslog message from the gateway for a day.
 
 ## Data storage: ledger and MongoDB
 
@@ -456,7 +499,9 @@ att-monitor uninstall [--interactive] | start | stop | status
 att-monitor run [--data DIR]                      run in the foreground (console mode)
 att-monitor set-access-code (--file PATH | --stdin)
 att-monitor gateway notification [status|on|off]
-att-monitor gateway syslog [status] [--json]      the gateway's Syslog setting (read only), the receiver and the store
+att-monitor gateway syslog [status|on|off] [--json]
+                                                  the gateway's Syslog setting, the receiver and the store; on: send
+                                                  the gateway's log to this PC and keep it so; off: stop it
 att-monitor gateway trust-cert                    confirm a changed gateway certificate (after an AT&T update)
 att-monitor syslog [--since 24h] [--grep TEXT] [--severity LEVEL] [--limit N] [--json]
                                                   the gateway's syslog messages, oldest first (through the service)
@@ -490,6 +535,8 @@ after editing it. Main settings:
 |---|---|---|
 | `gateway.host` | `192.168.1.254` | the BGW320's address |
 | `gateway.enforce_notification_off` | `true` | keep the outage redirect switched off |
+| `gateway.enforce_syslog` | `true` | keep the gateway's Syslog page sending its log to this PC while the receiver is on (`syslog.enabled`); `false`: only read it |
+| `gateway.syslog_level` | `""` | the Log Level to set, when the gateway offers it; empty (or not offered): the level already set while Syslog is on, else Informational if the gateway offers it, else the most detailed level but Debug (Notice on the BGW320-505) |
 | `gateway.poll_interval` / `incident_poll_interval` | `1m` / `15s` | gateway snapshots |
 | `probes.fast_interval` | `10s` | the measurement cycle |
 | `incident.open_after_cycles` / `window_cycles` | `3` / `6` | an incident opens when 3 of 6 cycles fail |
@@ -519,9 +566,10 @@ after editing it. Main settings:
 * Outbound traffic: pings and TCP connects to 1.1.1.1, 8.8.8.8, 9.9.9.9 and AT&T's next hop; DNS queries
   for www.google.com; HTTP checks to msftconnecttest.com and google.com; SNTP to time.windows.com,
   time.google.com and pool.ntp.org; and **only a SHA-256 digest** to the Time-Stamp Authorities.
-  MongoDB is used on the local PC only. Inbound: UDP 514 from the gateway (its syslog). While the
-  dashboard's Overview is open, the flow meter reads the gateway's Broadband Status page at most every
-  5 seconds.
+  MongoDB is used on the local PC only. Inbound: UDP 514 from the gateway (its syslog). The monitor logs
+  in to the gateway about once a day (and after this PC's address changes) to check, and if needed set,
+  its outage-redirect and Syslog settings. While the dashboard's Overview is open, the flow meter reads
+  the gateway's Broadband Status page at most every 5 seconds.
 
 ## Development
 

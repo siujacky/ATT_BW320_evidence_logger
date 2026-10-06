@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -37,6 +38,11 @@ type fakeService struct {
 	failMsg string // … and error
 	queries []string
 	posts   []map[string]any
+	// POST /api/gateway/syslog: the change it answers, or gwFail with gwFailBody.
+	gwChange   model.ConfigChange
+	gwFail     int
+	gwFailBody any
+	gwPosts    []map[string]any
 }
 
 // useService makes the syslog commands find f (an httptest server on 127.0.0.1:0) as the running
@@ -101,6 +107,21 @@ func (f *fakeService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		_ = json.NewEncoder(w).Encode(f.change)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/gateway/syslog":
+		if r.Header.Get("X-ATT-Monitor") != "1" {
+			f.t.Error("POST without the X-ATT-Monitor header")
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			f.t.Errorf("POST body: %v", err)
+		}
+		f.gwPosts = append(f.gwPosts, body)
+		if f.gwFail != 0 {
+			w.WriteHeader(f.gwFail)
+			_ = json.NewEncoder(w).Encode(f.gwFailBody)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(f.gwChange)
 	default:
 		w.WriteHeader(http.StatusNotFound)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "not found: " + r.URL.Path})
@@ -111,6 +132,13 @@ func (f *fakeService) recorded() ([]string, []map[string]any) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.queries...), append([]map[string]any(nil), f.posts...)
+}
+
+// gwRecorded returns the bodies of the POST /api/gateway/syslog requests so far.
+func (f *fakeService) gwRecorded() []map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]map[string]any(nil), f.gwPosts...)
 }
 
 func sevOf(n int) *int { return &n }
@@ -430,8 +458,19 @@ func TestSyslogRetentionChange(t *testing.T) {
 	}
 }
 
-// TestGatewaySyslogStatus: Status.syslog in words, how to set the gateway by hand while it does
-// not send here, and on/off refused in this version.
+// The by-hand instructions of `gateway syslog`, to set it on (with this PC's address, or without
+// it) and to stop it.
+var (
+	setByHandHere = "To set it on the gateway itself: open https://192.168.1.254, Diagnostics > Syslog (the page asks for the Device Access Code), " +
+		"set Syslog to On (the page then enables its other fields), Server IP Address 192.168.1.71 (this PC), Server Port 514, and save.\n"
+	setByHandNoIP = "Server IP Address this PC's IPv4 address on the gateway's network, Server Port 514, and save.\n"
+	stopByHand    = "To stop it on the gateway itself: open https://192.168.1.254, Diagnostics > Syslog (the page asks for the Device Access Code), " +
+		"set Syslog to Off and save.\n"
+)
+
+// TestGatewaySyslogStatus: Status.syslog in words, whether att-monitor keeps the gateway sending
+// here, and how to set it by hand only while the gateway does not send here and att-monitor does
+// not set it (not kept, or setting it failed), and no message arrived since the setting was read.
 func TestGatewaySyslogStatus(t *testing.T) {
 	st := storeStatus()
 	sl := st.Syslog
@@ -446,11 +485,16 @@ func TestGatewaySyslogStatus(t *testing.T) {
 	f := &fakeService{status: st}
 	useService(t, f)
 	dir := t.TempDir()
-	var out strings.Builder
-	if err := gatewaySyslog(&out, []string{"--data", dir}); err != nil {
-		t.Fatal(err)
+	status := func(args ...string) string {
+		t.Helper()
+		var out strings.Builder
+		if err := gatewaySyslog(&out, append(args, "--data", dir)); err != nil {
+			t.Fatal(err)
+		}
+		return out.String()
 	}
-	got := out.String()
+	// Not kept, sending elsewhere, but messages arrived since that was read: no instructions.
+	got := status()
 	wantText(t, got,
 		"Syslog receiver:  listening on [::]:514 (UDP)\n",
 		"Since the start:  12 messages received, 11 stored, 1 dropped (over the receiver's limits), 3 rejected (from other senders)\n",
@@ -460,64 +504,384 @@ func TestGatewaySyslogStatus(t *testing.T) {
 		"Gateway setting:  on, sending to 192.168.1.50 port 514, level Informational (read "+at(sl.GatewayAt, "2006-01-02 15:04")+", ledger record #1234)\n",
 		"State:            elsewhere: the gateway sends its log to 192.168.1.50:514, not to this computer (192.168.1.71:514)\n",
 		"Condition:        [warning] The syslog store has failed\n",
-		"setting it automatically comes in a later version.",
-		"open https://192.168.1.254, Diagnostics > Syslog, switch Syslog on, Server IP Address 192.168.1.71 (this PC), Server Port 514, and save")
-	if strings.Contains(got, "optics") || strings.ContainsRune(got, 0x1b) {
+		"Kept:             no, att-monitor only reads this setting; `att-monitor gateway syslog on` sends the gateway's log to this PC and keeps it so\n",
+		"Messages have arrived since the setting was read, so it may have been changed on the gateway since.\n")
+	if strings.Contains(got, "optics") || strings.ContainsRune(got, 0x1b) || strings.Contains(got, "To set it on the gateway itself") ||
+		strings.Contains(got, "later version") {
 		t.Errorf("unexpected content:\n%s", got)
 	}
-
-	// The gateway sends here: no instructions. Then: not read yet, the receiver down.
-	sl.State, sl.Problem = "ok", ""
-	out.Reset()
-	if err := gatewaySyslog(&out, []string{"status", "--data", dir}); err != nil {
-		t.Fatal(err)
+	// No message since the read: how to set it by hand.
+	sl.LastAt = "2026-10-05T11:59:00Z"
+	if got := status(); !strings.HasSuffix(got, setByHandHere) || strings.Contains(got, "Messages have arrived") {
+		t.Errorf("not kept, sending elsewhere:\n%s", got)
 	}
-	if got := out.String(); !strings.Contains(got, "State:            ok: the gateway sends its log to this PC\n") || strings.Contains(got, "Server IP Address") {
+
+	// Kept and sent here: no instructions.
+	sl.State, sl.Problem, sl.Enforce = "ok", "", true
+	sl.Target = &model.SyslogTarget{Enabled: true, Server: "192.168.1.71", Port: 514, Level: "Notice"}
+	sl.Gateway = &model.SyslogSetting{Enabled: true, Server: "192.168.1.71", Port: 514, Level: "Notice"}
+	got = status("status")
+	wantText(t, got, "State:            ok: the gateway sends its log to this PC\n",
+		"Kept:             yes, att-monitor keeps it sending to 192.168.1.71 port 514, level Notice: it reads the setting in its daily settings check"+
+			" (and after this PC's address changes) and sets it again whenever it differs; `att-monitor gateway syslog off` stops it\n")
+	if strings.Contains(got, "Server IP Address") {
 		t.Errorf("ok:\n%s", got)
 	}
-	sl.Gateway, sl.GatewaySeq, sl.State, sl.Problem = nil, 0, "unknown", "the gateway's Syslog setting has not been read yet"
+	// Kept, but read as off (before the service set it): it will, no instructions.
+	sl.State, sl.Gateway = "off", &model.SyslogSetting{Port: 514, Level: "Error"}
+	if got := status(); !strings.HasSuffix(got, "att-monitor sets it again at its next settings check, or now with `att-monitor gateway syslog on`.\n") {
+		t.Errorf("kept, read as off:\n%s", got)
+	}
+	// Kept, but setting it failed, or cannot be done: instructions.
+	for name, set := range map[string]func(){
+		"check failed": func() {
+			sl.State, sl.Problem = "error", "the latest change of the gateway's Syslog setting failed: gateway: HTTP 500"
+		},
+		"not understood": func() { sl.State, sl.Gateway = "unknown", nil },
+		"no access code": func() {
+			st.Conditions = append(st.Conditions, model.Condition{Code: "NO_ACCESS_CODE", Severity: "info"})
+		},
+		"certificate": func() {
+			st.GatewayCert = &model.GatewayCertState{Pinned: strings.Repeat("ab", 32), Pending: strings.Repeat("cd", 32)}
+		},
+		"cert condition": func() {
+			st.Conditions = append(st.Conditions, model.Condition{Code: "GATEWAY_CERT_CHANGED", Severity: "critical"})
+		},
+		"setting failed": func() { // the state stays as read; the problem and a condition say so
+			sl.Problem = "the gateway does not send its log to a syslog server (its Syslog setting is off); the monitor could not set it: gateway: HTTP 500"
+			st.Conditions = append(st.Conditions, model.Condition{Code: "SYSLOG_SETTING_FAILED", Severity: "warning", Message: "The monitor could not set the gateway's Syslog page"})
+		},
+		"(control: none)": func() {},
+	} {
+		saved, savedConds, savedCert := *sl, st.Conditions, st.GatewayCert
+		set()
+		f.mu.Lock()
+		f.status = st
+		f.mu.Unlock()
+		got := status()
+		if hand := strings.HasSuffix(got, setByHandHere); hand != (name != "(control: none)") {
+			t.Errorf("%s: instructions %v:\n%s", name, hand, got)
+		}
+		*sl, st.Conditions, st.GatewayCert = saved, savedConds, savedCert
+	}
+	f.mu.Lock()
+	f.status = st
+	f.mu.Unlock()
+
+	// Not kept, not read yet, nothing received, the receiver down, this PC's address unknown.
+	sl.Enforce, sl.Target = false, nil
+	sl.Gateway, sl.GatewayAt, sl.GatewaySeq, sl.State, sl.Problem = nil, "", 0, "unknown", "the gateway's Syslog setting has not been read yet"
+	sl.LastAt, sl.Last, sl.Received = "", "", 0
 	sl.Listening, sl.ListenErr = false, "listen udp :514: bind: Only one usage of each socket address"
 	st.LocalLink = nil
+	f.mu.Lock()
 	f.status = st
-	out.Reset()
-	if err := gatewaySyslog(&out, []string{"--data", dir}); err != nil {
-		t.Fatal(err)
-	}
-	wantText(t, out.String(), "Syslog receiver:  NOT listening on [::]:514 (UDP): listen udp :514: bind: Only one usage",
+	f.mu.Unlock()
+	wantText(t, status(), "Syslog receiver:  NOT listening on [::]:514 (UDP): listen udp :514: bind: Only one usage",
 		"Gateway setting:  not read yet", "State:            unknown: the gateway's Syslog setting has not been read yet",
-		"Server IP Address this PC's IPv4 address on the gateway's network")
+		"Kept:             no, att-monitor only reads this setting", setByHandNoIP)
 
 	// --json: Status.syslog as it is.
-	out.Reset()
-	if err := gatewaySyslog(&out, []string{"--json", "--data", dir}); err != nil {
-		t.Fatal(err)
-	}
 	var js model.SyslogStatus
-	if err := json.Unmarshal([]byte(out.String()), &js); err != nil || !reflect.DeepEqual(&js, sl) {
+	if err := json.Unmarshal([]byte(status("--json")), &js); err != nil || !reflect.DeepEqual(&js, sl) {
 		t.Errorf("JSON %v: %+v", err, js)
 	}
 
-	// No syslog at all.
+	// No syslog at all: config.json says whether the service keeps the setting (it does by
+	// default, unless it cannot log in).
+	f.mu.Lock()
 	f.status = model.Status{}
-	out.Reset()
-	if err := gatewaySyslog(&out, []string{"--data", dir}); err != nil {
+	f.mu.Unlock()
+	if got := status(); !strings.Contains(got, "The running service reports nothing about syslog") || strings.Contains(got, "on the gateway itself") {
+		t.Errorf("no syslog, kept:\n%s", got)
+	}
+	f.mu.Lock()
+	f.status = model.Status{Conditions: []model.Condition{{Code: "NO_ACCESS_CODE", Severity: "info"}}}
+	f.mu.Unlock()
+	if got := status(); !strings.HasSuffix(got, setByHandNoIP) {
+		t.Errorf("no syslog, no access code:\n%s", got)
+	}
+	f.mu.Lock()
+	f.status = model.Status{}
+	f.mu.Unlock()
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"version":1,"gateway":{"enforce_syslog":false}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	wantText(t, out.String(), "The running service reports nothing about syslog", "Diagnostics > Syslog")
+	if got := status(); !strings.HasSuffix(got, setByHandNoIP) {
+		t.Errorf("no syslog, not kept:\n%s", got)
+	}
+	if posts := f.gwRecorded(); len(posts) != 0 {
+		t.Errorf("a status changed the setting: %v", posts)
+	}
+}
 
-	for _, args := range [][]string{{"on"}, {"off"}} {
-		if err := gatewaySyslog(io.Discard, append(args, "--data", dir)); err == nil || !strings.Contains(err.Error(), "later version") {
-			t.Errorf("%q: %v", args, err)
+// TestGatewaySyslogArguments: wrong arguments are refused before the service is asked.
+func TestGatewaySyslogArguments(t *testing.T) {
+	noService(t, false)
+	dir := t.TempDir()
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"enforce"}, `unknown action "enforce" (usage: att-monitor gateway syslog [status|on|off] [--json] [--data DIR])`},
+		{[]string{"enable"}, `unknown action "enable"`},
+		{[]string{"on", "now"}, `unexpected argument "now" (usage: att-monitor gateway syslog [status|on|off] [--json] [--data DIR])`},
+		{[]string{"status", "off"}, `unexpected argument "off"`},
+		{[]string{"--json", "on"}, `unexpected argument "on"`},
+		{[]string{"off", "--yes"}, "flag provided but not defined: -yes"},
+	} {
+		err := gatewaySyslog(io.Discard, append(tc.args, "--data", dir))
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%q: %v, want %q", tc.args, err, tc.want)
 		}
 	}
-	if err := gatewaySyslog(io.Discard, []string{"enforce", "--data", dir}); err == nil || !strings.Contains(err.Error(), `unknown action "enforce"`) {
-		t.Errorf("unknown action: %v", err)
+	// Through the command line.
+	if err := run([]string{"gateway", "syslog", "bogus", "--data", dir}); err == nil || !strings.Contains(err.Error(), `unknown action "bogus"`) {
+		t.Errorf("run gateway syslog bogus: %v", err)
 	}
-	if err := run([]string{"gateway", "syslog", "off", "--data", dir}); err == nil || !strings.Contains(err.Error(), "later version") {
-		t.Errorf("run gateway syslog off: %v", err)
-	}
-	if err := run([]string{"gateway", "bogus"}); err == nil || !strings.Contains(err.Error(), "gateway syslog [status]") {
+	if err := run([]string{"gateway", "bogus"}); err == nil || !strings.Contains(err.Error(), "gateway syslog [status|on|off] [--json]") {
 		t.Errorf("gateway usage: %v", err)
+	}
+	if !strings.Contains(usageText, "att-monitor gateway syslog [status|on|off] [--json] [--data DIR]") {
+		t.Error("the usage text does not name gateway syslog on|off")
+	}
+}
+
+// TestGatewaySyslogOnOff: on and off go to POST /api/gateway/syslog (client cli) and print the
+// recorded change and what att-monitor does from now on; --json prints the change.
+func TestGatewaySyslogOnOff(t *testing.T) {
+	onCC := model.ConfigChange{Target: "gateway", What: "syslog.ha (Syslog, Server IP Address, Server Port, Log Level)", Before: "off",
+		After: "on -> 192.168.1.71:514, level Notice", Actor: "operator via cli", Result: "verified; monitor setting enforce_syslog changed from false to true"}
+	f := &fakeService{status: storeStatus(), gwChange: onCC}
+	useService(t, f)
+	dir := t.TempDir()
+	var out strings.Builder
+	if err := gatewaySyslog(&out, []string{"on", "--data", dir}); err != nil {
+		t.Fatal(err)
+	}
+	want := "Gateway setting syslog.ha (Syslog, Server IP Address, Server Port, Log Level): off → on -> 192.168.1.71:514, level Notice " +
+		"(verified; monitor setting enforce_syslog changed from false to true)\n" +
+		"att-monitor keeps it so: it reads the setting in its daily settings check (and after this PC's address changes) and sets it again whenever it differs." +
+		" `att-monitor gateway syslog off` stops it.\n"
+	if out.String() != want {
+		t.Errorf("on:\n%s\nwant:\n%s", out.String(), want)
+	}
+
+	offCC := onCC
+	offCC.Before, offCC.After, offCC.Result = onCC.After, "off", "verified; monitor setting enforce_syslog changed from true to false"
+	f.mu.Lock()
+	f.gwChange = offCC
+	f.mu.Unlock()
+	out.Reset()
+	if err := gatewaySyslog(&out, []string{"OFF", "--data", dir}); err != nil {
+		t.Fatal(err)
+	}
+	wantText(t, out.String(), "Gateway setting syslog.ha (Syslog, Server IP Address, Server Port, Log Level): on -> 192.168.1.71:514, level Notice → off (verified;",
+		"The gateway sends its log to no syslog server now, and att-monitor no longer sets it (it still reads it daily). `att-monitor gateway syslog on` sends it to this PC again.\n")
+
+	// --json: the change as the service answered it.
+	out.Reset()
+	if err := gatewaySyslog(&out, []string{"off", "--json", "--data", dir}); err != nil {
+		t.Fatal(err)
+	}
+	var js model.ConfigChange
+	if err := json.Unmarshal([]byte(out.String()), &js); err != nil || js != offCC {
+		t.Errorf("JSON %v: %+v", err, js)
+	}
+	// What a gateway page holds is escaped.
+	f.mu.Lock()
+	f.gwChange.Before = "on -> 192.168.1.71:514, level Notice\x1b[2J"
+	f.mu.Unlock()
+	out.Reset()
+	if err := gatewaySyslog(&out, []string{"off", "--data", dir}); err != nil {
+		t.Fatal(err)
+	}
+	if got := out.String(); strings.ContainsRune(got, 0x1b) || !strings.Contains(got, bs("Notice~x1b[2J → off")) {
+		t.Errorf("escaping:\n%s", got)
+	}
+
+	want4 := []map[string]any{{"enabled": true, "client": "cli"}, {"enabled": false, "client": "cli"}, {"enabled": false, "client": "cli"}, {"enabled": false, "client": "cli"}}
+	if posts := f.gwRecorded(); !reflect.DeepEqual(posts, want4) {
+		t.Errorf("posted %v", posts)
+	}
+}
+
+// onlyJSON decodes s, which must hold exactly one JSON value and nothing else (a script reads
+// it), into v, rejecting fields v does not have.
+func onlyJSON(t *testing.T, s string, v any) {
+	t.Helper()
+	dec := json.NewDecoder(strings.NewReader(s))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		t.Fatalf("not JSON (%v):\n%s", err, s)
+	}
+	if err := dec.Decode(&json.RawMessage{}); err != io.EOF {
+		t.Fatalf("more than one JSON value (%v):\n%s", err, s)
+	}
+}
+
+// wantFailedJSON checks the output of a failed change with --json: {error, change} (as the
+// service answers a failed change) with the command's error and the change reported, if any.
+func wantFailedJSON(t *testing.T, out string, err error, change *model.ConfigChange) {
+	t.Helper()
+	var js web.ConfigChangeError
+	onlyJSON(t, out, &js)
+	if err == nil || js.Error != err.Error() {
+		t.Errorf("JSON error %q, the command's error %v", js.Error, err)
+	}
+	if (js.Change == nil) != (change == nil) || (change != nil && *js.Change != *change) {
+		t.Errorf("JSON change %+v, want %+v", js.Change, change)
+	}
+}
+
+// TestGatewaySyslogOnOffErrors: a failed change prints the change the service reported and the
+// error; how to make it by hand only when the gateway did not take the change (not when its
+// record failed, nor when the service only refused to run two gateway operations at once).
+// With --json it prints only {error, change} - the error and the change reported, if any - and
+// still fails (its exit status), so that a script tells a failure from a change.
+func TestGatewaySyslogOnOffErrors(t *testing.T) {
+	st := storeStatus()
+	st.LocalLink = &model.LocalLink{LocalIP: "192.168.1.71"}
+	f := &fakeService{status: st}
+	useService(t, f)
+	dir := t.TempDir()
+	failed := model.ConfigChange{Target: "gateway", What: "syslog.ha", Before: "off", After: "on -> 192.168.1.71:514, level Notice", Actor: "operator via cli",
+		Result: "failed: gateway: POST syslog.ha (Update): HTTP 500; Save not posted"}
+	taken := failed
+	taken.Result = "verified; monitor setting enforce_syslog changed from false to true"
+	for _, tc := range []struct {
+		name    string
+		action  string
+		code    int
+		body    any
+		wantErr string
+		texts   []string
+		hand    string              // the instructions printed ("" none)
+		change  *model.ConfigChange // the change reported (nil none)
+	}{
+		{"gateway failed", "on", 502, map[string]any{"error": "gateway: POST syslog.ha (Update): HTTP 500; Save not posted", "change": failed},
+			"service: gateway: POST syslog.ha (Update): HTTP 500; Save not posted",
+			[]string{"Change: syslog.ha: off → on -> 192.168.1.71:514, level Notice (failed: gateway: POST syslog.ha (Update): HTTP 500; Save not posted)\n"}, setByHandHere, &failed},
+		{"stop failed", "off", 502, map[string]any{"error": "gateway: setting not applied: Syslog reads on (wanted off) after saving"},
+			"service: gateway: setting not applied", nil, stopByHand, nil},
+		{"no access code", "on", 503, map[string]any{"error": "gateway Syslog setting change: no gateway device access code is stored"},
+			"no gateway device access code is stored", nil, setByHandHere, nil},
+		{"taken, not recorded", "on", 500, map[string]any{"error": "the gateway reports the setting as changed (verified; ...), but the change could not be completed: disk full", "change": taken},
+			"but the change could not be completed: disk full",
+			[]string{"Change: syslog.ha: off → on -> 192.168.1.71:514, level Notice (verified; monitor setting enforce_syslog changed from false to true)\n"}, "", &taken},
+		{"busy", "on", 409, map[string]any{"error": "a gateway setting change or certificate confirmation is already in progress"},
+			"service: a gateway setting change or certificate confirmation is already in progress", nil, "", nil},
+		{"not JSON", "on", 502, "Bad Gateway", "service: HTTP 502", nil, setByHandHere, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f.mu.Lock()
+			f.gwFail, f.gwFailBody = tc.code, tc.body
+			f.mu.Unlock()
+			var out strings.Builder
+			err := gatewaySyslog(&out, []string{tc.action, "--data", dir})
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error %v, want %q", err, tc.wantErr)
+			}
+			got := out.String()
+			wantText(t, got, tc.texts...)
+			if tc.hand != "" && !strings.HasSuffix(got, tc.hand) {
+				t.Errorf("no instructions %q:\n%s", tc.hand, got)
+			}
+			if tc.hand == "" && strings.Contains(got, "on the gateway itself") {
+				t.Errorf("instructions although the gateway took the change or nothing was tried:\n%s", got)
+			}
+			if strings.Contains(got, "Gateway setting ") {
+				t.Errorf("a failed change printed as made:\n%s", got)
+			}
+
+			// --json: the same failure as JSON, and nothing else; the command still fails.
+			out.Reset()
+			jerr := gatewaySyslog(&out, []string{tc.action, "--json", "--data", dir})
+			if jerr == nil || jerr.Error() != err.Error() {
+				t.Fatalf("--json: error %v, want %v", jerr, err)
+			}
+			wantFailedJSON(t, out.String(), jerr, tc.change)
+		})
+	}
+}
+
+// TestGatewaySyslogWithoutService: with the service stopped the change is made on the ledger
+// directly, like `gateway notification on|off`; before it logs in to the gateway the strict
+// certificate check refuses a gateway whose certificate is not pinned (no request is made), and
+// the command says how to make the change by hand. With --json a failure prints only {error,
+// change}, as through the service.
+func TestGatewaySyslogWithoutService(t *testing.T) {
+	// A data directory whose gateway has no pinned certificate (and is this computer: nothing
+	// could reach a real gateway even if the check let it).
+	dir := newDataDir(t, `"gateway":{"host":"127.0.0.1"}`)
+	noService(t, true)
+	var out strings.Builder
+	err := gatewaySyslog(&out, []string{"on", "--data", dir})
+	if err == nil || !strings.Contains(err.Error(), "the gateway certificate is not pinned yet") {
+		t.Fatalf("no pin: %v", err)
+	}
+	wantText(t, out.String(), "To set it on the gateway itself: open https://127.0.0.1, Diagnostics > Syslog", "Server IP Address this PC's IPv4 address")
+	// --json: the refusal as JSON (no change was reported), and nothing else.
+	out.Reset()
+	jerr := gatewaySyslog(&out, []string{"on", "--json", "--data", dir})
+	if jerr == nil || jerr.Error() != err.Error() {
+		t.Fatalf("no pin, --json: %v", jerr)
+	}
+	wantFailedJSON(t, out.String(), jerr, nil)
+	led := openLedgerReadOnly(t, dir)
+	var last model.Body
+	if err := led.Scan(0, func(_ model.Envelope, b model.Body) error { last = b; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if last.Type == model.TypeConfigChange {
+		t.Errorf("a refused change was recorded: %s", last.Data)
+	}
+
+	// The change as the monitor makes it on the ledger.
+	restore := gatewaySyslogOffline
+	t.Cleanup(func() { gatewaySyslogOffline = restore })
+	var calls []string
+	gatewaySyslogOffline = func(dataDir string, on bool) (model.ConfigChange, error) {
+		calls = append(calls, fmt.Sprintf("%s|%v", dataDir, on))
+		return model.ConfigChange{Target: "gateway", What: "syslog.ha", Before: "off", After: "on -> 192.168.1.71:514, level Notice", Actor: "cli user x", Result: "verified"}, nil
+	}
+	out.Reset()
+	if err := gatewaySyslog(&out, []string{"on", "--data", dir}); err != nil {
+		t.Fatal(err)
+	}
+	wantText(t, out.String(), "Gateway setting syslog.ha: off → on -> 192.168.1.71:514, level Notice (verified)\n",
+		"The service is not running: the gateway's messages are received, and the setting kept, once it runs (att-monitor start).\n")
+	throttled := model.ConfigChange{Target: "gateway", What: "syslog.ha", Before: "on -> 192.168.1.71:514, level Notice", After: "off", Actor: "cli user x",
+		Result: "failed: gateway: login throttled"}
+	gatewaySyslogOffline = func(dataDir string, on bool) (model.ConfigChange, error) {
+		calls = append(calls, fmt.Sprintf("%s|%v", dataDir, on))
+		return throttled, errors.New("gateway: login throttled")
+	}
+	out.Reset()
+	if err := gatewaySyslog(&out, []string{"off", "--data", dir}); err == nil || err.Error() != "gateway: login throttled" {
+		t.Errorf("failed offline change: %v", err)
+	}
+	wantText(t, out.String(), "Change: syslog.ha: on -> 192.168.1.71:514, level Notice → off (failed: gateway: login throttled)\n", "set Syslog to Off and save.")
+	// --json: the error and the change the monitor reported, as JSON only; still a failure.
+	out.Reset()
+	jerr = gatewaySyslog(&out, []string{"off", "--json", "--data", dir})
+	if jerr == nil || jerr.Error() != "gateway: login throttled" {
+		t.Errorf("failed offline change, --json: %v", jerr)
+	}
+	wantFailedJSON(t, out.String(), jerr, &throttled)
+	// A failure that reports no change.
+	gatewaySyslogOffline = func(dataDir string, on bool) (model.ConfigChange, error) {
+		calls = append(calls, fmt.Sprintf("%s|%v", dataDir, on))
+		return model.ConfigChange{}, errors.New("a gateway settings check or change is already running")
+	}
+	out.Reset()
+	jerr = gatewaySyslog(&out, []string{"on", "--json", "--data", dir})
+	if jerr == nil || jerr.Error() != "a gateway settings check or change is already running" {
+		t.Errorf("busy offline, --json: %v", jerr)
+	}
+	wantFailedJSON(t, out.String(), jerr, nil)
+	if want := []string{dir + "|true", dir + "|false", dir + "|false", dir + "|true"}; !reflect.DeepEqual(calls, want) {
+		t.Errorf("calls %q, want %q", calls, want)
 	}
 }
 

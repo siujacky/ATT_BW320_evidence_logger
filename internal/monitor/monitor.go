@@ -3,8 +3,9 @@
 // (§9, Classify), runs the incident state machine (§10), derives gateway events (§7),
 // anchors the ledger head (§11), keeps the gateway's syslog (docs/syslog-snmp-traffic.md) and
 // serves the live status, chart series and incident views to the dashboard
-// (contracts.StatusSource) as well as operator actions (contracts.Actions), the syslog
-// retention control (contracts.SyslogControl) and the flow meter (contracts.LiveTrafficSource).
+// (contracts.StatusSource) as well as operator actions (contracts.Actions), the syslog controls
+// (contracts.SyslogControl: how much is kept, and the gateway's Syslog page) and the flow meter
+// (contracts.LiveTrafficSource).
 //
 // Everything the monitor learns is appended to the evidence ledger; its in-memory state is
 // a cache that is rebuilt from the ledger at startup (state/monitor-state.json only speeds
@@ -15,7 +16,8 @@
 // link, clock, heartbeat, anchoring, notification check, traceroutes, incident close,
 // segment compression, syslog receiver and syslog flush). Locks, always acquired in this order:
 //
-//	notifMu   makes "read the redirect setting, then enforce it" atomic w.r.t. operator changes
+//	notifMu   makes "read the redirect and Syslog settings, then enforce them" atomic w.r.t.
+//	          operator changes
 //	syslogMu  serializes the syslog store's operations with their records (syslog.go)
 //	gwMu      serializes requests to the gateway (one web session at a time)
 //	anchorMu  serializes anchoring
@@ -24,8 +26,8 @@
 //	          gateway restarts are attached to incidents under it (so no incident record can
 //	          miss a restart learned at the same moment), and what a new daily segment must
 //	          contain (config_state, incident_update) follows its first record under it
-//	cfgMu     guards *config.Config after New (pin, enforce_notification_off, syslog
-//	          retention) and SaveConfig
+//	cfgMu     guards *config.Config after New (pin, enforce_notification_off, enforce_syslog,
+//	          syslog retention) and SaveConfig
 //	mu        guards the in-memory state (never held during I/O)
 //
 // liveMu guards the flow meter (live.go) and is never held while another lock is taken.
@@ -290,6 +292,19 @@ type state struct {
 	syslogGw  *syslogGwRead
 	syslogErr string
 	localIP   string
+	// Keeping the gateway's Syslog setting (syslog_gateway.go): the latest failed attempt to set
+	// it (nil: none since the latest success, SYSLOG_SETTING_FAILED); whether it waits for this
+	// computer's address (the first reading that has one asks for a settings check); since when
+	// the setting as recorded sends here; when the newest message from the gateway was handed over
+	// (SYSLOG_NOT_ARRIVING); whether a change made by the monitor waits for its first message; who
+	// asked for a switch-off of the page that failed and waits to be made by the settings checks
+	// ("" when none; syslogOffDueAfter, rebuilt from the ledger).
+	syslogSetFail  *syslogSetFail
+	syslogNeedAddr bool
+	syslogOKSince  time.Time
+	syslogGwMsgAt  time.Time
+	syslogAwaitMsg bool
+	syslogOffDue   string
 
 	// Custody facts rebuilt from the ledger.
 	lastStartRun, lastStopRun string
@@ -379,7 +394,7 @@ type Monitor struct {
 
 	running       atomic.Bool
 	shutdownSeen  atomic.Bool
-	gwAuth        atomic.Bool // an authenticated gateway operation holds gwMu
+	gwAuth        atomic.Bool // an authenticated gateway operation holds gwMu (raised and read under cfgMu)
 	appendFailing atomic.Bool // the latest append failed (fast path of noteAppendSuccess)
 	records       atomic.Uint64
 
@@ -415,8 +430,8 @@ type Monitor struct {
 
 // New validates the options, applies defaults and installs the gateway certificate observer.
 // The monitor owns *Options.Config from now on: it changes Gateway.PinnedCertSHA256,
-// Gateway.PendingCertSHA256, Gateway.EnforceNotificationOff and Syslog.KeepMB/KeepDays under
-// its own lock and persists them with SaveConfig.
+// Gateway.PendingCertSHA256, Gateway.EnforceNotificationOff, Gateway.EnforceSyslog and
+// Syslog.KeepMB/KeepDays under its own lock and persists them with SaveConfig.
 func New(opts Options) (*Monitor, error) {
 	switch {
 	case opts.Config == nil:

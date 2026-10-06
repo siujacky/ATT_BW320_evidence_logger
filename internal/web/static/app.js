@@ -118,11 +118,18 @@
     LEDGER_WRITE_FAILING: 'Evidence is not being recorded — the ledger refuses new records',
     DISK_SPACE_LOW: 'Low disk space on the evidence volume',
     CLOCK_OFFSET: 'This computer’s clock is off',
+    SYSLOG_RECEIVER_DOWN: 'The syslog receiver is not listening',
+    SYSLOG_STORE_FAILING: 'The syslog store fails',
+    SYSLOG_SETTING_FAILED: 'The gateway’s Syslog page could not be set',
+    SYSLOG_NOT_ARRIVING: 'No syslog message from the gateway for a day',
   });
   // Conditions also shown on the Gateway page (they pause or block its authenticated actions).
   const GATEWAY_ALERTS = ['GATEWAY_CERT_CHANGED', 'NO_ACCESS_CODE'];
   // Conditions also shown on the Evidence page (they affect what is recorded, and when).
   const EVIDENCE_ALERTS = ['LEDGER_WRITE_FAILING', 'DISK_SPACE_LOW', 'CLOCK_OFFSET', 'ANCHOR_UNTRUSTED'];
+  // Conditions also shown on the Syslog page (the receiver, the store and the gateway's Syslog
+  // setting), with those that pause the change of that setting.
+  const SYSLOG_ALERTS = ['SYSLOG_RECEIVER_DOWN', 'SYSLOG_STORE_FAILING', 'SYSLOG_SETTING_FAILED', 'SYSLOG_NOT_ARRIVING', 'GATEWAY_CERT_CHANGED', 'NO_ACCESS_CODE'];
 
   // Verification problems (model.VerifyFailure.problem) in words.
   const VERIFY_PROBLEMS = dict({
@@ -270,6 +277,27 @@
   function replace(el, ...kids) {
     el.textContent = '';
     return add(el, kids);
+  }
+
+  /** placeChildren makes kids (as add() takes them) the children of el, in order, leaving where
+   *  it is every node that is already in its place: replace() would take a part a view keeps
+   *  (the flow meter, the gateway syslog card) out of the page and put it back, which loses the
+   *  keyboard focus in it and can make a screen reader announce its live region again. A node
+   *  that goes is replaced where it was. */
+  function placeChildren(el, ...kids) {
+    const want = [];
+    for (const k of kids.flat(Infinity)) {
+      if (k == null || k === false || k === '') continue;
+      want.push(k instanceof Node ? k : document.createTextNode(String(k)));
+    }
+    want.forEach((k, i) => {
+      const cur = el.childNodes[i];
+      if (cur === k) return;
+      if (cur && !want.includes(cur)) cur.replaceWith(k);
+      else el.insertBefore(k, cur || null);
+    });
+    while (el.childNodes.length > want.length) el.removeChild(el.lastChild);
+    return el;
   }
 
   function loadPref(key, def) {
@@ -999,6 +1027,7 @@
     const tiles = h('section', { 'aria-label': 'Availability statistics' });
     const cards = h('div', { class: 'grid' });
     const flow = flowMeter(ctx);
+    const syslog = syslogPanel(ctx, true);
     const charts = h('section', { 'aria-labelledby': 'history-h' });
     const recent = h('section', { class: 'card', 'aria-labelledby': 'recent-h' });
     c.append(h('h1', { class: 'sr-only' }, 'Overview'), hero, conditions, tiles, cards, charts, recent);
@@ -1007,7 +1036,7 @@
       fillHero(hero, st);
       fillAlerts(conditions, st, null);
       fillTiles(tiles, st);
-      fillCards(cards, st, flow);
+      fillCards(cards, st, flow, syslog);
     };
     ctx.onStatus = update;
     if (app.status) update(app.status);
@@ -1167,7 +1196,7 @@
         h('a', { href: '#/gateway' }, 'Turn it off on the Gateway page')));
     }
     if (cnd.code === 'NO_ACCESS_CODE') {
-      body.append(h('p', { class: 'src' }, 'Monitoring needs no access code — only checking or changing the gateway’s outage-redirect setting does. To store it, run ',
+      body.append(h('p', { class: 'src' }, 'Monitoring needs no access code — only checking or changing the gateway’s settings (the outage redirect and the Syslog page) does. To store it, run ',
         h('code', null, 'att-monitor set-access-code --file PATH'), ' as administrator (the device access code is printed on the gateway’s label).'));
     }
     if (cnd.code === 'ANCHOR_UNTRUSTED') {
@@ -1184,6 +1213,10 @@
     if (cnd.code === 'DISK_SPACE_LOW') {
       body.append(h('p', { class: 'src' }, 'Once the volume is full no record can be written and the monitor stops producing evidence. Free space on the volume that holds the data directory. ',
         evidenceLink('Data directory on the Evidence page')));
+    }
+    if (cnd.code === 'SYSLOG_SETTING_FAILED') {
+      body.append(h('p', { class: 'src' }, 'While att-monitor keeps the gateway sending its log here (gateway.enforce_syslog), it tries again at its next settings check; the control of the gateway’s Syslog setting on the Syslog page tries now. ',
+        parseHash().path === '/syslog' ? null : h('a', { href: '#/syslog' }, 'Open the Syslog page')));
     }
     if (cnd.code === 'CLOCK_OFFSET') {
       body.append(h('p', { class: 'src' }, 'Every record carries this computer’s time, so a wrong clock shifts the recorded times by that much; the RFC 3161 time-stamps still prove when records existed. Correct the clock in Windows Settings › Time & language › Date & time (Sync now), or run ',
@@ -1315,7 +1348,7 @@
     const btn = h('button', { type: 'button', class: 'btn btn-primary', disabled: true }, 'Trust the new certificate');
     const body = h('div', { class: 'banner-body' },
       h('p', { class: 'banner-title' }, COND_TITLES.GATEWAY_CERT_CHANGED),
-      h('p', null, 'The AT&T gateway presented a different TLS certificate from the one att-monitor pinned. Status pages are still read and recorded (they need no login), but authenticated actions — checking or changing the outage-redirect setting — are paused, so the gateway’s access code is never sent to a device that may not be your gateway.'),
+      h('p', null, 'The AT&T gateway presented a different TLS certificate from the one att-monitor pinned. Status pages are still read and recorded (they need no login), but authenticated actions — checking or changing the gateway’s outage-redirect and Syslog settings — are paused, so the gateway’s access code is never sent to a device that may not be your gateway.'),
       fps,
       cnd.message ? h('p', { class: 'src' }, 'Monitor: ', cnd.message) : null,
       since || seq ? h('p', { class: 'src' }, since ? ['Since ', timeEl(since)] : null, since && seq ? ' · ' : null,
@@ -1400,10 +1433,11 @@
         tile('Monitoring coverage', (x) => x.coverage_pct, (p) => fmtPct(p, 1), 'Share of the window during which the monitor was measuring')));
   }
 
-  /** fillCards rebuilds the Overview's cards from st; flow (the flow meter) is put back as it is:
-   *  it keeps its own state and readings. */
-  function fillCards(el, st, flow) {
-    replace(el, cardInternet(st), cardGatewayWAN(st), flow, cardFiber(st), cardLocalLink(st), syslogCard(st, true), cardEvidence(st), cardMonitor(st));
+  /** fillCards rebuilds the Overview's cards from st. flow (the flow meter) and syslog (the
+   *  gateway syslog card, syslogPanel) keep their own state and stay in place (placeChildren):
+   *  the flow meter its readings, the syslog card its control of the gateway's setting. */
+  function fillCards(el, st, flow, syslog) {
+    placeChildren(el, cardInternet(st), cardGatewayWAN(st), flow, cardFiber(st), cardLocalLink(st), syslog.update(st), cardEvidence(st), cardMonitor(st));
   }
 
   /** probeLabel names a probe as configured (Status.probes, else the chart series' list). */
@@ -2068,17 +2102,48 @@
 
   // ------------------------------------------------------------------ gateway syslog
 
-  /** syslogCard shows the receiver of the gateway's syslog messages and the gateway's Syslog
-   *  setting (Status.syslog, docs/syslog-snmp-traffic.md §3.2), or nothing when the monitor
-   *  reports neither. link: on the Overview, linking the Syslog page (which has its own card
-   *  title and shows the syslog store in its own card); the Overview's card also says how much
-   *  the store holds. */
-  function syslogCard(st, link) {
+  /** syslogStatus returns Status.syslog (the receiver of the gateway's syslog messages and the
+   *  gateway's Syslog setting, docs/syslog-snmp-traffic.md §3), or null when the monitor reports
+   *  neither. */
+  function syslogStatus(st) {
     const sl = st && st.syslog;
-    if (!sl || typeof sl !== 'object' || Array.isArray(sl)) return null;
+    return sl && typeof sl === 'object' && !Array.isArray(sl) ? sl : null;
+  }
+
+  /** syslogPanel is a view's card of the gateway's syslog: the receiver and what it received,
+   *  the gateway's Syslog setting as last read, whether att-monitor keeps it sending here, and
+   *  the control that changes that (syslogControl). link: the Overview's card, which links the
+   *  Syslog page and also says how much the store holds (the Syslog page shows the store in a
+   *  card of its own). The card is built once: update(st) redraws what it shows when that
+   *  changes and leaves the control as it is, and the view puts the card back with
+   *  placeChildren, so a status refresh takes neither the keyboard focus nor a change's
+   *  progress or outcome away. update returns the card, or null when the monitor reports no
+   *  syslog status. */
+  function syslogPanel(ctx, link) {
+    const ctl = syslogControl(ctx);
+    const body = h('div');
+    const el = link ? cardWithLink('Gateway syslog', '#/syslog', 'Messages', body, ctl.el) : card('Receiver and gateway setting', body, ctl.el);
+    let key = null;
+    return {
+      update(st) {
+        const sl = syslogStatus(st);
+        if (!sl) return null;
+        const k = JSON.stringify([sl, st.local_link ? st.local_link.local_ip : null, gatewayAuthBlock(st)]);
+        if (k !== key) {
+          key = k;
+          replace(body, syslogCardBody(sl, st, link));
+        }
+        ctl.update(st);
+        return el;
+      },
+    };
+  }
+
+  /** syslogCardBody is what syslogPanel's card shows from Status.syslog (sl). */
+  function syslogCardBody(sl, st, link) {
     const seq = Number(sl.gateway_seq) || 0;
     const store = syslogStore(sl);
-    const body = [
+    return [
       kv([
         ['Receiver', syslogReceiver(sl)],
         ['Messages', [syslogCounts(sl), h('span', { class: 'sub small muted' }, 'since the service started')]],
@@ -2090,10 +2155,10 @@
         ['Setting read', sl.gateway_at || seq
           ? [sl.gateway_at ? timeEl(sl.gateway_at, F.short) : null, sl.gateway_at && seq ? ' · ' : null, seq ? h('a', { href: recordsLink(seq) }, 'record #' + seq) : null]
           : null],
+        ['Kept by att-monitor', syslogKept(sl)],
       ]),
       h('p', { class: 'card-foot' }, syslogEnforcement(sl, st)),
     ];
-    return link ? cardWithLink('Gateway syslog', '#/syslog', 'Messages', ...body) : card('Receiver and gateway setting', ...body);
   }
 
   /** syslogReceiver says whether this computer listens for the gateway's messages. */
@@ -2136,6 +2201,24 @@
     return x && x.server ? String(x.server) + (x.port ? ':' + x.port : '') : '';
   }
 
+  /** syslogPort is the port the gateway is to send its log to: the target's (syslog.port), else
+   *  the receiver's, else 514. */
+  function syslogPort(sl) {
+    const t = sl && sl.target && typeof sl.target === 'object' ? sl.target : null;
+    return (t && Number(t.port)) || Number((/:(\d+)$/.exec(String((sl && sl.listen) || '')) || [])[1]) || 514;
+  }
+
+  /** syslogKept says whether att-monitor keeps the gateway's Syslog setting (Status.syslog.enforce,
+   *  gateway.enforce_syslog) and at what (target: this PC's address toward the gateway,
+   *  syslog.port and the level chosen; absent while this PC's address is not known). */
+  function syslogKept(sl) {
+    if (!sl.enforce) return [chip('none', 'no'), ' att-monitor only reads this setting'];
+    const t = sl.target && typeof sl.target === 'object' ? sl.target : null;
+    if (t && t.enabled === false) return [chip('good', 'yes'), ' off'];
+    return [chip('good', 'yes'), ' on, sending to ', syslogTarget(t) || 'this PC (its address toward the gateway is not known yet)',
+      t && t.level ? [' · level ', String(t.level)] : null];
+  }
+
   /** syslogSetting words the gateway's Syslog setting as the monitor last read it
    *  (Status.syslog.state: ok, off, elsewhere, unknown, error). */
   function syslogSetting(sl) {
@@ -2148,7 +2231,7 @@
       case 'off': return [chip('warning', 'off'), ' the gateway sends no syslog messages', problem];
       case 'elsewhere': return [chip('warning', 'sends elsewhere'), ' to ', syslogTarget(g) || 'another address', level, ', not to this PC', problem];
       case 'error':
-        return [chip('warning', 'could not be read'), ' ', String(sl.problem || 'the last check failed'),
+        return [chip('warning', 'check failed'), ' ', String(sl.problem || 'the last check failed'),
           g ? h('span', { class: 'sub small muted' }, 'Last read: ', g.enabled ? 'on, sends to ' + (syslogTarget(g) || '?') : 'off', level) : null];
       case 'unknown':
         return g ? [chip('none', 'not understood'), ' ', String(sl.problem || 'the gateway’s Syslog page was not understood')]
@@ -2157,28 +2240,232 @@
     return [chip('none', humanize(state) || 'on'), g && g.enabled ? [' sends to ', syslogTarget(g) || '?', level] : null, problem];
   }
 
-  /** syslogEnforcement says what att-monitor does with the gateway's Syslog setting. It reads
-   *  the setting only in the daily settings check (and within 10 minutes after the service
-   *  starts, or after this PC's address changed), so a change made on the gateway shows above
-   *  only after the next read, while its messages show at once: once messages have arrived
-   *  since the setting was read, the card says so instead of how to set it by hand. */
+  /** syslogEnforcement says what att-monitor does with the gateway's Syslog setting: it reads it
+   *  in its daily settings check (and within 10 minutes after the service starts or this PC's
+   *  address changed) and, while it keeps it (enforce), sets it again whenever it differs. A
+   *  change made on the gateway itself therefore shows above only after the next read, while
+   *  its messages show at once: once messages have arrived since a read that found the gateway
+   *  sending elsewhere or not at all, the card says so. While the gateway does not send here and
+   *  att-monitor cannot set it (syslogHandHint), and no message arrived since the setting was
+   *  read, the card also says how to set it on the gateway itself. */
   function syslogEnforcement(sl, st) {
-    if (sl.enforce) {
-      return 'att-monitor keeps the gateway sending its log to ' + (syslogTarget(sl.target) || 'this PC') + ' and records every check and change of the setting.';
-    }
-    const reads = 'att-monitor reads this setting in its daily settings check and within 10 minutes after the service starts (att-monitor stop, then start); it does not change it yet.';
-    if (sl.state === 'ok') return reads;
+    const reads = 'in its daily settings check (also within 10 minutes after the service starts and after this PC’s address changes)';
+    const out = [];
     const readAt = toMs(sl.gateway_at);
     const lastAt = toMs(sl.last_at);
-    if (lastAt != null && readAt == null) return reads;
-    if (lastAt != null && lastAt > readAt) {
-      return ['Messages have arrived since this setting was read, so it may have been changed on the gateway since. ', reads];
+    const receiving = lastAt != null && (readAt == null || lastAt > readAt); // messages since the latest read
+    const contradicted = receiving && readAt != null && (sl.state === 'off' || sl.state === 'elsewhere');
+    if (contradicted) out.push('Messages have arrived since this setting was read, so it may have been changed on the gateway since. ');
+    if (sl.enforce) {
+      out.push('att-monitor keeps the gateway sending its log to this PC: it reads the setting ' + reads +
+        ', sets it again whenever it differs, and records every reading and change with the gateway’s page.');
+    } else {
+      out.push('att-monitor does not keep this setting (gateway.enforce_syslog is off): it only reads it ' + reads +
+        ' and records every reading. “Send the gateway’s log to this PC” sets it and keeps it so.');
     }
-    const ip = st && st.local_link && st.local_link.local_ip;
-    const port = (sl.target && sl.target.port) || (/:(\d+)$/.exec(String(sl.listen || '')) || [])[1] || 514;
-    return ['To receive the gateway’s log, turn Syslog on in the gateway’s Diagnostics › Syslog page with server ',
-      ip ? h('code', null, String(ip)) : 'this PC’s address', ' and port ', String(port),
-      sl.listening ? ': its messages then show here within a minute. ' : '. ', reads];
+    const hand = syslogHandHint(st) && !receiving;
+    if (sl.enforce && !hand && !contradicted && (sl.state === 'off' || sl.state === 'elsewhere')) {
+      out.push(' It is set again at the next check, or now with “Send the gateway’s log to this PC”.');
+    }
+    if (hand) out.push(' ', syslogByHand(sl, st));
+    return out;
+  }
+
+  /** syslogHandHint reports whether to say how to set the gateway's Syslog page by hand: only
+   *  while the gateway does not send its log here and att-monitor cannot set it - setting it
+   *  failed or cannot be done: the latest check failed (state error), the latest attempt to set
+   *  it failed (SYSLOG_SETTING_FAILED), the page was not understood, no access code is stored or
+   *  a changed gateway certificate waits for confirmation (gatewayAuthBlock). While att-monitor
+   *  merely does not keep the setting, its control (“Send the gateway’s log to this PC”) is the
+   *  way. */
+  function syslogHandHint(st) {
+    const sl = syslogStatus(st);
+    if (!sl || sl.state === 'ok') return false;
+    const notUnderstood = (Number(sl.gateway_seq) || 0) > 0 && !(sl.gateway && typeof sl.gateway === 'object');
+    return sl.state === 'error' || notUnderstood || !!findCondition(st, 'SYSLOG_SETTING_FAILED') || gatewayAuthBlock(st) !== '';
+  }
+
+  /** syslogByHand says how to set the gateway's Syslog page by hand: the real page enables its
+   *  fields only once Syslog is set to On. */
+  function syslogByHand(sl, st) {
+    const t = sl.target && typeof sl.target === 'object' ? sl.target : null;
+    const ip = (st && st.local_link && st.local_link.local_ip) || (t && t.server) || '';
+    return ['To set it on the gateway itself: open its Diagnostics › Syslog page, set Syslog to On (the page then enables its other fields), enter Server IP Address ',
+      ip ? h('code', null, String(ip)) : 'this PC’s address', ' and Server Port ', String(syslogPort(sl)), ', and save',
+      sl.listening ? ': its messages then show here within a minute.' : '.'];
+  }
+
+  // ------------------------------------------------------------------ the gateway's Syslog setting
+
+  /** gwSyslog is the operator's change of the gateway's Syslog setting (POST /api/gateway/syslog),
+   *  which can take a minute or more: whether one runs (busy), its outcome (a function building
+   *  the notice) until `until`, and why this monitor offers no such change (unavailable, after a
+   *  404). It belongs to no view: the Overview's syslog card and the Syslog page both show it
+   *  (views: their redraw functions), so a change in progress and its outcome survive going from
+   *  one to the other, and neither offers a second change meanwhile. version counts its changes. */
+  const gwSyslog = { busy: false, outcome: null, until: 0, unavailable: '', version: 0, views: new Set() };
+  // How long the outcome of a change of the gateway's Syslog setting is shown.
+  const GW_SYSLOG_OUTCOME_MS = 10 * 60 * 1000;
+
+  function gwSyslogSet(changes) {
+    Object.assign(gwSyslog, changes);
+    gwSyslog.version++;
+    for (const draw of gwSyslog.views) draw();
+  }
+
+  /** gwSyslogOffers says which changes the control offers (Status.syslog): sending the gateway's
+   *  log to this PC unless att-monitor keeps it so and it does (enforce, state ok); stopping it
+   *  while att-monitor keeps it or the gateway may send its log somewhere (not read as off). */
+  function gwSyslogOffers(sl) {
+    return { on: !(sl.enforce && sl.state === 'ok'), off: !!sl.enforce || sl.state !== 'off' };
+  }
+
+  /** syslogControl offers the operator's change of the gateway's Syslog setting in a view:
+   *  “Send the gateway’s log to this PC” and “Stop sending” (gwSyslogOffers), each confirmed in a
+   *  dialog that says what happens on the gateway, then the change's progress and outcome
+   *  (gwSyslog). Like the outage-redirect control on the Gateway page, its buttons are disabled
+   *  while authenticated gateway actions cannot run (gatewayAuthBlock), and it says why. Its
+   *  elements are built once and only updated, so a status refresh never takes the focus or an
+   *  outcome away (and a live region is not announced again). Nor does a change: while it runs
+   *  the buttons only say that they do nothing (aria-disabled; changeGatewaySyslog ignores them),
+   *  as a disabled button would drop the focus the dialog gave back to it to the start of the
+   *  page; and once the button the keyboard is on is no longer offered (or is disabled), the focus
+   *  goes to the outcome, else to why the control offers no change, else to the other button.
+   *  Returns { el, update(st) }. */
+  function syslogControl(ctx) {
+    const why = h('div', { hidden: true, tabindex: '-1' });
+    const on = h('button', { type: 'button', class: 'btn btn-primary' }, 'Send the gateway’s log to this PC');
+    const off = h('button', { type: 'button', class: 'btn' }, 'Stop sending');
+    const out = h('div', { 'aria-live': 'polite', tabindex: '-1' });
+    const el = h('div', { class: 'syslog-control' }, why, h('div', { class: 'btn-row' }, on, off), out);
+    let st = null;
+    let whyKey = null;
+    let shown = -1; // the gwSyslog.version out shows
+    let shownUntil = 0; // until when the outcome out shows is current (0: none shown)
+    on.addEventListener('click', () => changeGatewaySyslog(true, st));
+    off.addEventListener('click', () => changeGatewaySyslog(false, st));
+    const draw = () => {
+      const had = [on, off].find((b) => b === document.activeElement) || null; // the button the keyboard is on
+      const sl = syslogStatus(st);
+      el.hidden = !sl;
+      if (!sl) return;
+      const block = gatewayAuthBlock(st);
+      const offers = gwSyslogOffers(sl);
+      on.hidden = !!gwSyslog.unavailable || !offers.on;
+      off.hidden = !!gwSyslog.unavailable || !offers.off;
+      on.disabled = off.disabled = !!block;
+      for (const b of [on, off]) {
+        if (gwSyslog.busy) b.setAttribute('aria-disabled', 'true');
+        else b.removeAttribute('aria-disabled');
+      }
+      const k = block + '|' + gwSyslog.unavailable;
+      if (k !== whyKey) {
+        whyKey = k;
+        replace(why, gwSyslog.unavailable ? callout('info', gwSyslog.unavailable)
+          : block === 'cert' ? h('p', null, chip('critical', 'paused'), ' The gateway presented an unconfirmed TLS certificate, so att-monitor will not log in to it until the certificate is confirmed (see the banner above).')
+            : block === 'code' ? h('p', null, chip('none', 'no access code'), ' No usable gateway access code is stored, so att-monitor can neither set nor read this setting (att-monitor set-access-code).')
+              : null);
+        why.hidden = !gwSyslog.unavailable && !block;
+      }
+      const current = !!gwSyslog.outcome && Date.now() < gwSyslog.until;
+      if (gwSyslog.version !== shown || (shownUntil && !current)) {
+        shown = gwSyslog.version;
+        shownUntil = current ? gwSyslog.until : 0;
+        replace(out, gwSyslog.busy ? gwSyslogProgress() : current ? gwSyslog.outcome() : null);
+      }
+      if (had && (had.hidden || had.disabled)) { // the focus stays in the control
+        const next = out.firstChild ? out : !why.hidden ? why : [on, off].find((b) => !b.hidden && !b.disabled);
+        if (next) next.focus();
+      }
+    };
+    gwSyslog.views.add(draw);
+    ctx.cleanup(() => gwSyslog.views.delete(draw));
+    return { el, update(s) { st = s; draw(); } };
+  }
+
+  /** changeGatewaySyslog asks the monitor, once the operator confirmed what will happen on the
+   *  gateway, to send the gateway's log to this PC and keep it so (enabled), or to stop it. */
+  async function changeGatewaySyslog(enabled, st) {
+    if (gwSyslog.busy) return;
+    if (!(await dialog(gwSyslogDialog(enabled, st))) || gwSyslog.busy) return;
+    gwSyslogSet({ busy: true, outcome: null, until: 0 });
+    let outcome = null;
+    let unavailable = gwSyslog.unavailable;
+    try {
+      const cc = (await api('/api/gateway/syslog', { method: 'POST', body: { enabled } })) || {};
+      outcome = () => gwSyslogDone(enabled, cc);
+    } catch (e) {
+      if (e.status === 404) unavailable = sentence(capitalize(e.message)); // this monitor offers no such change
+      else outcome = () => gwSyslogFailed(e);
+    } finally {
+      gwSyslogSet({ busy: false, outcome, until: outcome ? Date.now() + GW_SYSLOG_OUTCOME_MS : 0, unavailable });
+      refreshStatus();
+    }
+  }
+
+  /** gwSyslogDialog is the confirmation before a change of the gateway's Syslog setting: what
+   *  will happen on the gateway, and what att-monitor does about the setting from then on. */
+  function gwSyslogDialog(enabled, st) {
+    const sl = syslogStatus(st) || {};
+    const g = sl.gateway && typeof sl.gateway === 'object' ? sl.gateway : null;
+    const sends = g && g.enabled ? syslogTarget(g) : ''; // where the gateway sends its log as last read
+    const evidence = 'att-monitor then reads the page back: the change counts only if the gateway shows it. The pages before and after the change are stored as evidence, and the change is recorded in the evidence ledger.';
+    if (!enabled) {
+      return {
+        title: 'Stop the gateway sending its log?',
+        body: [
+          h('p', null, 'att-monitor will log in to the AT&T gateway with the stored access code and set Syslog to Off on its Diagnostics › Syslog page: the gateway then sends its log to no syslog server',
+            sends ? ' (it sends it to ' + sends + ' now)' : '', '. ', evidence),
+          h('p', null, 'att-monitor no longer sets this setting (gateway.enforce_syslog off) until you choose “Send the gateway’s log to this PC” again; it still reads it in its daily settings check. The messages received so far stay in the syslog store, within its limits.'),
+        ],
+        confirm: 'Stop sending',
+      };
+    }
+    const t = sl.target && typeof sl.target === 'object' ? sl.target : null;
+    const ip = (t && t.server) || (st && st.local_link && st.local_link.local_ip) || '';
+    return {
+      title: 'Send the gateway’s log to this PC?',
+      body: [
+        h('p', null, 'att-monitor will log in to the AT&T gateway with the stored access code and set its Diagnostics › Syslog page: Syslog On, Server IP Address ',
+          ip ? h('code', null, String(ip)) : 'this PC’s address toward the gateway', ', Server Port ', h('code', null, String(syslogPort(sl))), ', Log Level ',
+          t && t.level ? h('code', null, String(t.level)) : 'as gateway.syslog_level says, else as already set while Syslog is on, else the most detailed level the page offers (not Debug)', '.'),
+        sl.state === 'elsewhere' && sends ? h('p', null, h('strong', null, 'The gateway sends its log to ' + sends + ' now: it will send it to this PC instead.')) : null,
+        h('p', null, g && g.enabled ? null : 'The page enables those fields only once Syslog is On, so att-monitor first switches it on (the page’s Update), then fills them in and saves. ',
+          evidence),
+        h('p', null, 'From then on att-monitor keeps the setting: it reads it in its daily settings check (also after this PC’s address changes) and sets it again whenever it differs.'),
+        sl.enabled === false ? h('p', null, h('strong', null, 'This PC’s syslog receiver is off (syslog.enabled is false in config.json): the gateway’s messages are not received until it is turned on.')) : null,
+      ],
+      confirm: 'Send the log to this PC',
+    };
+  }
+
+  function gwSyslogProgress() {
+    return notice('info', spinner(), ' Talking to the gateway… Logging in, changing its Syslog page and reading it back can take a minute or two.');
+  }
+
+  /** gwSyslogDone words a change of the gateway's Syslog setting that the monitor made (its
+   *  config_change), or did not need to make: the page already showed what was asked
+   *  ("unchanged: ...", not recorded as a change of the page). */
+  function gwSyslogDone(enabled, cc) {
+    const result = String(cc.result || 'applied');
+    const then = enabled ? 'att-monitor keeps the gateway sending its log to this PC; new messages show on the Syslog page as they arrive.'
+      : 'The gateway sends its log to no syslog server now, and att-monitor no longer sets it.';
+    if (/^\s*unchanged/i.test(result)) {
+      return notice('good', h('strong', null, 'Already so. '), 'The gateway’s Syslog page already showed this, so it was not changed (', result, '). ', then);
+    }
+    return notice('good', h('strong', null, 'Done. '), 'Recorded in the evidence ledger as a configuration change: ',
+      String(cc.what || 'the gateway’s Syslog setting'), ', ', String(cc.before || '?'), ' → ', String(cc.after || '?'), ' (', result, '). ', then);
+  }
+
+  /** gwSyslogFailed words a change of the gateway's Syslog setting that failed. It never claims
+   *  that nothing changed when the monitor reports that the gateway took the change (the answer's
+   *  change says "verified" or "applied"): then what failed came after, e.g. recording it. */
+  function gwSyslogFailed(e) {
+    const ch = e.data && e.data.change;
+    const result = ch && ch.result ? String(ch.result) : '';
+    if (result && !/^\s*failed/i.test(result)) return notice('warning', sentence(capitalize(e.message)));
+    return notice('critical', 'The change could not be completed or confirmed: ', sentence(e.message),
+      result ? ' (Recorded result: ' + sentence(result) + ')' : '');
   }
 
   async function loadRecentIncidents(el, ctx) {
@@ -3893,16 +4180,17 @@
   function renderSyslog(c, q, ctx) {
     c.append(h('div', { class: 'view-head' }, h('h1', null, 'Gateway syslog'),
       h('p', { class: 'muted' }, 'The AT&T gateway’s own log messages as this PC received them, kept in the syslog store within the limit you choose, the oldest deleted first. Every sealed chunk of messages is recorded in the evidence ledger with its SHA-256, and so is every deletion. Each message keeps the exact datagram; its time is when this PC received it.')));
+    const alerts = h('div', { class: 'conditions' });
     const statusArea = h('div');
     const store = syslogStorePanel();
-    let statusKey = null;
+    const panel = syslogPanel(ctx, false);
+    let none = null; // what the page says without a syslog status
     const update = (st) => {
+      fillAlerts(alerts, st, SYSLOG_ALERTS);
       store.update(st);
-      const key = JSON.stringify([st.syslog || null, st.local_link ? st.local_link.local_ip : null]);
-      if (key === statusKey) return;
-      statusKey = key;
-      replace(statusArea, syslogCard(st, false) ||
-        callout('info', 'This monitor reports no syslog receiver: the messages below are the ones the syslog store holds.'));
+      const card = panel.update(st);
+      if (!card && !none) none = callout('info', 'This monitor reports no syslog receiver: the messages below are the ones the syslog store holds.');
+      placeChildren(statusArea, card || none);
     };
     ctx.onStatus = update;
     if (app.status) update(app.status);
@@ -3921,7 +4209,7 @@
       field('Severity', sev), search,
       h('button', { type: 'submit', class: 'btn' }, 'Refresh'));
     const out = h('section', { class: 'card', 'aria-labelledby': 'syslog-list-h' });
-    c.append(statusArea, store.el, form, out);
+    c.append(alerts, statusArea, store.el, form, out);
     const browser = syslogBrowser(out, ctx, {
       heading: 'Messages', headingId: 'syslog-list-h',
       empty: () => (sev.value || text.value.trim() ? 'No syslog message received in this period matches the filters.' : 'No syslog messages were received in this period.'),

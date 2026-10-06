@@ -430,6 +430,10 @@ func TestErrorSentinelMapping(t *testing.T) {
 			func(hs *harness) *httptest.ResponseRecorder {
 				return hs.post("/api/gateway/notification", `{"enabled":false}`)
 			}},
+		{"gateway syslog", func(hs *harness, err error) { hs.syslogCtl.gwErr = err },
+			func(hs *harness) *httptest.ResponseRecorder {
+				return hs.post("/api/gateway/syslog", `{"enabled":true}`)
+			}},
 		{"trust-cert", func(hs *harness, err error) { hs.actions.trustErr = err },
 			func(hs *harness) *httptest.ResponseRecorder { return hs.post(trustURL, `{}`) }},
 		{"anchor", func(hs *harness, err error) { hs.actions.anchorErr = err },

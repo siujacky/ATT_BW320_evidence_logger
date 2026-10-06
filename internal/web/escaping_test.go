@@ -286,13 +286,18 @@ type dashboardView struct {
 	Requests int            `json:"requests"` // requests the page had made when the view was captured
 	Timers   int            `json:"timers"`   // timers of a second or more waiting (the flow meter's next reading)
 	Live     []string       `json:"live"`     // the view's live regions, "<aria-live>:<class>"
+	// Focus is where the keyboard focus is: "body" (the start of the page, where a browser puts
+	// it when the element that had it is disabled, hidden or removed), or "<tag>:<its text>".
+	Focus string `json:"focus"`
 }
 
 // dashboardButton is one button of a rendered view.
 type dashboardButton struct {
 	Text     string `json:"text"`
 	Disabled bool   `json:"disabled"`
-	Shown    bool   `json:"shown"` // not inside a hidden element
+	// AriaDisabled: aria-disabled="true", announced as unavailable while it keeps the focus.
+	AriaDisabled bool `json:"ariaDisabled"`
+	Shown        bool `json:"shown"` // not inside a hidden element
 }
 
 // dashboardRow is one table row of a rendered view.
@@ -394,6 +399,62 @@ fetch('http://evil.example/x').catch(() => {});
 		if !slices.ContainsFunc(rep.Violations, func(v string) bool { return strings.Contains(v, want) }) {
 			t.Errorf("the harness did not report %q; violations: %q", want, rep.Violations)
 		}
+	}
+}
+
+// TestDashboardHarnessModelsFocus: the harness keeps the keyboard focus as a browser does, so
+// that a control which sends it back to the start of the page is noticed: an element takes it
+// only when it can (a button, or an element with a tabindex; shown and not disabled), loses it
+// to the body as soon as it is disabled, hidden or taken out of the page, keeps it while it is
+// only aria-disabled, and gets it back when a modal dialog it opened closes.
+func TestDashboardHarnessModelsFocus(t *testing.T) {
+	requireNode(t)
+	script := `'use strict';
+const view = document.getElementById('view');
+const say = (s) => view.append(document.createTextNode(s + ';'));
+const on = () => { const e = document.activeElement; return e === document.body ? 'body' : e.textContent || e.localName; };
+const b = document.createElement('button');
+b.textContent = 'B';
+const d = document.createElement('div');
+view.append(b, d);
+say('start ' + on());
+b.focus(); say('focus ' + on());
+b.disabled = true; say('disabled ' + on());
+b.disabled = false; b.focus(); b.hidden = true; say('hidden ' + on());
+b.hidden = false; b.focus(); view.hidden = true; say('inside hidden ' + on());
+view.hidden = false; b.focus(); b.setAttribute('aria-disabled', 'true'); say('aria-disabled ' + on());
+d.focus(); say('div ' + on());
+d.setAttribute('tabindex', '-1'); d.focus(); say('div tabindex ' + on());
+b.focus(); view.append(b); say('moved ' + on());
+b.focus();
+const dlg = document.createElement('dialog');
+const ok = document.createElement('button');
+ok.textContent = 'OK';
+dlg.append(ok);
+document.body.append(dlg);
+dlg.showModal(); ok.focus(); say('dialog ' + on());
+dlg.close('ok'); dlg.remove(); say('closed ' + on());
+b.focus(); document.body.append(dlg); dlg.showModal(); ok.focus(); b.disabled = true; dlg.close('ok'); dlg.remove(); say('closed, opener disabled ' + on());
+b.disabled = false; b.focus(); b.remove(); say('removed ' + on());
+`
+	mux := http.NewServeMux()
+	mux.HandleFunc("/static/app.js", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/javascript")
+		w.Write([]byte(script))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	rep := runHarness(t, srv.URL, "overview")
+	for _, e := range rep.Errors {
+		t.Errorf("script error: %s", e)
+	}
+	want := "start body;focus B;disabled body;hidden body;inside hidden body;aria-disabled B;div B;div tabindex div;moved body;" +
+		"dialog OK;closed B;closed, opener disabled body;removed body;"
+	if got := rep.Views["overview"].Text; got != want {
+		t.Errorf("focus as the harness keeps it:\n got %s\nwant %s", got, want)
+	}
+	if got := rep.Views["overview"].Focus; got != "body" {
+		t.Errorf("the view reports the focus on %q, want body", got)
 	}
 }
 
@@ -538,7 +599,7 @@ func TestDashboardCertificateAndAccountingViews(t *testing.T) {
 	contains("overview",
 		"Gateway TLS certificate changed — authenticated actions paused",
 		"Status pages are still read and recorded",
-		"authenticated actions — checking or changing the outage-redirect setting — are paused",
+		"authenticated actions — checking or changing the gateway’s outage-redirect and Syslog settings — are paused",
 		"Pinned until now: "+groupFP(demoCertSHA), "Presented now: "+groupFP(demoNewCertSHA),
 		"Since ", "evidence record #"+certSeq,
 		"Trust the new certificate",

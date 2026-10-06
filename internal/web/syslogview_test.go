@@ -38,17 +38,24 @@ func TestDashboardShowsSyslogAndTraffic(t *testing.T) {
 	bs := string(rune(0x5c)) // a backslash: escapes are shown as typed
 
 	// The Overview card: the receiver, its counters, how much the store holds, the last
-	// message, the gateway's setting and the record of its latest check; this version only
-	// reads the setting, and says so.
+	// message, the gateway's setting and the record of its latest check, and that att-monitor
+	// keeps it sending here (gateway.enforce_syslog), with the control that stops it.
 	w.mu.Lock()
 	checkSeq := w.syslogCheck.Seq
 	w.mu.Unlock()
 	contains("overview", "Gateway syslog", "Receiverlistening on UDP 0.0.0.0:514", " received · ", " stored · 0 dropped · 7 from other senders",
-		"Gateway settingon sends to 192.168.1.71:514 (this PC) · level Informational", "record #"+strconv.FormatUint(checkSeq, 10),
-		"att-monitor reads this setting in its daily settings check and within 10 minutes after the service starts (att-monitor stop, then start); it does not change it yet.")
+		"Gateway settingon sends to 192.168.1.71:514 (this PC) · level Notice", "record #"+strconv.FormatUint(checkSeq, 10),
+		"Kept by att-monitoryes on, sending to 192.168.1.71:514 · level Notice",
+		"att-monitor keeps the gateway sending its log to this PC: it reads the setting in its daily settings check (also within 10 minutes after "+
+			"the service starts and after this PC’s address changes), sets it again whenever it differs, and records every reading and change with the gateway’s page.")
 	ov := rep.Views["overview"]
-	if strings.Contains(ov.Text, "turn Syslog on") {
-		t.Error("the card says how to turn on what the gateway already does")
+	for _, s := range []string{"To set it on the gateway itself", "does not change it"} {
+		if strings.Contains(ov.Text, s) {
+			t.Errorf("the card says %q while att-monitor keeps the gateway sending here", s)
+		}
+	}
+	if s, o := buttonState(ov, sendButton), buttonState(ov, stopButton); s != "hidden" || o != "shown" {
+		t.Errorf("the card's control: send %q, stop %q", s, o)
 	}
 	if !regexp.MustCompile(`Stored\d+\.\d KiB of 100 MiB usedoldest message `).MatchString(ov.Text) {
 		t.Error("the Overview's syslog card does not say how much the store holds")
@@ -411,28 +418,48 @@ func TestDashboardWithoutSyslogStoreOrFlowMeter(t *testing.T) {
 	}
 }
 
-// The card's other states, as the monitor reports them (Status.syslog).
+// The card's other states, as the monitor reports them (Status.syslog), and the changes its
+// control offers in each. The setting is read once a day, so a change made on the gateway
+// itself shows only at the next read while its messages show at once: once messages have
+// arrived since the read, the card says so. The card says how to set the gateway by hand only
+// while the gateway does not send here and att-monitor cannot set it (setting it failed or
+// cannot be done); while the setting is merely not kept, its control is the way.
 func TestDashboardSyslogCardStates(t *testing.T) {
 	requireNode(t)
-	// The setting is read once a day: while it says off, the card tells how to set it by hand,
-	// until messages arrive (they show at once that the gateway was set; the setting shown is
-	// read again only later).
-	reads := "att-monitor reads this setting in its daily settings check and within 10 minutes after the service starts (att-monitor stop, then start); it does not change it yet."
+	const (
+		notKept = "att-monitor does not keep this setting (gateway.enforce_syslog is off): it only reads it in its daily settings check (also within 10 " +
+			"minutes after the service starts and after this PC’s address changes) and records every reading. “Send the gateway’s log to this PC” sets it and keeps it so."
+		kept    = "att-monitor keeps the gateway sending its log to this PC: it reads the setting in its daily settings check"
+		byHand  = "To set it on the gateway itself: open its Diagnostics › Syslog page, set Syslog to On (the page then enables its other fields), enter Server IP Address 192.168.1.71 and Server Port 514, and save: its messages then show here within a minute."
+		arrived = "Messages have arrived since this setting was read, so it may have been changed on the gateway since. "
+		next    = "It is set again at the next check, or now with “Send the gateway’s log to this PC”."
+	)
 	for state, want := range map[string]struct {
-		view  string
-		texts []string
+		view       string
+		texts      []string
+		hand       bool   // the card says how to set the gateway by hand
+		send, stop string // how the control offers the changes (buttonState)
 	}{
 		"offquiet": {"overview", []string{"Gateway settingoff the gateway sends no syslog messages", "Last messagenone since the service started",
-			"To receive the gateway’s log, turn Syslog on in the gateway’s Diagnostics › Syslog page with server 192.168.1.71 and port 514: its messages then show here within a minute. " + reads}},
-		"off": {"overview", []string{"Gateway settingoff the gateway sends no syslog messages",
-			"Messages have arrived since this setting was read, so it may have been changed on the gateway since. " + reads}},
-		"elsewhere": {"overview", []string{"Gateway settingsends elsewhere to 192.168.1.20:1514 · level Debug, not to this PC"}},
-		"error":     {"overview", []string{"could not be read gateway: login throttled", "Last read: on, sends to 192.168.1.71:514 · level Informational"}},
-		"unknown":   {"overview", []string{"Gateway settingnot read yet", "the daily settings check has not read the gateway's Syslog page yet"}},
-		"enforce":   {"overview", []string{"att-monitor keeps the gateway sending its log to 192.168.1.71:514"}},
-		"nolisten":  {"overview", []string{"Receivernot listening listen udp 0.0.0.0:514: bind: Only one usage of each socket address"}},
-		"disabled":  {"overview", []string{"Receiveroff turned off in the configuration (syslog.enabled)"}},
-		"nostore":   {"syslog", []string{"This monitor reports no syslog store, so how much is kept cannot be shown or changed here."}},
+			"Kept by att-monitorno att-monitor only reads this setting", notKept}, false, "shown", "hidden"},
+		"off": {"overview", []string{"Gateway settingoff the gateway sends no syslog messages", arrived + notKept}, false, "shown", "hidden"},
+		"elsewhere": {"overview", []string{"Gateway settingsends elsewhere to 192.168.1.20:1514 · level Warning, not to this PC", "Kept by att-monitorno", notKept},
+			false, "shown", "shown"},
+		"manual": {"overview", []string{"Gateway settingon sends to 192.168.1.71:514 (this PC)", "Kept by att-monitorno", notKept}, false, "shown", "shown"},
+		"pending": {"overview", []string{"Gateway settingoff the gateway sends no syslog messages", "Kept by att-monitoryes on, sending to 192.168.1.71:514 · level Notice",
+			kept, next}, false, "shown", "shown"},
+		// The latest check failed, but messages arrive: no instructions.
+		"error": {"overview", []string{"Gateway settingcheck failed the latest settings check could not read the gateway's Syslog page: gateway: login throttled",
+			"Last read: on, sends to 192.168.1.71:514 · level Notice", kept}, false, "shown", "shown"},
+		// The latest check failed, and nothing arrived since the service started: instructions.
+		"errorquiet": {"overview", []string{"Gateway settingcheck failed the latest settings check could not read the gateway's Syslog page", kept},
+			true, "shown", "shown"},
+		"unknown": {"overview", []string{"Gateway settingnot read yet", "the gateway's Syslog setting has not been read yet", kept}, false, "shown", "shown"},
+		"notarget": {"overview", []string{"Kept by att-monitoryes on, sending to this PC (its address toward the gateway is not known yet)", kept},
+			false, "shown", "shown"},
+		"nolisten": {"overview", []string{"Receivernot listening listen udp 0.0.0.0:514: bind: Only one usage of each socket address"}, false, "hidden", "shown"},
+		"disabled": {"overview", []string{"Receiveroff turned off in the configuration (syslog.enabled)"}, false, "hidden", "shown"},
+		"nostore":  {"syslog", []string{"This monitor reports no syslog store, so how much is kept cannot be shown or changed here."}, false, "hidden", "shown"},
 	} {
 		t.Run(state, func(t *testing.T) {
 			w := newDemoWorld(time.Now())
@@ -443,6 +470,18 @@ func TestDashboardSyslogCardStates(t *testing.T) {
 			viewChecker(t, rep)(want.view, want.texts...)
 			if state == "nostore" && strings.Contains(rep.Views["overview"].Text, "Stored") {
 				t.Error("the Overview's card shows a store the monitor does not report")
+			}
+			for _, view := range []string{"overview", "syslog"} {
+				v := rep.Views[view]
+				if hand := strings.Contains(v.Text, byHand); hand != want.hand {
+					t.Errorf("%s: says how to set the gateway by hand: %v, want %v", view, hand, want.hand)
+				}
+				if s, o := buttonState(v, sendButton), buttonState(v, stopButton); s != want.send || o != want.stop {
+					t.Errorf("%s: send %q, stop %q; want %q, %q", view, s, o, want.send, want.stop)
+				}
+				if strings.Contains(v.Text, "does not change it yet") {
+					t.Errorf("%s says that att-monitor does not change the setting", view)
+				}
 			}
 		})
 	}

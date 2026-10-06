@@ -504,6 +504,11 @@ details.syslog-raw[open] > summary { margin-bottom: 6px; }
 .store-usage p { margin: 0; }
 .form.retention { max-width: 640px; }
 
+/* the gateway's Syslog setting (syslog cards): why it cannot be changed now, the buttons, the outcome */
+.syslog-control { margin-top: 12px; }
+.syslog-control p { margin: 0 0 8px; }
+.syslog-control > div:first-child > .notice { margin: 0 0 8px; }
+
 /* traffic chart: MRTG's legend under the plot */
 .mrtg { margin-top: 10px; }
 .mrtg table.tbl { width: auto; min-width: min(100%, 520px); }

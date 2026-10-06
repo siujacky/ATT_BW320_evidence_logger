@@ -901,6 +901,17 @@ func (f *pageForm) fields(label string) []formField {
 // isRadioGroup reports whether the field is a radio button group.
 func (fd formField) isRadioGroup() bool { return fd.controls[0].isRadio() }
 
+// disabled reports whether a person cannot change the field: its control is disabled, or every
+// button of its radio group.
+func (fd formField) disabled() bool {
+	for _, c := range fd.controls {
+		if !c.disabled {
+			return false
+		}
+	}
+	return true
+}
+
 // kind describes the field's control for messages ("checkbox", "drop-down list", "radio
 // buttons", "text input", ...).
 func (fd formField) kind() string {

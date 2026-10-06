@@ -21,8 +21,8 @@ service continuously:
 | 60 s | the PC's own link (Wi-Fi signal/BSSID/channel or Ethernet speed) | rules local link problems in or out |
 | outage start/end | traceroutes | shows where the path stops |
 | hourly | SNTP clock offsets (and the gateway's own clock every minute) | shows how far this PC's clock was from internet time (the RFC 3161 time-stamps below are what bound every record's time) |
-| as it arrives | the gateway's own log messages (syslog), once the gateway is set to send them to the PC: every datagram from the gateway's address, exactly as received, with the PC's receive time | the gateway's own account of events, kept as supporting evidence (it never changes a verdict) |
-| daily | the gateway's Syslog setting (read only) | shows whether, and where, the gateway was sending its log |
+| as it arrives | the gateway's own log messages (syslog), which the monitor has the gateway send to the PC: every datagram from the gateway's address, exactly as received, with the PC's receive time | the gateway's own account of events, kept as supporting evidence (it never changes a verdict) |
+| daily, and after the PC's address changes | the gateway's Syslog setting: every reading with the page, and every change the monitor or the operator made to it (to keep it sending to the PC, or to stop it) with the pages before and after; failed attempts too | shows whether, and where, the gateway was sending its log, and who changed that and when |
 
 Every gateway page fetch records the page's SHA-256 and the values parsed from it. The page itself is
 stored **byte-for-byte** whenever a decisive value changes (WAN/PON state, optical alarm flags, WAN IP,

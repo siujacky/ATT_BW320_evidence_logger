@@ -298,6 +298,7 @@ func (m *Monitor) checkLocalLink(ctx context.Context, force bool) {
 		prevAt   time.Time
 		incident bool
 		movedIP  string // this computer's address toward the gateway changed from it
+		foundIP  bool   // the gateway's Syslog page waits for this computer's address, known now
 	)
 	m.locked(func() {
 		prev, prevAt = m.st.lastLinkRec, m.st.lastLinkRecAt
@@ -313,12 +314,22 @@ func (m *Monitor) checkLocalLink(ctx context.Context, force bool) {
 			if m.st.localIP != "" && ip != m.st.localIP {
 				movedIP = m.st.localIP
 			}
+			foundIP = m.st.syslogNeedAddr && usableIPv4(ip) != ""
+			if foundIP {
+				m.st.syslogNeedAddr = false
+			}
 			m.st.localIP = ip
 		}
 	})
-	if movedIP != "" {
-		// The gateway's Syslog setting names the address it sends to: it is read again soon.
+	switch {
+	case movedIP != "":
+		// The gateway's Syslog setting names the address it sends to: it is read (and with
+		// gateway.enforce_syslog set) again soon.
 		m.log.Info("this computer's address toward the gateway changed", "from", movedIP, "to", view.LocalIP)
+		m.kNotif.kick(kickAddressChange)
+	case foundIP:
+		// The latest settings check could not set the gateway's Syslog page without it.
+		m.log.Info("this computer's address toward the gateway is known now", "addr", view.LocalIP)
 		m.kNotif.kick(kickAddressChange)
 	}
 	fresh := m.set.incident.SnapshotFreshness.Duration

@@ -23,7 +23,8 @@
 // ErrUnavailable 503, ErrNotRecorded 500 ("applied but could not be recorded"),
 // ErrLedgerBroken 503 (nothing can be recorded until the service restarts), and the gateway
 // sentinels to 409/502/503 with an explanation the operator can act on. A feature the monitor
-// does not offer at all (the syslog store, its retention control, the flow meter) answers 404.
+// does not offer at all (the syslog store, the syslog control - its retention and the gateway's
+// Syslog setting - and the flow meter) answers 404.
 package web
 
 import (
@@ -103,7 +104,8 @@ type Options struct {
 	Exporter contracts.Exporter
 	// SyslogReader reads the syslog store (GET /api/syslog); its messages are linked to their
 	// syslog_chunk records through Reader. SyslogControl changes how much of it is kept (POST
-	// /api/syslog/retention). LiveTraffic is the flow meter (GET /api/traffic/live).
+	// /api/syslog/retention) and the gateway's Syslog setting (POST /api/gateway/syslog).
+	// LiveTraffic is the flow meter (GET /api/traffic/live).
 	SyslogReader  contracts.SyslogReader
 	SyslogControl contracts.SyslogControl
 	LiveTraffic   contracts.LiveTrafficSource
@@ -133,9 +135,9 @@ type Server struct {
 	index   staticFile            // index.html with the version filled in
 
 	// Long-running operations are single-flight: a second request gets 409. gatewayMu covers
-	// every operator action on the gateway's authenticated side (the notification setting and
-	// confirming a changed certificate): one at a time. syslogMu covers changes of the syslog
-	// retention (they delete what no longer fits).
+	// every operator action on the gateway's authenticated side (the notification setting, the
+	// Syslog setting and confirming a changed certificate): one at a time. syslogMu covers
+	// changes of the syslog retention (they delete what no longer fits).
 	verifyMu  sync.Mutex
 	exportMu  sync.Mutex
 	anchorMu  sync.Mutex
@@ -509,6 +511,7 @@ func (s *Server) routes() http.Handler {
 	rt.handle(http.MethodGet, "/api/exports/{name}", s.handleExportDownload)
 	rt.handle(http.MethodPost, "/api/notes", s.handleNote)
 	rt.handle(http.MethodPost, "/api/gateway/notification", s.handleNotification)
+	rt.handle(http.MethodPost, "/api/gateway/syslog", s.handleGatewaySyslog)
 	rt.handle(http.MethodPost, "/api/gateway/trust-cert", s.handleTrustCert)
 	rt.handle(http.MethodPost, "/api/anchor", s.handleAnchor)
 

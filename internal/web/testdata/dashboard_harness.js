@@ -10,12 +10,19 @@
  *
  * Scenarios: "hostile" (every remote string carries the marker), "cert" (a changed gateway
  * certificate is waiting for confirmation; the harness looks at the Gateway page, then confirms
- * it through the dialog on the overview), "overview" (the overview and the Syslog page only) and
+ * it through the dialog on the overview), "overview" (the overview and the Syslog page only),
  * "syslog" (the flow meter's polling while the overview is shown, hidden and left, then the
- * Syslog page's retention form); any other name visits every view.
+ * Syslog page's retention form), "gwsyslog" (the control of the gateway's Syslog setting on the
+ * Syslog page and the overview) and "gwsyslogon" / "gwsyslogoff" (one change of that setting on
+ * the Syslog page); any other name visits every view.
  *
  * Timers of a second or more (the flow meter's polling) do not run by themselves: the harness
  * fires them (fireLongTimers), so that a test sees exactly which requests a poll makes.
+ *
+ * The keyboard focus is kept as a browser keeps it (document.activeElement; see "focus" below):
+ * the harness presses a button as a keyboard user does, with the focus on it, and every view
+ * says where the focus is, so that a test can tell when a control sends it back to the start of
+ * the page.
  *
  * The fake DOM has no HTML parser: assigning innerHTML/outerHTML, insertAdjacentHTML and
  * document.write are recorded as violations. After every step the whole document is checked:
@@ -48,8 +55,50 @@ function guard(what, fn) {
 
 // ------------------------------------------------------------------ fake DOM
 
+/** taken calls the onTaken hook of a node taken from its parent (removed, moved, or its
+ *  parent's content replaced): a scenario sets it on a node that must stay where it is. */
+function taken(n) {
+  if (typeof n.onTaken === 'function') n.onTaken();
+}
+
 const HTMLNS = 'http://www.w3.org/1999/xhtml';
 const SVGNS = 'http://www.w3.org/2000/svg';
+
+// ------------------------------------------------------------------ focus
+
+// focused is the element with the keyboard focus (null: the body, the start of the page).
+let focused = null;
+
+// The elements that take the focus without a tabindex, and those of them a disabled attribute
+// takes it from.
+const FOCUSABLE = new Set(['button', 'input', 'select', 'textarea', 'summary']);
+const DISABLEABLE = new Set(['button', 'input', 'select', 'textarea']);
+
+/** rendered reports whether e is shown: in the document, and neither inside a hidden element
+ *  nor inside a closed dialog. */
+function rendered(e) {
+  if (!document.contains(e)) return false;
+  for (let x = e; x; x = x.parentElement) {
+    if (x.hasAttribute('hidden') || (x.localName === 'dialog' && !x.hasAttribute('open'))) return false;
+  }
+  return true;
+}
+
+/** canFocus reports whether e can have the keyboard focus, as a browser decides it. */
+function canFocus(e) {
+  if (!(e instanceof FakeElement) || !rendered(e)) return false;
+  if (DISABLEABLE.has(e.localName) && e.hasAttribute('disabled')) return false;
+  return FOCUSABLE.has(e.localName) || (e.localName === 'a' && e.hasAttribute('href')) || e.hasAttribute('tabindex');
+}
+
+/** fixFocus is a browser's focus fixup rule: the element with the focus loses it to the body when
+ *  it is disabled, hidden or taken out of the document (moving a node takes it out). It runs
+ *  after every change of an attribute or of the tree, which is stricter than a browser (that
+ *  runs it at its next style or rendering update) only for a change undone within one task; a
+ *  control that waits for an answer from the network meets that update first. */
+function fixFocus() {
+  if (focused && !canFocus(focused)) focused = null;
+}
 
 class FakeEvent {
   constructor(type, init) {
@@ -73,8 +122,12 @@ class FakeNode {
   get lastChild() { return this.childNodes[this.childNodes.length - 1] || null; }
   get textContent() { return this.childNodes.map((n) => n.textContent).join(''); }
   set textContent(v) {
-    for (const n of this.childNodes) n.parentNode = null;
+    for (const n of this.childNodes) {
+      n.parentNode = null;
+      taken(n);
+    }
     this.childNodes = [];
+    fixFocus();
     const t = v == null ? '' : String(v);
     if (t !== '') this.appendChild(new FakeText(t));
   }
@@ -91,6 +144,8 @@ class FakeNode {
     if (i < 0) throw new Error('removeChild: not a child');
     this.childNodes.splice(i, 1);
     n.parentNode = null;
+    taken(n);
+    fixFocus();
     return n;
   }
   insertBefore(n, ref) {
@@ -164,13 +219,19 @@ class FakeElement extends FakeNode {
       contains(c) { return el.className.split(/\s+/).includes(c); },
     };
   }
-  setAttribute(name, value) { this.attrs.set(String(name).toLowerCase(), String(value)); }
+  setAttribute(name, value) {
+    this.attrs.set(String(name).toLowerCase(), String(value));
+    fixFocus();
+  }
   getAttribute(name) {
     const v = this.attrs.get(String(name).toLowerCase());
     return v === undefined ? null : v;
   }
   hasAttribute(name) { return this.attrs.has(String(name).toLowerCase()); }
-  removeAttribute(name) { this.attrs.delete(String(name).toLowerCase()); }
+  removeAttribute(name) {
+    this.attrs.delete(String(name).toLowerCase());
+    fixFocus();
+  }
   get id() { return this.getAttribute('id') || ''; }
   set id(v) { this.setAttribute('id', v); }
   get className() { return this.getAttribute('class') || ''; }
@@ -188,14 +249,31 @@ class FakeElement extends FakeNode {
   get offsetWidth() { return 160; }
   get offsetHeight() { return 40; }
   getBoundingClientRect() { return { left: 0, top: 0, right: 800, bottom: 240, width: 800, height: 240, x: 0, y: 0 }; }
-  focus() { this.dispatchEvent(new FakeEvent('focus')); }
-  blur() { this.dispatchEvent(new FakeEvent('blur')); }
+  // focus moves the keyboard focus here when this element can take it (canFocus); a browser
+  // leaves it where it is otherwise. The focus and blur events are dispatched as before, either
+  // way: the charts' keyboard handling is exercised through them.
+  focus() {
+    if (canFocus(this)) focused = this;
+    this.dispatchEvent(new FakeEvent('focus'));
+  }
+  blur() {
+    if (focused === this) focused = null;
+    this.dispatchEvent(new FakeEvent('blur'));
+  }
   click() { this.dispatchEvent(new FakeEvent('click')); }
   scrollIntoView() {}
-  showModal() { this.open = true; }
+  showModal() {
+    this.previouslyFocused = focused;
+    this.open = true;
+  }
+  // close closes a dialog as a browser does: the element that had the focus when the modal
+  // dialog opened (the button that opened it) gets it back, then the close event.
   close(rv) {
     if (rv !== undefined) this.returnValue = rv;
     this.open = false;
+    const prev = this.previouslyFocused;
+    this.previouslyFocused = null;
+    if (prev && canFocus(prev)) prev.focus();
     this.dispatchEvent(new FakeEvent('close'));
   }
   matches(sel) { return matches(this, sel); }
@@ -231,6 +309,10 @@ class FakeDocument extends FakeNode {
     this.head = new FakeElement('head');
     this.body = new FakeElement('body');
     this.documentElement.append(this.head, this.body);
+  }
+  get activeElement() {
+    fixFocus();
+    return focused || this.body;
   }
   createElement(tag) { return new FakeElement(tag, HTMLNS); }
   createElementNS(ns, tag) { return new FakeElement(tag, ns); }
@@ -480,6 +562,13 @@ function shownEl(e) {
   return true;
 }
 
+/** focusOf describes the element with the keyboard focus: "body" (the start of the page), or
+ *  "<tag>:<its text>". */
+function focusOf() {
+  const e = document.activeElement;
+  return e === document.body ? 'body' : e.localName + ':' + e.textContent.trim().slice(0, 300);
+}
+
 /** chipOf describes a status chip as "<tone>:<label>" (e.g. "critical:NXDOMAIN"). */
 function chipOf(c) {
   const m = /(?:^|\s)tone-([\w-]+)/.exec(c.className);
@@ -499,7 +588,11 @@ function capture(name) {
     title: document.title,
     hero: hero ? hero.textContent : '',
     markers,
-    buttons: view().querySelectorAll('button').map((b) => ({ text: b.textContent.trim(), disabled: b.disabled, shown: shownEl(b) })),
+    buttons: view().querySelectorAll('button').map((b) => ({
+      text: b.textContent.trim(), disabled: b.disabled, ariaDisabled: b.getAttribute('aria-disabled') === 'true', shown: shownEl(b),
+    })),
+    // Where the keyboard focus is (focusOf).
+    focus: focusOf(),
     // Every table row with the status chips it shows, so that a test can tell a red chip
     // from a green one (the text alone cannot).
     rows: view().querySelectorAll('tr').map((tr) => ({ text: tr.textContent, chips: tr.querySelectorAll('.chip').map(chipOf) })),
@@ -557,13 +650,19 @@ async function press(text) {
     errors.push('button "' + text + '" is disabled');
     return false;
   }
+  if (!shownEl(b)) {
+    errors.push('button "' + text + '" is hidden');
+    return false;
+  }
+  b.focus(); // as a keyboard user is on the button they press (and a browser focuses a button it clicks)
   b.click();
   await settle();
   return true;
 }
 
-/** answerDialog records the open dialog's text and closes it with OK or Cancel. */
-async function answerDialog(ok, fill) {
+/** answerDialog records the open dialog's text and closes it with OK or Cancel. With running,
+ *  what the answer starts is not waited for: the page is as it shows the action in progress. */
+async function answerDialog(ok, fill, running) {
   const dlg = document.querySelector('dialog');
   if (!dlg) {
     errors.push('no dialog is open');
@@ -573,6 +672,14 @@ async function answerDialog(ok, fill) {
   dialogs.push(dlg.textContent);
   checkDocument('dialog');
   dlg.close(ok ? 'ok' : 'cancel');
+  if (running) await tick(30);
+  else await settle();
+}
+
+/** refresh runs the page's periodic work once - the status refresh every 10 s and the view's
+ *  own (the Overview's recent incidents): intervals never fire by themselves. */
+async function refresh() {
+  for (const fn of intervals.slice()) if (fn) guard('interval', fn);
   await settle();
 }
 
@@ -664,6 +771,44 @@ async function syslogScenario() {
   capture('syslog retention refused');
 }
 
+/** gwSyslogScenario: the control of the gateway's Syslog setting, on the Syslog page and on the
+ *  Overview, used from the keyboard. "Stop sending" is confirmed and runs (captured while it
+ *  runs - pressed again meanwhile, it must do nothing -, then when it is done); "Send the
+ *  gateway’s log to this PC" is cancelled in its dialog (nothing is sent), then confirmed. On
+ *  the Overview the syslog card's control stops the sending again, and stays where it is, with
+ *  its outcome, when the status refresh rebuilds the cards around it. */
+async function gwSyslogScenario() {
+  await visit('#/syslog');
+  capture('syslog');
+  if (await press('Stop sending')) {
+    await answerDialog(true, null, true);
+    capture('syslog stopping');
+    const again = button('Stop sending');
+    if (again) again.click();
+    if (document.querySelector('dialog')) {
+      errors.push('"Stop sending", pressed while its change runs, opened a dialog');
+      await answerDialog(false, null, true);
+    }
+    await settle();
+  }
+  capture('syslog stopped');
+  if (await press('Send the gateway’s log to this PC')) await answerDialog(false);
+  capture('syslog cancelled');
+  if (await press('Send the gateway’s log to this PC')) await answerDialog(true);
+  capture('syslog sending');
+  await visit('#/');
+  capture('overview sending');
+  const ctl = view().querySelector('.syslog-control');
+  const card = ctl && ctl.closest('section');
+  let moved = 0;
+  if (card) card.onTaken = () => { moved++; };
+  if (await press('Stop sending')) await answerDialog(true);
+  await refresh();
+  if (!ctl || view().querySelector('.syslog-control') !== ctl) errors.push('the status refresh rebuilt the syslog control on the Overview');
+  if (moved) errors.push('the status refresh took the syslog card out of the Overview ' + moved + ' times (it loses the focus, and its live region is announced again)');
+  capture('overview stopped');
+}
+
 async function run() {
   const res = await fetch(new URL('/static/app.js', base));
   const code = await res.text();
@@ -681,6 +826,18 @@ async function run() {
   }
   if (scenario === 'syslog') {
     await syslogScenario();
+    return;
+  }
+  if (scenario === 'gwsyslog') {
+    await gwSyslogScenario();
+    return;
+  }
+  // gwsyslogon / gwsyslogoff: one change of the gateway's Syslog setting on the Syslog page.
+  if (scenario === 'gwsyslogon' || scenario === 'gwsyslogoff') {
+    await visit('#/syslog');
+    capture('syslog');
+    if (await press(scenario === 'gwsyslogon' ? 'Send the gateway’s log to this PC' : 'Stop sending')) await answerDialog(true);
+    capture('syslog changed');
     return;
   }
   // The charts over 7 days (the range is remembered: back to 24 hours afterwards).

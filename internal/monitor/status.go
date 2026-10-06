@@ -19,6 +19,7 @@ func (m *Monitor) Status() model.Status {
 	probes := m.displaySpecs()
 	pinned, pending := m.certPins()
 	hasCode := m.hasAccessCode()
+	enforceSyslog, syslogLevel := m.syslogConfig()
 	var mongo *model.MongoStatus
 	if f := m.opts.MongoStatus; f != nil {
 		ms := f()
@@ -131,8 +132,8 @@ func (m *Monitor) Status() model.Status {
 	if anchorsUntrusted(m.st.lastAnchor, m.st.lastUntrusted) {
 		s.Conditions = append(s.Conditions, anchorUntrustedCondition(m.st.lastUntrusted, m.st.untrustedSince))
 	}
-	s.Syslog = m.syslogStatusLocked(rxAddr, rxErr, usage, hasCode)
-	s.Conditions = append(s.Conditions, m.syslogConditionsLocked(rxAddr, rxErr)...)
+	s.Syslog = m.syslogStatusLocked(rxAddr, rxErr, usage, hasCode, enforceSyslog, syslogLevel)
+	s.Conditions = append(s.Conditions, m.syslogConditionsLocked(rxAddr, rxErr, now)...)
 	switch {
 	case !hasCode:
 		s.Conditions = append(s.Conditions, noAccessCodeCondition(""))

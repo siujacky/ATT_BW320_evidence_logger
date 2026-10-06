@@ -28,7 +28,9 @@ Usage:
   att-monitor run [--data DIR]                 run in the foreground (console mode)
   att-monitor set-access-code (--file PATH | --stdin) [--data DIR]
   att-monitor gateway notification [status|on|off] [--data DIR]
-  att-monitor gateway syslog [status] [--json] [--data DIR]   the gateway's Syslog setting, the receiver and the store
+  att-monitor gateway syslog [status|on|off] [--json] [--data DIR]
+                                               the gateway's Syslog setting, the receiver and the store; on: send
+                                               the gateway's log to this PC and keep it so, off: stop it
   att-monitor gateway trust-cert [--data DIR]  confirm a changed gateway certificate (after AT&T updates)
   att-monitor syslog [--since 24h] [--grep TEXT] [--severity LEVEL] [--limit N] [--json] [--data DIR]
                                                the gateway's syslog messages kept on this PC, oldest first

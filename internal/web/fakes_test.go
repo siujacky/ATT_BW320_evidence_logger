@@ -633,6 +633,22 @@ type fakeSyslogControl struct {
 	err    error
 	gate   chan struct{} // when non-nil, SetSyslogRetention waits for it
 	in     chan struct{} // signalled when SetSyslogRetention starts
+
+	// SetGatewaySyslog: the calls, and what it answers (gwChange as-is when set, or when gwErr
+	// is set); gwGate/gwIn as gate/in.
+	gwCalls  []gwSyslogCall
+	gwChange model.ConfigChange
+	gwErr    error
+	gwGate   chan struct{}
+	gwIn     chan struct{}
+}
+
+// gwSyslogCall is one SetGatewaySyslog call.
+type gwSyslogCall struct {
+	enabled  bool
+	actor    string
+	ctxErr   error         // ctx.Err() observed inside the call
+	deadline time.Duration // time left until the context's deadline (-1: none)
 }
 
 // SetSyslogRetention behaves like the monitor: it records a config_change of the setting.
@@ -664,6 +680,48 @@ func (f *fakeSyslogControl) callList() []retentionCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return slices.Clone(f.calls)
+}
+
+// SetGatewaySyslog behaves like the monitor: it sets the gateway's Syslog page - to send to
+// this computer when enabled, off otherwise - reads it back ("verified") and records the
+// config_change.
+func (f *fakeSyslogControl) SetGatewaySyslog(ctx context.Context, enabled bool, actor string) (model.ConfigChange, error) {
+	f.mu.Lock()
+	gate, in := f.gwGate, f.gwIn
+	f.mu.Unlock()
+	if in != nil {
+		in <- struct{}{}
+	}
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return model.ConfigChange{}, ctx.Err()
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	call := gwSyslogCall{enabled: enabled, actor: actor, ctxErr: ctx.Err(), deadline: -1}
+	if d, ok := ctx.Deadline(); ok {
+		call.deadline = time.Until(d)
+	}
+	f.gwCalls = append(f.gwCalls, call)
+	if f.gwErr != nil || f.gwChange != (model.ConfigChange{}) {
+		return f.gwChange, f.gwErr
+	}
+	on := "on -> 192.168.1.71:514, level Notice"
+	cc := model.ConfigChange{Target: "gateway", What: "syslog.ha (Syslog: on/off, Server IP Address, Server Port, Log Level)",
+		Before: "off", After: on, Actor: actor, Result: "verified"}
+	if !enabled {
+		cc.Before, cc.After = on, "off"
+	}
+	return cc, nil
+}
+
+func (f *fakeSyslogControl) gwCallList() []gwSyslogCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.gwCalls)
 }
 
 // ----------------------------------------------------------------------------- LiveTrafficSource
@@ -810,9 +868,4 @@ func wantJSONError(t *testing.T, rec *httptest.ResponseRecorder, code int) strin
 		t.Fatalf("empty error message: %s", rec.Body.String())
 	}
 	return e.Error
-}
-
-// SetGatewaySyslog: phase 2 of docs/syslog-snmp-traffic.md gives the fake its behaviour.
-func (f *fakeSyslogControl) SetGatewaySyslog(ctx context.Context, enabled bool, actor string) (model.ConfigChange, error) {
-	return model.ConfigChange{}, errors.New("not configured in this test")
 }

@@ -99,11 +99,12 @@ func IsLoginPage(body []byte) bool
 func SessionsFull(body []byte) bool
 func Derive(s *model.GatewaySnapshot, fetchedAt time.Time, loc *time.Location) model.GatewayDerived
 // Client.Syslog reads the Syslog page (authenticated, read-only); Client.SetSyslog changes only its
-// syslog controls, reads the page back and fails unless it shows the target. SetSyslog has no
-// caller in phase 1 (docs/syslog-snmp-traffic.md).
+// syslog controls - with the page's Update round first when the switch changes (firmware 6.34.7
+// disables the fields while Syslog is off), then the Save - reads the page back and fails unless it
+// shows the target. The monitor calls it to keep the page set (docs/syslog-snmp-traffic.md §3.1).
 ```
-Fixtures: `testdata/gateway/*.html` (sanitized real pages, see README there; the `syslog_*.html`
-pages are synthetic until the real page is captured).
+Fixtures: `testdata/gateway/*.html` (sanitized real pages, see README there: `syslog_real_off.html`
+is the real Syslog page; the pages derived from it, and the other `syslog_*.html`, are synthetic).
 
 ## internal/probe
 ```go
@@ -150,6 +151,10 @@ func New(opts Options) (*Monitor, error)
 func (m *Monitor) Run(ctx context.Context) error // writes monitor_start … monitor_stop
 func (m *Monitor) PowerEvent(kind string)        // from the service control handler
 func (m *Monitor) SetSyslogRetention(ctx context.Context, keepMB, keepDays int, actor string) (model.ConfigChange, error)
+// SetGatewaySyslog: the operator's choice for the gateway's Syslog page - saves and records
+// gateway.enforce_syslog, then reads, records and sets the page (to this computer, or off); the
+// daily settings check keeps it so while gateway.enforce_syslog (docs/DESIGN.md §18).
+func (m *Monitor) SetGatewaySyslog(ctx context.Context, enabled bool, actor string) (model.ConfigChange, error)
 func (m *Monitor) LiveTraffic(ctx context.Context) (model.LiveTraffic, error) // the flow meter, unrecorded
 // *Monitor implements contracts.StatusSource, contracts.Actions, contracts.SyslogControl and
 // contracts.LiveTrafficSource.
@@ -187,7 +192,7 @@ type Options struct {
     Exporter contracts.Exporter
     // Optional (nil: the endpoint answers 404 with a JSON error; the dashboard hides or explains it):
     SyslogReader  contracts.SyslogReader      // GET /api/syslog (entries linked to syslog_chunk records via Reader)
-    SyslogControl contracts.SyslogControl     // POST /api/syslog/retention
+    SyslogControl contracts.SyslogControl     // POST /api/syslog/retention, POST /api/gateway/syslog
     LiveTraffic   contracts.LiveTrafficSource // GET /api/traffic/live
     Version  string
     Logger   *slog.Logger
@@ -196,6 +201,9 @@ func New(opts Options) (*Server, error)
 func (s *Server) Handler() http.Handler
 func (s *Server) Run(ctx context.Context) error   // listen until ctx is done (graceful shutdown)
 type SyslogRetentionRequest struct { KeepMB *int; KeepDays *int; Client string } // keep_mb required; keep_days absent = 0
+type GatewaySyslogRequest struct { Enabled *bool; Client string } // POST /api/gateway/syslog: enabled required
+// POST /api/gateway/syslog shares the notification setting's guard (one authenticated gateway
+// operation at a time), its time limit (3 min, detached) and its error mapping ({error, change}).
 const DefaultSyslogLimit = 200; const MaxSyslogLimit = 5000                    // GET /api/syslog limit
 const MaxSyslogAnswerBytes = 16 << 20 // GET /api/syslog also ends its list before the message that would take its JSON beyond this
 const DefaultSyslogSpan = 24 * time.Hour; const MaxSyslogSpan = 31 * 24 * time.Hour
@@ -347,13 +355,14 @@ Defined in `internal/model/syslog.go`, `internal/contracts` and `internal/config
 contracts.SyslogReceiver    // Run, Drain, SetAllowed, Listening (syslogrx.Receiver)
 contracts.SyslogReader      // Query(ctx, from, to, match, limit), Usage, OpenChunk (syslogstore.Store)
 contracts.SyslogStore       // SyslogReader + Recover, Append, Seal, Prune, SetRetention (syslogstore.Store)
-contracts.SyslogControl     // SetSyslogRetention (monitor.Monitor)
+contracts.SyslogControl     // SetSyslogRetention, SetGatewaySyslog (monitor.Monitor)
 contracts.LiveTrafficSource // LiveTraffic (monitor.Monitor)
 contracts.Gateway           // + Syslog, SetSyslog (gateway.Client)
 model.TypeSyslogChunk / TypeSyslogPrune, model.SyslogChunk / SyslogPrune / SyslogChunkRef,
 model.SyslogMessage / SyslogEntry / SyslogList / SyslogUsage / SyslogStatus / SyslogSetting / SyslogTarget,
 model.TrafficPoint / TrafficDay / LiveTraffic / LivePoint, model.GwEvSyslogSetting
 config.SyslogConfig {Enabled, Listen, Port, Allow, FlushInterval, MaxPerMinute, KeepMB, KeepDays}
+config.GatewayConfig.EnforceSyslog (default true), SyslogLevel (default "")
 config.MinSyslogKeepMB, MaxSyslogKeepMB, MaxSyslogKeepDays; config.Paths.Syslog
 ```
 
@@ -366,4 +375,6 @@ The same store is `web.Options.SyslogReader`, `export.Options.Syslog` and
 `mongostore.Options.Syslog`; the monitor is `web.Options.SyslogControl` and `LiveTraffic`. A store
 that cannot be opened is logged and left out (never a typed nil in an interface). `install` sets up
 the Windows Firewall rule of the receiver (`netsh`, through a replaceable runner so tests never run
-it) and `uninstall` removes it.
+it) and `uninstall` removes it. `gateway syslog on|off` goes through `POST /api/gateway/syslog`, or
+with the service stopped through `Monitor.SetGatewaySyslog` after `strictGatewayTLS` (a replaceable
+function, so tests never reach a gateway).

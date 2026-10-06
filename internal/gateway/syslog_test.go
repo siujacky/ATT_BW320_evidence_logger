@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"html"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -20,11 +23,13 @@ import (
 
 // ---------------------------------------------------------------- fake gateway with a Syslog page
 
-// syslogVariant describes one synthetic Syslog page (testdata/gateway/syslog_*.html) for the
-// fake gateway: its fixtures and the names of its controls - which the client never uses: it
-// finds the controls by their labels.
+// syslogVariant describes one Syslog page (testdata/gateway/syslog_*.html) for the fake
+// gateway: its fixtures and the names of its controls - which the client never uses: it finds
+// the controls by their labels.
 type syslogVariant struct {
 	off, on             string // fixture shown while Syslog is off, and while on ("" = the same)
+	update              string // fixture the Update button answers with once on ("" = on)
+	offFields           bool   // the off fixture shows the fields too (disabled)
 	sw, swKind          string // the switch's name and kind: "select", "checkbox" or "radio"
 	swOn, swOff         string // the switch's values for on and off (select, radio)
 	server, port, level string // field names ("" = not on the page)
@@ -49,6 +54,10 @@ var (
 		server: "s_ip", level: "s_lvl"}
 	fewLevelsVariant = syslogVariant{off: "syslog_fewlevels.html", sw: "sys_en", swKind: "select", swOn: "1", swOff: "0",
 		server: "sys_ip", port: "sys_port", level: "sys_lvl"}
+	// The real page of firmware 6.34.7 and the pages derived from it (testdata/gateway/README.md):
+	// while Syslog is off the fields are shown but disabled.
+	realVariant = syslogVariant{off: "syslog_real_off.html", on: "syslog_real_on.html", update: "syslog_real_on_update.html",
+		offFields: true, sw: "syslog", swKind: "select", swOn: "on", swOff: "off", server: "location", port: "port", level: "level"}
 
 	// The settings the fixtures show (for the checkbox variant: what the page shows once on).
 	selectOff    = syslogState{false, "", "514", "4"}
@@ -56,15 +65,22 @@ var (
 	radioOff     = syslogState{false, "", "514", "warning"}
 	noPortOn     = syslogState{true, "192.168.1.64", "", "notice"}
 	fewLevelsOn  = syslogState{true, "192.168.1.64", "514", "5"}
+	realOff      = syslogState{false, "", "514", "Error"} // as captured
+	realOn       = syslogState{true, "192.168.1.71", "514", "Notice"}
 	enableTarget = model.SyslogTarget{Enabled: true, Server: "192.168.1.71", Port: 514, Level: "Informational"}
+	// The real page offers no "Informational": Notice is its most detailed level.
+	noticeTarget = model.SyslogTarget{Enabled: true, Server: "192.168.1.71", Port: 514, Level: "Notice"}
 )
 
-// render returns the variant's page showing st. Mismatches are reported with t.Errorf: it
-// runs in the server's goroutines.
-func (v syslogVariant) render(t testing.TB, st syslogState) []byte {
+// render returns the variant's page showing st; update asks for the page the Update button
+// answers with. Mismatches are reported with t.Errorf: it runs in the server's goroutines.
+func (v syslogVariant) render(t testing.TB, st syslogState, update bool) []byte {
 	name := v.off
 	if st.on && v.on != "" {
 		name = v.on
+		if update && v.update != "" {
+			name = v.update
+		}
 	}
 	page := fixture(t, name)
 	sw := v.swOff
@@ -79,7 +95,7 @@ func (v syslogVariant) render(t testing.TB, st syslogState) []byte {
 	case "radio":
 		page = chooseRadio(t, page, v.sw, sw)
 	}
-	if st.on || v.on == "" {
+	if st.on || v.on == "" || v.offFields {
 		page = setInputValue(t, page, v.server, st.server)
 		if v.port != "" {
 			page = setInputValue(t, page, v.port, st.port)
@@ -164,10 +180,92 @@ func chooseRadio(t testing.TB, page []byte, name, value string) []byte {
 	return replaceOnce(t, page, re, func(m []string) string { return m[0] + ` checked="checked"` })
 }
 
+// pageRules is what a page served lets a browser post: the names of its controls, those it
+// disables (a browser never submits them), and the values each drop-down list offers (its
+// options that are not disabled).
+type pageRules struct {
+	controls, disabled map[string]bool
+	options            map[string]map[string]bool
+}
+
+var (
+	reControlTag = regexp.MustCompile(`<(?:input|select|textarea)\b([^>]*)>`)
+	reNameAttr   = regexp.MustCompile(`\bname="([^"]*)"`)
+	reValueAttr  = regexp.MustCompile(`\bvalue="([^"]*)"`)
+	reDisabled   = regexp.MustCompile(`\sdisabled(?:="[^"]*")?(?:\s|/|$)`)
+	reSelectElem = regexp.MustCompile(`(?s)<select\b([^>]*)>(.*?)</select>`)
+	reOptionElem = regexp.MustCompile(`<option\b([^>]*)>([^<]*)`)
+)
+
+// rulesOf reads the rules of a page served from its markup with regular expressions (the
+// fixtures' markup is regular), independently of the client's form reader.
+func rulesOf(page []byte) pageRules {
+	r := pageRules{controls: map[string]bool{}, disabled: map[string]bool{}, options: map[string]map[string]bool{}}
+	for _, m := range reControlTag.FindAllSubmatch(page, -1) {
+		if n := reNameAttr.FindSubmatch(m[1]); n != nil {
+			r.controls[string(n[1])] = true
+			if reDisabled.Match(m[1]) {
+				r.disabled[string(n[1])] = true
+			}
+		}
+	}
+	for _, m := range reSelectElem.FindAllSubmatch(page, -1) {
+		n := reNameAttr.FindSubmatch(m[1])
+		if n == nil {
+			continue
+		}
+		offered := map[string]bool{}
+		for _, o := range reOptionElem.FindAllSubmatch(m[2], -1) {
+			if reDisabled.Match(o[1]) {
+				continue
+			}
+			v := strings.Join(strings.Fields(html.UnescapeString(string(o[2]))), " ") // no value: the text
+			if va := reValueAttr.FindSubmatch(o[1]); va != nil {
+				v = html.UnescapeString(string(va[1]))
+			}
+			offered[v] = true
+		}
+		r.options[string(n[1])] = offered
+	}
+	return r
+}
+
+// refuses says why the gateway refuses a form posted from the page ("" = it does not): a
+// control the page does not have or disables, a value a list does not offer, or not exactly
+// one of the page's buttons.
+func (r pageRules) refuses(form url.Values) string {
+	buttons := 0
+	for _, name := range slices.Sorted(maps.Keys(form)) {
+		switch {
+		case !r.controls[name]:
+			return "posts " + name + ", which the page does not have"
+		case r.disabled[name]:
+			return "posts " + name + ", which the page disables"
+		}
+		if offered, ok := r.options[name]; ok {
+			for _, v := range form[name] {
+				if !offered[v] {
+					return fmt.Sprintf("posts %s=%q, which the list does not offer", name, v)
+				}
+			}
+		}
+		if name == "Update" || name == "Save" || name == "Cancel" {
+			buttons++
+		}
+	}
+	if buttons != 1 {
+		return fmt.Sprintf("posts %d buttons", buttons)
+	}
+	return ""
+}
+
 // syslogGateway is the mock gateway (helpers_test.go) with a Syslog page behind the same
-// login: syslog.ha is rendered from a synthetic fixture for the stored setting; a POST with
-// the page's nonce is saved (Save) or answered with the transformed page (Update), as the
-// BGW320 is expected to do.
+// login: syslog.ha is rendered from a fixture for the stored setting. It keeps the real page's
+// rules: a POST must carry the nonce of the page served last to the session (single use) and
+// only controls that page has and enables, with values its lists offer; anything else is
+// refused - counted, not applied, answered with a redirect to the page. An accepted POST is
+// saved (Save) or answered with the page transformed by the switch posted (Update), with the
+// page itself (200) or a redirect to it (302), as the behaviour switches say.
 type syslogGateway struct {
 	*mockGateway
 	v  syslogVariant
@@ -175,8 +273,9 @@ type syslogGateway struct {
 
 	// behaviour switches
 	ignoreSave     bool                     // Save does not change the setting
+	saveOK         bool                     // Save answers 200 with the page (else 302 -> syslog.ha)
 	updateRedirect bool                     // Update answers 302 -> syslog.ha; the next GET shows the transformed page
-	updateIgnored  bool                     // Update answers with the page unchanged
+	updateIgnored  bool                     // Update leaves the page unchanged
 	edit           func(page []byte) []byte // applied to every page served
 	editUpdate     func(page []byte) []byte // applied to the transformed page only
 	// onPost takes over a POST to syslog.ha (after it is recorded) when it returns true. It
@@ -184,6 +283,7 @@ type syslogGateway struct {
 	onPost func(w http.ResponseWriter, form url.Values) bool
 
 	nonces  map[*mockSession]string
+	rules   map[*mockSession]pageRules
 	pending map[*mockSession]bool
 
 	// observations
@@ -191,12 +291,13 @@ type syslogGateway struct {
 	posts    []string // raw POST bodies to syslog.ha, in order
 	forms    []url.Values
 	referers []string
-	badPosts int // POSTs without the page's nonce: not applied
+	badPosts int      // POSTs refused: not applied
+	rejects  []string // why, in order
 }
 
 func newSyslogGateway(t testing.TB, code string, v syslogVariant, st syslogState) *syslogGateway {
 	return &syslogGateway{mockGateway: newMockGateway(t, code, false), v: v, st: st,
-		nonces: map[*mockSession]string{}, pending: map[*mockSession]bool{}}
+		nonces: map[*mockSession]string{}, rules: map[*mockSession]pageRules{}, pending: map[*mockSession]bool{}}
 }
 
 func (g *syslogGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -242,33 +343,53 @@ func (g *syslogGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if g.onPost != nil && g.onPost(w, form) {
 		return
 	}
-	nonce := g.nonces[s]
-	delete(g.nonces, s) // single use
+	nonce, rules := g.nonces[s], g.rules[s]
+	delete(g.nonces, s) // single use: only the page served last can be posted, once
+	delete(g.rules, s)
+	var refused string
 	switch {
-	case nonce == "" || form.Get("nonce") != nonce || r.Header.Get("Content-Type") != "application/x-www-form-urlencoded":
+	case nonce == "" || form.Get("nonce") != nonce:
+		refused = "stale or missing nonce"
+	case r.Header.Get("Content-Type") != "application/x-www-form-urlencoded":
+		refused = "not form-urlencoded"
+	default:
+		refused = rules.refuses(form)
+	}
+	switch {
+	case refused != "":
 		g.badPosts++
+		g.rejects = append(g.rejects, refused)
 	case form.Has("Update") && g.updateRedirect:
-		g.pending[s] = g.v.switchOn(form)
-	case form.Has("Update"):
-		on := g.v.switchOn(form)
-		if g.updateIgnored {
-			on = g.st.on
+		if !g.updateIgnored {
+			g.pending[s] = g.v.switchOn(form)
 		}
-		g.write(w, http.StatusOK, g.page(s, on, !g.updateIgnored))
+	case form.Has("Update"):
+		if g.updateIgnored {
+			g.write(w, http.StatusOK, g.page(s, g.st.on, false))
+		} else {
+			g.write(w, http.StatusOK, g.page(s, g.v.switchOn(form), true))
+		}
 		return
-	case form.Has("Save") && !g.ignoreSave:
-		g.v.apply(&g.st, form)
+	case form.Has("Save"):
+		if !g.ignoreSave {
+			g.v.apply(&g.st, form)
+		}
+		if g.saveOK {
+			g.write(w, http.StatusOK, g.page(s, g.st.on, false))
+			return
+		}
 	}
 	w.Header().Set("Location", "/cgi-bin/syslog.ha")
 	g.write(w, http.StatusFound, nil)
 }
 
 // page renders the Syslog page with the switch at on (the stored setting otherwise) and a
-// fresh nonce for session s; update marks the page the Update button transforms.
+// fresh nonce for session s, and notes its rules; update asks for the page the Update button
+// transforms.
 func (g *syslogGateway) page(s *mockSession, on, update bool) []byte {
 	st := g.st
 	st.on = on
-	p := g.v.render(g.t, st)
+	p := g.v.render(g.t, st, update)
 	if g.edit != nil {
 		p = g.edit(p)
 	}
@@ -278,6 +399,7 @@ func (g *syslogGateway) page(s *mockSession, on, update bool) []byte {
 	nonce := randomHex(32)
 	g.nonces[s] = nonce
 	p = withNonce(p, nonce)
+	g.rules[s] = rulesOf(p)
 	g.served = append(g.served, p)
 	return p
 }
@@ -289,6 +411,7 @@ type syslogObservations struct {
 	forms    []url.Values
 	referers []string
 	badPosts int
+	rejects  []string
 	requests int
 	logins   int
 	gets     int // GET syslog.ha
@@ -304,6 +427,7 @@ func (g *syslogGateway) observed() syslogObservations {
 		forms:    append([]url.Values(nil), g.forms...),
 		referers: append([]string(nil), g.referers...),
 		badPosts: g.badPosts,
+		rejects:  append([]string(nil), g.rejects...),
 		requests: g.requests,
 		logins:   len(g.loginForms),
 		gets:     g.byPath["GET /cgi-bin/syslog.ha"],
@@ -345,6 +469,7 @@ func nonceIn(t *testing.T, page []byte) string {
 var (
 	levels8 = []string{"Emergency", "Alert", "Critical", "Error", "Warning", "Notice", "Informational", "Debug"}
 	levels7 = []string{"Emergency", "Alert", "Critical", "Error", "Warning", "Notice", "Debug"}
+	levels6 = []string{"Emergency", "Alert", "Critical", "Error", "Warning", "Notice"} // the real page
 )
 
 func TestParseSyslogFixtures(t *testing.T) {
@@ -353,6 +478,10 @@ func TestParseSyslogFixtures(t *testing.T) {
 		want model.SyslogSetting
 		err  string // part of the ErrSyslogPage message ("" = no error)
 	}{
+		// The real page, off: the fields are read although disabled.
+		{"syslog_real_off.html", model.SyslogSetting{Enabled: false, Server: "", Port: 514, Level: "Error", Levels: levels6}, ""},
+		{"syslog_real_on_update.html", model.SyslogSetting{Enabled: true, Port: 514, Level: "Error", Levels: levels6}, ""},
+		{"syslog_real_on.html", model.SyslogSetting{Enabled: true, Server: "192.168.1.71", Port: 514, Level: "Notice", Levels: levels6}, ""},
 		{"syslog_select.html", model.SyslogSetting{Port: 514, Level: "Warning", Levels: levels8}, ""},
 		{"syslog_checkbox_off.html", model.SyslogSetting{}, ""}, // the fields are shown once Syslog is on
 		{"syslog_checkbox_on.html", model.SyslogSetting{Enabled: true, Server: "192.168.1.64", Port: 514, Level: "Notice", Levels: levels8}, ""},
@@ -377,9 +506,11 @@ func TestParseSyslogFixtures(t *testing.T) {
 				t.Errorf("setting = %+v, want %+v", got, tt.want)
 			}
 			// Line endings and the page's encoding do not matter.
+			lf := func(b []byte) []byte { return bytes.ReplaceAll(b, []byte("\r\n"), []byte("\n")) }
 			for vname, variant := range map[string]func([]byte) []byte{
-				"LF":      func(b []byte) []byte { return bytes.ReplaceAll(b, []byte("\r\n"), []byte("\n")) },
-				"CR":      func(b []byte) []byte { return bytes.ReplaceAll(b, []byte("\r\n"), []byte("\r")) },
+				"LF":      lf,
+				"CRLF":    func(b []byte) []byte { return bytes.ReplaceAll(lf(b), []byte("\n"), []byte("\r\n")) },
+				"CR":      func(b []byte) []byte { return bytes.ReplaceAll(lf(b), []byte("\n"), []byte("\r")) },
 				"latin-1": latin1Variant,
 				"U+FFFD":  replacementVariant,
 			} {
@@ -690,7 +821,8 @@ func TestSetSyslogLevel(t *testing.T) {
 
 // TestSetSyslogUpdateRound: a page that shows the server fields only once Syslog is on is
 // first posted with the switch on and its Update button; the fields are filled in on the page
-// the gateway answers with, whose nonce is used for the Save.
+// the gateway answers with, whose nonce is used for the Save. Switching off takes the same two
+// rounds, as the page asks of a change of an item with an Update button.
 func TestSetSyslogUpdateRound(t *testing.T) {
 	for _, redirect := range []bool{false, true} {
 		t.Run(map[bool]string{false: "Update answers with the page", true: "Update redirects to the page"}[redirect], func(t *testing.T) {
@@ -704,7 +836,7 @@ func TestSetSyslogUpdateRound(t *testing.T) {
 			}
 			o := g.observed()
 			if len(o.posts) != 2 || len(o.served) != 3 || o.badPosts != 0 {
-				t.Fatalf("posts=%d served=%d bad=%d, want 2/3/0", len(o.posts), len(o.served), o.badPosts)
+				t.Fatalf("posts=%d served=%d refused=%q, want 2/3/none", len(o.posts), len(o.served), o.rejects)
 			}
 			if want := "nonce=" + nonceIn(t, before) + "&logsend=on&Update=Update"; o.posts[0] != want {
 				t.Errorf("Update body = %q, want %q", o.posts[0], want)
@@ -723,20 +855,211 @@ func TestSetSyslogUpdateRound(t *testing.T) {
 				t.Error("the Update round is not in the log")
 			}
 
-			// Switching off needs no Update round: the unchecked box is simply left out.
+			// Switching off: the box is unchecked (and so left out) with the Update button, the
+			// fields posted as the page has them; the page the gateway answers with leaves the
+			// fields out again, and is saved.
 			_, after, err = c.SetSyslog(context.Background(), model.SyslogTarget{})
 			if err != nil {
 				t.Fatal(err)
 			}
 			o = g.observed()
-			want := "nonce=" + nonceIn(t, o.served[3]) + "&logsrv=192.168.1.71&logport=514&loglevel=Informational&Save=Save"
-			if len(o.posts) != 3 || o.posts[2] != want {
-				t.Errorf("off body = %q\nwant       %q", o.posts[len(o.posts)-1], want)
+			if len(o.posts) != 4 || len(o.served) != 6 || o.badPosts != 0 {
+				t.Fatalf("posts=%d served=%d refused=%q, want 4/6/none", len(o.posts), len(o.served), o.rejects)
 			}
-			if s, err := ParseSyslog(after); err != nil || s.Enabled || s.Server != "" {
+			if want := "nonce=" + nonceIn(t, o.served[3]) + "&Update=Update&logsrv=192.168.1.71&logport=514&loglevel=Informational"; o.posts[2] != want {
+				t.Errorf("off Update body = %q\nwant              %q", o.posts[2], want)
+			}
+			if want := "nonce=" + nonceIn(t, o.served[4]) + "&Save=Save"; o.posts[3] != want {
+				t.Errorf("off Save body = %q, want %q", o.posts[3], want)
+			}
+			if o.state != (syslogState{false, "192.168.1.71", "514", "Informational"}) {
+				t.Errorf("gateway state = %+v (the fields are kept)", o.state)
+			}
+			if s, err := ParseSyslog(after); err != nil || s.Enabled || s.Server != "" || !bytes.Equal(after, o.served[5]) {
 				t.Errorf("after: %+v %v (the page leaves the fields out again)", s, err)
 			}
 		})
+	}
+}
+
+// TestSetSyslogRealPage drives SetSyslog on the real Syslog page of firmware 6.34.7
+// (syslog_real_off.html) and the pages derived from it, through a fake gateway that keeps the
+// page's rules (a POST must carry the nonce of the page served last, and no control that page
+// disables). Switching on, the fields are disabled, so the switch goes On with the Update
+// button first, exactly as a browser without JavaScript posts it; the fields are filled in on
+// the page the gateway answers with and saved with that page's nonce. Switching off takes the
+// same two rounds. However the gateway answers the Update and the Save - with the page (200) or
+// a redirect to it (302) - the bodies posted are the same, and the page read back decides.
+func TestSetSyslogRealPage(t *testing.T) {
+	answer := map[bool]string{false: "200", true: "302"}
+	for _, updateRedirect := range []bool{false, true} {
+		for _, saveRedirect := range []bool{false, true} {
+			t.Run("Update answered "+answer[updateRedirect]+", Save answered "+answer[saveRedirect], func(t *testing.T) {
+				g := newSyslogGateway(t, testCode, realVariant, realOff)
+				g.updateRedirect, g.saveOK = updateRedirect, !saveRedirect
+				var logs syncBuffer
+				clk := newFakeClock()
+				c, _ := startSyslog(t, g, clk, &logs)
+				ctx := context.Background()
+
+				before, after, err := c.SetSyslog(ctx, noticeTarget)
+				if err != nil {
+					t.Fatal(err)
+				}
+				o := g.observed()
+				// Served: the page read, the transformed page, the Save's answer (200 only) and
+				// the page read back.
+				served := 3
+				if !saveRedirect {
+					served++
+				}
+				if len(o.posts) != 2 || len(o.served) != served || o.badPosts != 0 {
+					t.Fatalf("posts=%d served=%d refused=%q, want 2/%d/none", len(o.posts), len(o.served), o.rejects, served)
+				}
+				// The disabled fields are left out of the Update round.
+				if want := "nonce=" + nonceIn(t, before) + "&syslog=on&Update=Update"; o.posts[0] != want {
+					t.Errorf("Update body = %q\nwant          %q", o.posts[0], want)
+				}
+				if want := "nonce=" + nonceIn(t, o.served[1]) + "&syslog=on&location=192.168.1.71&port=514&level=Notice&Save=Save"; o.posts[1] != want {
+					t.Errorf("Save body = %q\nwant        %q", o.posts[1], want)
+				}
+				// The read-back is a GET of its own, whatever the Save was answered with.
+				gets := 4 // the login's three, and the read-back
+				if updateRedirect {
+					gets++
+				}
+				if o.gets != gets || !bytes.Equal(before, o.served[0]) || !bytes.Equal(after, o.served[served-1]) {
+					t.Errorf("GETs = %d (want %d), or before/after are not the first and the last page read", o.gets, gets)
+				}
+				if o.state != realOn {
+					t.Errorf("gateway state = %+v", o.state)
+				}
+				on := model.SyslogSetting{Enabled: true, Server: "192.168.1.71", Port: 514, Level: "Notice", Levels: levels6}
+				if s, err := ParseSyslog(after); err != nil || !reflect.DeepEqual(s, on) {
+					t.Errorf("after: %+v %v", s, err)
+				}
+				for _, l := range []string{"transformed by its Update button", "gateway syslog setting posted"} {
+					if !strings.Contains(logs.String(), l) {
+						t.Errorf("%q is not in the log", l)
+					}
+				}
+
+				// Switching off: the switch goes Off with the Update button (the fields, enabled
+				// while on, posted as the page has them), and the page the gateway answers with,
+				// whose fields are disabled again, is saved with the switch alone.
+				clk.Advance(time.Minute)
+				before, after, err = c.SetSyslog(ctx, model.SyslogTarget{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				o = g.observed()
+				if len(o.posts) != 4 || len(o.served) != 2*served || o.badPosts != 0 || o.logins != 1 {
+					t.Fatalf("posts=%d served=%d refused=%q logins=%d, want 4/%d/none/1", len(o.posts), len(o.served), o.rejects, o.logins, 2*served)
+				}
+				if want := "nonce=" + nonceIn(t, before) + "&syslog=off&Update=Update&location=192.168.1.71&port=514&level=Notice"; o.posts[2] != want {
+					t.Errorf("off Update body = %q\nwant              %q", o.posts[2], want)
+				}
+				if want := "nonce=" + nonceIn(t, o.served[served+1]) + "&syslog=off&Save=Save"; o.posts[3] != want {
+					t.Errorf("off Save body = %q, want %q", o.posts[3], want)
+				}
+				if !bytes.Equal(before, o.served[served]) || !bytes.Equal(after, o.served[2*served-1]) {
+					t.Error("before/after are not the first and the last page read")
+				}
+				if o.state != (syslogState{false, "192.168.1.71", "514", "Notice"}) {
+					t.Errorf("gateway state = %+v (the server, port and level are kept)", o.state)
+				}
+				off := on
+				off.Enabled = false
+				if s, err := ParseSyslog(after); err != nil || !reflect.DeepEqual(s, off) {
+					t.Errorf("after: %+v %v", s, err)
+				}
+			})
+		}
+	}
+}
+
+// TestSetSyslogRealPageLevels: with Syslog already on the fields are enabled and the switch
+// stays: they are changed and saved in one round (this computer's address changed, say). An
+// empty level leaves the level as the page has it - when switching on, as the page the Update
+// round answered with has it; a level is matched by text or value, ignoring case.
+func TestSetSyslogRealPageLevels(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		state  syslogState
+		level  string
+		posted string // the level saved
+	}{
+		{"on, address changed", syslogState{true, "192.168.1.64", "514", "Warning"}, "Notice", "Notice"},
+		{"on, address changed, level kept", syslogState{true, "192.168.1.64", "514", "Warning"}, "", "Warning"},
+		{"on, level by another case", syslogState{true, "192.168.1.64", "514", "Warning"}, " notice ", "Notice"},
+		{"on, port changed", syslogState{true, "192.168.1.71", "1514", "Notice"}, "Notice", "Notice"},
+		{"off, level kept", realOff, "", "Error"},
+		{"off, level by another case", realOff, "NOTICE", "Notice"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			g := newSyslogGateway(t, testCode, realVariant, tt.state)
+			c, _ := startSyslog(t, g, newFakeClock(), nil)
+			want := noticeTarget
+			want.Level = tt.level
+			before, _, err := c.SetSyslog(context.Background(), want)
+			if err != nil {
+				t.Fatal(err)
+			}
+			o := g.observed()
+			save := "&syslog=on&location=192.168.1.71&port=514&level=" + tt.posted + "&Save=Save"
+			var wantPosts []string
+			if tt.state.on {
+				wantPosts = []string{"nonce=" + nonceIn(t, before) + save}
+			} else {
+				wantPosts = []string{"nonce=" + nonceIn(t, before) + "&syslog=on&Update=Update", "nonce=" + nonceIn(t, o.served[1]) + save}
+			}
+			if !reflect.DeepEqual(o.posts, wantPosts) || o.badPosts != 0 {
+				t.Errorf("posts = %q\nwant    %q (refused: %q)", o.posts, wantPosts, o.rejects)
+			}
+			if wantState := (syslogState{true, "192.168.1.71", "514", tt.posted}); o.state != wantState {
+				t.Errorf("gateway state = %+v, want %+v", o.state, wantState)
+			}
+		})
+	}
+	// A setting already as wanted is not posted again; an empty level accepts any.
+	g := newSyslogGateway(t, testCode, realVariant, realOn)
+	c, _ := startSyslog(t, g, newFakeClock(), nil)
+	for _, level := range []string{"Notice", "notice", ""} {
+		want := noticeTarget
+		want.Level = level
+		if before, after, err := c.SetSyslog(context.Background(), want); err != nil || !bytes.Equal(before, after) {
+			t.Errorf("level %q: err = %v, posted = %v", level, err, !bytes.Equal(before, after))
+		}
+	}
+	if o := g.observed(); len(o.posts) != 0 {
+		t.Errorf("posts = %q, want none", o.posts)
+	}
+}
+
+// TestSetSyslogRealPageNotApplied: the gateway answers both rounds but does not save: the page
+// read back decides, whichever way the Save was answered.
+func TestSetSyslogRealPageNotApplied(t *testing.T) {
+	for _, saveRedirect := range []bool{false, true} {
+		g := newSyslogGateway(t, testCode, realVariant, realOff)
+		g.ignoreSave, g.saveOK = true, !saveRedirect
+		c, _ := startSyslog(t, g, newFakeClock(), nil)
+		before, after, err := c.SetSyslog(context.Background(), noticeTarget)
+		if !errors.Is(err, ErrNotApplied) {
+			t.Fatalf("Save redirect %v: err = %v, want ErrNotApplied", saveRedirect, err)
+		}
+		for _, want := range []string{"Syslog reads off (wanted on)", `Server IP Address reads "" (wanted "192.168.1.71")`,
+			`Log Level reads "Error" (wanted "Notice")`} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("err = %v, want it to say %q", err, want)
+			}
+		}
+		o := g.observed()
+		if len(o.posts) != 2 || !o.forms[0].Has("Update") || !o.forms[1].Has("Save") || o.badPosts != 0 || o.state != realOff {
+			t.Errorf("posts = %q, refused = %q, state = %+v", o.posts, o.rejects, o.state)
+		}
+		if !bytes.Equal(before, o.served[0]) || !bytes.Equal(after, o.served[len(o.served)-1]) {
+			t.Error("before/after evidence missing")
+		}
 	}
 }
 
@@ -816,43 +1139,212 @@ func TestSetSyslogPostOutcomes(t *testing.T) {
 			t.Errorf("%d request(s) with a session known to be dead", got-req)
 		}
 	})
-	for name, answer := range map[string]func(w http.ResponseWriter){
-		"Update answered with an error": func(w http.ResponseWriter) {
+	// An Update round that reached the gateway but is not followed by a Save: the page that shows
+	// what the gateway did is returned with the error (after) - the gateway's answer, or, when the
+	// answer does not say what the gateway did, the page one GET reads back.
+	eventsPage := fixture(t, "events_checked.html")
+	for name, tc := range map[string]struct {
+		answer   func(w http.ResponseWriter)
+		readBack bool
+	}{
+		"Update answered with an error": {func(w http.ResponseWriter) {
 			http.Error(w, "internal error", http.StatusInternalServerError)
-		},
-		"Update redirected elsewhere": func(w http.ResponseWriter) {
+		}, true},
+		"Update redirected elsewhere": {func(w http.ResponseWriter) {
 			w.Header().Set("Location", "/cgi-bin/home.ha")
 			w.WriteHeader(http.StatusFound)
-		},
+		}, true},
+		// A browser would post the form again after a 307: not the answer the round expects.
+		"Update answered with a 307 to the page": {func(w http.ResponseWriter) {
+			w.Header().Set("Location", "/cgi-bin/syslog.ha")
+			w.WriteHeader(http.StatusTemporaryRedirect)
+		}, true},
+		"Update answered with a redirect without a target": {func(w http.ResponseWriter) {
+			w.WriteHeader(http.StatusFound)
+		}, true},
+		"Update answered with another page": {func(w http.ResponseWriter) {
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write(eventsPage)
+		}, false},
 	} {
-		t.Run(name, func(t *testing.T) {
-			g := newSyslogGateway(t, testCode, checkboxVariant, checkboxOff)
-			g.onPost = func(w http.ResponseWriter, form url.Values) bool {
-				answer(w)
-				return true
-			}
-			c, _ := startSyslog(t, g, newFakeClock(), nil)
-			before, after, err := c.SetSyslog(ctx, enableTarget)
-			if err == nil || !strings.Contains(err.Error(), "Save not posted") || before == nil || after != nil {
-				t.Fatalf("err = %v, after = %v", err, after != nil)
-			}
-			if o := g.observed(); len(o.posts) != 1 || len(o.served) != 1 || o.state != checkboxOff {
-				t.Errorf("posts=%d served=%d state=%+v, want only the Update POST and no read-back", len(o.posts), len(o.served), o.state)
-			}
-		})
+		for _, v := range []struct {
+			v    syslogVariant
+			st   syslogState
+			want model.SyslogTarget
+		}{{checkboxVariant, checkboxOff, enableTarget}, {realVariant, realOff, noticeTarget}} {
+			t.Run(name+" ("+v.v.off+")", func(t *testing.T) {
+				g := newSyslogGateway(t, testCode, v.v, v.st)
+				g.onPost = func(w http.ResponseWriter, form url.Values) bool {
+					tc.answer(w)
+					return true
+				}
+				c, _ := startSyslog(t, g, newFakeClock(), nil)
+				before, after, err := c.SetSyslog(ctx, v.want)
+				if err == nil || !strings.Contains(err.Error(), "Save not posted") || before == nil {
+					t.Fatalf("err = %v", err)
+				}
+				o := g.observed()
+				if len(o.posts) != 1 || !o.forms[0].Has("Update") || o.state != v.st {
+					t.Errorf("posts=%q state=%+v, want only the Update POST", o.posts, o.state)
+				}
+				wantAfter, served := eventsPage, 1 // the gateway's answer
+				if tc.readBack {
+					served = 2 // the page read, and the page read back
+				}
+				if len(o.served) != served {
+					t.Fatalf("served=%d, want %d", len(o.served), served)
+				}
+				if tc.readBack {
+					wantAfter = o.served[1]
+				}
+				if !bytes.Equal(after, wantAfter) {
+					t.Errorf("after = %.80q, want the %s", after, map[bool]string{false: "gateway's answer", true: "page read back"}[tc.readBack])
+				}
+			})
+		}
+	}
+	// The gateway saves the switch at the Update already and answers with an error: the page read
+	// back shows what it did (Syslog on, no server), and it is returned with the error.
+	t.Run("Update saved at once but answered with an error", func(t *testing.T) {
+		g := newSyslogGateway(t, testCode, realVariant, realOff)
+		g.onPost = func(w http.ResponseWriter, form url.Values) bool {
+			g.v.apply(&g.st, form)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return true
+		}
+		var logs syncBuffer
+		c, _ := startSyslog(t, g, newFakeClock(), &logs)
+		_, after, err := c.SetSyslog(ctx, noticeTarget)
+		if err == nil || !strings.Contains(err.Error(), "POST syslog.ha (Update): the POST was answered with HTTP 500") ||
+			!strings.Contains(err.Error(), "Save not posted") {
+			t.Fatalf("err = %v", err)
+		}
+		o := g.observed()
+		if len(o.posts) != 1 || len(o.served) != 2 || !bytes.Equal(after, o.served[1]) {
+			t.Fatalf("posts=%q served=%d: want the Update POST and the page read back as after", o.posts, len(o.served))
+		}
+		if s, err := ParseSyslog(after); err != nil || !s.Enabled || s.Server != "" {
+			t.Errorf("after: %+v %v; want the page showing Syslog on without a server", s, err)
+		}
+		if !strings.Contains(logs.String(), "reading the page back") {
+			t.Error("the read-back is not in the log")
+		}
+	})
+	// The page read back is the login page: the session expired. It is dropped (the next
+	// authenticated request logs in again) and the error says so.
+	t.Run("the page read back after the Update round is the login page", func(t *testing.T) {
+		g := newSyslogGateway(t, testCode, realVariant, realOff)
+		g.onPost = func(w http.ResponseWriter, form url.Values) bool {
+			g.sessions = map[string]*mockSession{}
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return true
+		}
+		clk := newFakeClock()
+		c, _ := startSyslog(t, g, clk, nil)
+		_, after, err := c.SetSyslog(ctx, noticeTarget)
+		if !errors.Is(err, ErrLoginRequired) || !strings.Contains(err.Error(), "Save not posted") ||
+			!strings.Contains(err.Error(), "the page could not be read back") || !scan(after).isLogin() {
+			t.Fatalf("err = %v, after is a login page: %v", err, scan(after).isLogin())
+		}
+		if c.reusableSession() != nil {
+			t.Error("the expired session was kept")
+		}
+		clk.Advance(loginSpacing + time.Second)
+		if _, _, err := c.Syslog(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if o := g.observed(); o.logins != 2 {
+			t.Errorf("logins = %d, want a second one", o.logins)
+		}
+	})
+	t.Run("session expired at the Update round", func(t *testing.T) {
+		g := newSyslogGateway(t, testCode, realVariant, realOff)
+		g.onPost = func(w http.ResponseWriter, form url.Values) bool {
+			g.sessions = map[string]*mockSession{}
+			g.write(w, http.StatusOK, fixture(g.t, "login_handshake1.html"))
+			return true
+		}
+		c, _ := startSyslog(t, g, newFakeClock(), nil)
+		_, after, err := c.SetSyslog(ctx, noticeTarget)
+		if !errors.Is(err, ErrLoginRequired) || !strings.Contains(err.Error(), "Save not posted") || after != nil {
+			t.Fatalf("err = %v, want ErrLoginRequired and no Save", err)
+		}
+		if o := g.observed(); len(o.posts) != 1 || len(o.served) != 1 || o.state != realOff {
+			t.Errorf("posts=%q served=%d state=%+v", o.posts, len(o.served), o.state)
+		}
+	})
+}
+
+// TestSyslogFakeGatewayRules: the fake gateway refuses what the real page's rules forbid - a
+// POST carrying a control the page disables, a stale nonce, a value a list does not offer, a
+// control the page does not have, no button - and applies none of it; so the tests that find
+// no refused POST show that the client posts none of these.
+func TestSyslogFakeGatewayRules(t *testing.T) {
+	g := newSyslogGateway(t, testCode, realVariant, realOff)
+	c, _ := startSyslog(t, g, newFakeClock(), nil)
+	ctx := context.Background()
+	if _, _, err := c.Syslog(ctx); err != nil {
+		t.Fatal(err)
+	}
+	s := c.reusableSession()
+	if s == nil {
+		t.Fatal("no session")
+	}
+	read := func() []byte { // GET syslog.ha in the session: a fresh nonce
+		t.Helper()
+		page, err := c.getPage(ctx, s, syslogPage)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return page
+	}
+	post := func(body string) {
+		t.Helper()
+		if _, problem, err := c.postForm(ctx, s, syslogPage, body); err != nil || problem != "" {
+			t.Fatalf("POST %q: %v %s", body, err, problem)
+		}
+	}
+	stale := nonceIn(t, read())
+	for _, tt := range []struct {
+		body   func(nonce string) string
+		reason string
+	}{
+		{func(n string) string { return "nonce=" + n + "&syslog=on&location=192.168.1.71&Update=Update" }, "posts location, which the page disables"},
+		{func(n string) string { return "nonce=" + n + "&syslog=on&level=Notice&Update=Update" }, "posts level, which the page disables"},
+		{func(string) string { return "nonce=" + stale + "&syslog=on&Update=Update" }, "stale or missing nonce"},
+		{func(n string) string { return "nonce=" + n + "&syslog=yes&Update=Update" }, `posts syslog="yes", which the list does not offer`},
+		{func(n string) string { return "nonce=" + n + "&syslog=on&debug=1&Update=Update" }, "posts debug, which the page does not have"},
+		{func(n string) string { return "nonce=" + n + "&syslog=on" }, "posts 0 buttons"},
+		{func(n string) string { return "nonce=" + n + "&syslog=on&Update=Update&Save=Save" }, "posts 2 buttons"},
+	} {
+		body := tt.body(nonceIn(t, read()))
+		post(body)
+		if o := g.observed(); len(o.rejects) == 0 || o.rejects[len(o.rejects)-1] != tt.reason || o.state != realOff {
+			t.Errorf("%q: refused %q, state %+v; want refused for %q", body, o.rejects, o.state, tt.reason)
+		}
+	}
+	// What a browser without JavaScript posts is accepted: the Update round, then the Save on
+	// the page it answers with.
+	post("nonce=" + nonceIn(t, read()) + "&syslog=on&Update=Update")
+	o := g.observed()
+	post("nonce=" + nonceIn(t, o.served[len(o.served)-1]) + "&syslog=on&location=192.168.1.71&port=514&level=Notice&Save=Save")
+	if o := g.observed(); o.badPosts != 7 || o.state != realOn {
+		t.Errorf("refused %d (%q), state %+v; want 7 refused and the setting saved", o.badPosts, o.rejects, o.state)
 	}
 }
 
-// TestSetSyslogFailsClosed: a page that is not fully understood is never posted.
+// TestSetSyslogFailsClosed: a page that is not fully understood is never posted; when only the
+// page an Update round answered with is not, no Save is posted.
 func TestSetSyslogFailsClosed(t *testing.T) {
 	type tc struct {
 		name    string
 		variant syslogVariant // default: the select variant, off
 		state   syslogState
 		setup   func(t *testing.T, g *syslogGateway)
-		off     bool   // switch Syslog off (default: enableTarget)
-		posts   int    // Update round POSTs expected before the refusal
-		msg     string // part of the error
+		off     bool                // switch Syslog off
+		target  *model.SyslogTarget // else: noticeTarget for the real page, enableTarget for the others
+		posts   int                 // Update round POSTs expected before the refusal
+		msg     string              // part of the error
 	}
 	sel := func(pattern, repl string) func(t *testing.T, g *syslogGateway) {
 		return func(t *testing.T, g *syslogGateway) { g.edit = pageEdit(t, "syslog_select.html", pattern, repl) }
@@ -860,7 +1352,22 @@ func TestSetSyslogFailsClosed(t *testing.T) {
 	cb := func(pattern, repl string) func(t *testing.T, g *syslogGateway) {
 		return func(t *testing.T, g *syslogGateway) { g.edit = pageEdit(t, "syslog_checkbox_off.html", pattern, repl) }
 	}
+	// Edits of every page served, and of the page the Update button answers with, for the real page.
+	realEdit := func(pattern, repl string) func(t *testing.T, g *syslogGateway) {
+		return func(t *testing.T, g *syslogGateway) { g.edit = pageEdit(t, "syslog_real_off.html", pattern, repl) }
+	}
+	realUpdateEdit := func(pattern, repl string) func(t *testing.T, g *syslogGateway) {
+		return func(t *testing.T, g *syslogGateway) {
+			g.editUpdate = pageEdit(t, "syslog_real_on_update.html", pattern, repl)
+		}
+	}
+	updateIgnored := func(redirect bool) func(t *testing.T, g *syslogGateway) {
+		return func(t *testing.T, g *syslogGateway) { g.updateIgnored, g.updateRedirect = true, redirect }
+	}
 	selectOn := syslogState{true, "192.168.1.64", "514", "6"}
+	realOnElsewhere := syslogState{true, "192.168.1.64", "514", "Notice"}
+	debugTarget := noticeTarget
+	debugTarget.Level = "Debug"
 	tests := []tc{
 		{name: "form posts to another page", setup: sel(`action="/cgi-bin/syslog.ha"`, `action="/cgi-bin/events.ha"`), msg: `posts to "/cgi-bin/events.ha"`},
 		{name: "form posts to another host", setup: sel(`action="/cgi-bin/syslog.ha"`, `action="https://203.0.113.9/cgi-bin/syslog.ha"`), msg: "not syslog.ha"},
@@ -904,6 +1411,69 @@ func TestSetSyslogFailsClosed(t *testing.T) {
 				g.editUpdate = pageEdit(t, "syslog_checkbox_on.html", `(?s)<tr>\s*<td></td>\s*<th scope="row"><label for="logport">.*?</tr>`, ``)
 			},
 			posts: 1, msg: `no control labelled "Server Port"`},
+
+		// The real page: what can be checked on the page first read is checked before the
+		// Update round, although its fields are disabled.
+		{name: "real page: level not an option", variant: realVariant, state: realOff, target: &enableTarget,
+			msg: `"Log Level" has no option "Informational" (it offers "Emergency", "Alert", "Critical", "Error", "Warning", "Notice")`},
+		{name: "real page: level Debug", variant: realVariant, state: realOff, target: &debugTarget, msg: `has no option "Debug"`},
+		{name: "real page: level not an option while on", variant: realVariant, state: realOnElsewhere, target: &enableTarget,
+			msg: `has no option "Informational"`},
+		{name: "real page: level option disabled", variant: realVariant, state: realOff,
+			setup: realEdit(`<option value="Notice"`, `<option value="Notice" disabled="disabled"`), msg: `has no option "Notice"`},
+		{name: "real page: no Update button", variant: realVariant, state: realOff,
+			setup: realEdit(`(?s)<noscript>\s*<input type="submit" name="Update"[^>]*/>\s*</noscript>`, ``),
+			msg:   `the "Server IP Address" input is disabled`},
+		{name: "real page: two different Update buttons", variant: realVariant, state: realOff,
+			setup: realEdit(`(<input type="submit" name="Update"[^>]*/>)`, `${1}<input type="submit" name="Update" value="Refresh" />`),
+			msg:   "2 different Update buttons"},
+		{name: "real page: Update button posts elsewhere", variant: realVariant, state: realOff,
+			setup: realEdit(`name="Update" class`, `name="Update" formaction="/cgi-bin/other.ha" class`), msg: "not syslog.ha"},
+		{name: "real page: no Save button", variant: realVariant, state: realOff,
+			setup: realEdit(`<input type="submit" name="Save"[^>]*/>`, ``), msg: "no Save button"},
+		{name: "real page: Save button posts elsewhere", variant: realVariant, state: realOff,
+			setup: realEdit(`name="Save" class`, `name="Save" formaction="/cgi-bin/other.ha" class`), msg: "not syslog.ha"},
+		{name: "real page: no nonce", variant: realVariant, state: realOff,
+			setup: realEdit(`<input type="hidden" name="nonce" value="[0-9a-f]+" />`, ``), msg: "no nonce"},
+		{name: "real page: server address too long for the field", variant: realVariant, state: realOff,
+			setup: realEdit(`maxlength="43"`, `maxlength="7"`), msg: `"Server IP Address" input takes at most 7 characters`},
+		{name: "real page: port too long for the field", variant: realVariant, state: realOff,
+			setup: realEdit(`maxlength="5"`, `maxlength="2"`), msg: `"Server Port" input takes at most 2 characters`},
+		{name: "real page: switch has no option for on", variant: realVariant, state: realOff,
+			setup: realEdit(`<option value="on"\s*>On</option>`, ``), msg: "0 options for on"},
+		{name: "real page: switch disabled", variant: realVariant, state: realOff,
+			setup: realEdit(`name="syslog" id="syslog"`, `name="syslog" id="syslog" disabled="disabled"`), msg: `the "Syslog" list is disabled`},
+		{name: "real page: another control holds characters outside ASCII", variant: realVariant, state: realOff,
+			setup: realEdit(`(<input type="hidden" name="nonce")`, `<input type="hidden" name="x" value="caf&#233;" />${1}`), msg: "outside ASCII"},
+
+		// The real page: the page the Update round answers with must be the page transformed -
+		// the switch On and the three fields enabled - or no Save is posted.
+		{name: "real page: the Update round changes nothing", variant: realVariant, state: realOff,
+			setup: updateIgnored(false), posts: 1, msg: "Syslog reads off (wanted on) after the Update round"},
+		{name: "real page: the Update round redirects to the page unchanged", variant: realVariant, state: realOff,
+			setup: updateIgnored(true), posts: 1, msg: "Syslog reads off (wanted on) after the Update round"},
+		{name: "real page: switching off, the Update round changes nothing", variant: realVariant, state: realOn, off: true,
+			setup: updateIgnored(false), posts: 1, msg: "Syslog reads on (wanted off) after the Update round"},
+		{name: "real page: the Update round leaves the address disabled", variant: realVariant, state: realOff,
+			setup: realUpdateEdit(`name="location" value=""`, `name="location" value="" disabled="disabled"`),
+			posts: 1, msg: `"Server IP Address" is still disabled after the Update round`},
+		{name: "real page: the Update round leaves the port disabled", variant: realVariant, state: realOff,
+			setup: realUpdateEdit(`name="port" value="514"`, `name="port" value="514" disabled="disabled"`),
+			posts: 1, msg: `"Server Port" is still disabled after the Update round`},
+		{name: "real page: the Update round leaves the level disabled", variant: realVariant, state: realOff,
+			setup: realUpdateEdit(`id="loglevel"`, `id="loglevel" disabled="disabled"`),
+			posts: 1, msg: `"Log Level" is still disabled after the Update round`},
+		{name: "real page: the Update round makes the address read-only", variant: realVariant, state: realOff,
+			setup: realUpdateEdit(`name="location"`, `name="location" readonly="readonly"`), posts: 1, msg: "read-only"},
+		{name: "real page: the Update round offers no Notice", variant: realVariant, state: realOff,
+			setup: realUpdateEdit(`<option value="Notice"\s*>Notice</option>`, ``), posts: 1, msg: `"Log Level" has no option "Notice"`},
+		{name: "real page: the Update round answers without a nonce", variant: realVariant, state: realOff,
+			setup: realUpdateEdit(`<input type="hidden" name="nonce" value="[0-9a-f]+" />`, ``), posts: 1, msg: "no nonce"},
+		{name: "real page: the Update round answers without a Save button", variant: realVariant, state: realOff,
+			setup: realUpdateEdit(`<input type="submit" name="Save"[^>]*/>`, ``), posts: 1, msg: "no Save button"},
+		{name: "real page: the Update round answers with a second switch", variant: realVariant, state: realOff,
+			setup: realUpdateEdit(`(<input type="hidden" name="nonce")`, `<label>Syslog <input type="checkbox" name="x" /></label>${1}`),
+			posts: 1, msg: "more than one control is labelled"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -914,8 +1484,13 @@ func TestSetSyslogFailsClosed(t *testing.T) {
 				}
 			}
 			want := enableTarget
-			if tt.off {
+			switch {
+			case tt.off:
 				want = model.SyslogTarget{}
+			case tt.target != nil:
+				want = *tt.target
+			case tt.variant == realVariant:
+				want = noticeTarget
 			}
 			g := newSyslogGateway(t, testCode, tt.variant, tt.state)
 			if tt.setup != nil {
@@ -938,12 +1513,23 @@ func TestSetSyslogFailsClosed(t *testing.T) {
 				t.Errorf("posts = %q, state = %+v: the form was posted", o.posts, o.state)
 			}
 			for _, f := range o.forms {
-				if f.Has("Save") {
-					t.Errorf("a Save was posted: %v", f)
+				if f.Has("Save") || !f.Has("Update") {
+					t.Errorf("a POST other than the Update round: %v", f)
 				}
 			}
-			if len(before) == 0 || !bytes.Equal(before, o.served[0]) || after != nil {
-				t.Errorf("before = %d bytes, after = %v: want the page read, and no after", len(before), after != nil)
+			if o.badPosts != 0 {
+				t.Errorf("the gateway refused a POST: %q", o.rejects)
+			}
+			if len(before) == 0 || !bytes.Equal(before, o.served[0]) {
+				t.Errorf("before = %d bytes: want the page read", len(before))
+			}
+			// Once the Update round was posted, the page the gateway answered it with is
+			// returned (after): the evidence of what it did, and the page the Save was refused on.
+			switch {
+			case tt.posts == 0 && after != nil:
+				t.Errorf("after = %d bytes, want none: nothing was posted", len(after))
+			case tt.posts > 0 && (len(o.served) != 2 || !bytes.Equal(after, o.served[1])):
+				t.Errorf("after = %d bytes (%d pages served), want the page the Update round answered with", len(after), len(o.served))
 			}
 		})
 	}
@@ -1071,16 +1657,19 @@ func TestSyslogSecretsNeverLeak(t *testing.T) {
 	var errs, hashes []string
 	ctx := context.Background()
 	for _, sc := range []struct {
-		code  string
-		v     syslogVariant
-		st    syslogState
-		setup func(g *syslogGateway)
+		code   string
+		v      syslogVariant
+		st     syslogState
+		target model.SyslogTarget
+		setup  func(g *syslogGateway)
 	}{
-		{testCode, selectVariant, selectOff, nil},
-		{testCode, checkboxVariant, checkboxOff, nil},
-		{testCode + "x", selectVariant, selectOff, nil},
-		{testCode, selectVariant, selectOff, func(g *syslogGateway) { g.sessionsFull = true }},
-		{testCode, radioVariant, radioOff, func(g *syslogGateway) { g.ignoreSave = true }},
+		{testCode, selectVariant, selectOff, enableTarget, nil},
+		{testCode, checkboxVariant, checkboxOff, enableTarget, nil},
+		{testCode, realVariant, realOff, noticeTarget, nil},
+		{testCode, realVariant, realOff, noticeTarget, func(g *syslogGateway) { g.updateIgnored = true }},
+		{testCode + "x", selectVariant, selectOff, enableTarget, nil},
+		{testCode, selectVariant, selectOff, enableTarget, func(g *syslogGateway) { g.sessionsFull = true }},
+		{testCode, radioVariant, radioOff, enableTarget, func(g *syslogGateway) { g.ignoreSave = true }},
 	} {
 		g := newSyslogGateway(t, testCode, sc.v, sc.st)
 		if sc.setup != nil {
@@ -1094,7 +1683,7 @@ func TestSyslogSecretsNeverLeak(t *testing.T) {
 			if err != nil {
 				errs = append(errs, err.Error())
 			}
-			want := enableTarget
+			want := sc.target
 			want.Enabled = i%2 == 0
 			if _, _, err := c.SetSyslog(ctx, want); err != nil {
 				errs = append(errs, err.Error())

@@ -115,6 +115,52 @@ func TestParseFormsFixtures(t *testing.T) {
 			t.Errorf("fields(source) = %+v", fd)
 		}
 	})
+	t.Run("syslog.ha (real, firmware 6.34.7)", func(t *testing.T) {
+		f := oneForm(t, string(fixture(t, "syslog_real_off.html")))
+		if f.method != "post" || f.action != "/cgi-bin/syslog.ha" || f.enctype != formURLEncoded {
+			t.Errorf("form = %s %q %s", f.method, f.action, f.enctype)
+		}
+		// The noscript Update button follows the switch, in its table row.
+		want := []string{"input/hidden nonce", "select/select-one syslog", "input/submit Update", "input/text location",
+			"input/text port", "select/select-one level", "input/submit Save", "input/submit Cancel"}
+		if got := controlSummary(f); !reflect.DeepEqual(got, want) {
+			t.Fatalf("controls = %q, want %q", got, want)
+		}
+		// While Syslog is off the three fields are disabled.
+		for name, label := range map[string]string{"syslog": "Syslog", "location": "Server IP Address", "port": "Server Port", "level": "Log Level"} {
+			if c := ctl(t, f, name, 0); c.label != label || c.labelFrom != labelFor || c.disabled != (name != "syslog") {
+				t.Errorf("%s: label %q (from %d), disabled %v", name, c.label, c.labelFrom, c.disabled)
+			}
+		}
+		if loc, port := ctl(t, f, "location", 0), ctl(t, f, "port", 0); loc.value != "" || loc.maxLen != 43 || port.value != "514" || port.maxLen != 5 {
+			t.Errorf("location = %+v, port = %+v", loc, port)
+		}
+		if sw := ctl(t, f, "syslog", 0); len(sw.options) != 2 || !sw.options[0].selected || sw.options[0].value != "off" ||
+			sw.options[1].value != "on" || sw.options[1].text != "On" {
+			t.Errorf("syslog options = %+v", sw.options)
+		}
+		if upd := ctl(t, f, "Update", 0); upd.row != "Syslog" || upd.disabled {
+			t.Errorf("Update button: row %q, disabled %v", upd.row, upd.disabled)
+		}
+		// Disabled controls are never submitted; only the clicked button is.
+		const nonce = "0000000000000000000000000000000000000000000000000000000000000000"
+		if got := mustEncode(t, f, "Save"); got != "nonce="+nonce+"&syslog=off&Save=Save" {
+			t.Errorf("Save body = %q", got)
+		}
+		if got := mustEncode(t, f, "Update"); got != "nonce="+nonce+"&syslog=off&Update=Update" {
+			t.Errorf("Update body = %q", got)
+		}
+		// Once on (a page derived from the real one), the fields are submitted after the
+		// Update button, in document order.
+		on := oneForm(t, string(fixture(t, "syslog_real_on.html")))
+		const onNonce = "2222222222222222222222222222222222222222222222222222222222222222"
+		if got := mustEncode(t, on, "Save"); got != "nonce="+onNonce+"&syslog=on&location=192.168.1.71&port=514&level=Notice&Save=Save" {
+			t.Errorf("on: Save body = %q", got)
+		}
+		if got := mustEncode(t, on, "Update"); got != "nonce="+onNonce+"&syslog=on&Update=Update&location=192.168.1.71&port=514&level=Notice" {
+			t.Errorf("on: Update body = %q", got)
+		}
+	})
 	t.Run("login.ha", func(t *testing.T) {
 		f := oneForm(t, string(fixture(t, "login_nonce.html")))
 		pw := ctl(t, f, "password", 0)
@@ -389,6 +435,18 @@ func TestFormFields(t *testing.T) {
 	// A radio button's own label also names its group.
 	if en := f.fields("Enable"); len(en) != 1 || len(en[0].controls) != 3 {
 		t.Errorf("fields(Enable) = %+v", en)
+	}
+
+	// A field is disabled when its control is, or every button of its radio group.
+	g := oneForm(t, `<form><table>
+<tr><th>Group</th><td><input type=radio name=g value=1 disabled><input type=radio name=g value=2></td></tr>
+<tr><th>Off group</th><td><fieldset disabled><input type=radio name=o value=1><input type=radio name=o value=2></fieldset></td></tr>
+<tr><th>Box</th><td><input name=b disabled></td></tr>
+<tr><th>List</th><td><select name=l><option>x</option></select></td></tr></table></form>`)
+	for label, want := range map[string]bool{"Group": false, "Off group": true, "Box": true, "List": false} {
+		if fd := g.fields(label); len(fd) != 1 || fd[0].disabled() != want {
+			t.Errorf("fields(%q) = %+v, want disabled %v", label, fd, want)
+		}
 	}
 }
 

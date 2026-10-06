@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -25,13 +26,14 @@ import (
 //
 //	att-monitor syslog [--since 24h] [--grep TEXT] [--severity LEVEL] [--limit N] [--json]
 //	att-monitor syslog retention [--keep-mb N] [--keep-days D] [--yes]
-//	att-monitor gateway syslog [status] [--json]
+//	att-monitor gateway syslog [status|on|off] [--json]
 //
 // The messages are listed through the running service (GET /api/syslog), which names for each
 // the syslog_chunk record of its chunk. A change of the retention goes through the service too
 // (POST /api/syslog/retention); while the service is stopped it is made like the other operator
-// changes, on the ledger directly, and the service applies it when it starts. The gateway's
-// Syslog setting is only read in this version (by the service's daily settings check).
+// changes, on the ledger directly, and the service applies it when it starts. So does a change of
+// the gateway's Syslog setting (POST /api/gateway/syslog), which the service otherwise keeps as
+// gateway.enforce_syslog says, reading it in its daily settings check.
 
 // syslogUsage is the usage of the syslog commands.
 const syslogUsage = "usage: att-monitor syslog [--since 24h] [--grep TEXT] [--severity LEVEL] [--limit N] [--json] [--data DIR]\n" +
@@ -493,33 +495,51 @@ func writeJSON(w io.Writer, v any) error {
 
 // ------------------------------------------------------------------ the gateway's setting
 
+// gatewaySyslogUsage is the usage of `att-monitor gateway syslog`.
+const gatewaySyslogUsage = "usage: att-monitor gateway syslog [status|on|off] [--json] [--data DIR]"
+
+// gatewaySyslogOffline changes the gateway's Syslog setting while the service is stopped: on the
+// ledger directly, like `gateway notification on|off`, after the strict certificate check of the
+// authenticated commands (the login must only reach the pinned certificate). The service applies
+// gateway.enforce_syslog when it starts. Tests replace it.
+var gatewaySyslogOffline = func(dataDir string, on bool) (model.ConfigChange, error) {
+	s, err := openStack(stackOptions{dataDir: dataDir, mode: "cli"})
+	if err != nil {
+		return model.ConfigChange{}, err
+	}
+	defer s.close()
+	if err := strictGatewayTLS(s); err != nil {
+		return model.ConfigChange{}, err
+	}
+	return s.mon.SetGatewaySyslog(background(), on, actor())
+}
+
 // gatewaySyslog shows the gateway's Syslog setting as the running service last read it, the
-// syslog receiver and the syslog store (Status.syslog). This version only reads the gateway's
-// setting: on and off come in a later version.
+// syslog receiver and the syslog store (Status.syslog) - status, the default - or changes the
+// setting (setGatewaySyslog): on sends the gateway's log to this PC and keeps it so
+// (gateway.enforce_syslog), off switches it off on the gateway and no longer keeps it.
 func gatewaySyslog(out io.Writer, args []string) error {
 	action := "status"
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		action, args = strings.ToLower(args[0]), args[1:]
 	}
 	fs, data := newFlags("gateway syslog")
-	asJSON := fs.Bool("json", false, "print Status.syslog as JSON")
+	asJSON := fs.Bool("json", false, "print Status.syslog (status) or the recorded change (on, off; a failed change: {error, change}) as JSON")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	switch action {
-	case "status":
-	case "on", "off":
-		return fmt.Errorf("this version only reads the gateway's Syslog setting: switching it %s from att-monitor comes in a later version; "+
-			"meanwhile set it on the gateway itself (Diagnostics > Syslog; `att-monitor gateway syslog` says what to enter)", action)
-	default:
-		return fmt.Errorf("unknown action %q (usage: att-monitor gateway syslog [status] [--json])", action)
+	if action != "status" && action != "on" && action != "off" {
+		return fmt.Errorf("unknown action %q (%s)", action, gatewaySyslogUsage)
 	}
 	if fs.NArg() > 0 {
-		return fmt.Errorf("unexpected argument %q (usage: att-monitor gateway syslog [status] [--json])", fs.Arg(0))
+		return fmt.Errorf("unexpected argument %q (%s)", fs.Arg(0), gatewaySyslogUsage)
 	}
 	dataDir := defaultDataDir(*data)
 	cfg := configOrDefault(dataDir)
 	api, ok := lookupService(dataDir)
+	if action != "status" {
+		return setGatewaySyslog(out, api, ok, dataDir, cfg, action == "on", *asJSON)
+	}
 	if !ok {
 		fmt.Fprintln(out, "The service is not running (its dashboard does not answer): the syslog receiver and the gateway's Syslog"+
 			" setting are reported by the running service (att-monitor start).")
@@ -541,14 +561,107 @@ func gatewaySyslog(out io.Writer, args []string) error {
 	return nil
 }
 
+// setGatewaySyslog switches the gateway's Syslog setting on - to this PC, and kept so - or off,
+// and no longer kept, through the running service (POST /api/gateway/syslog) or, with the
+// service stopped, on the ledger directly (gatewaySyslogOffline), and prints the recorded change
+// (--json: the change as JSON). When a change fails, the change the monitor reported (if any) is
+// printed with the error, and - unless the gateway took the change, or the service only refused
+// to run a second operation at the same time - how to make it on the gateway itself; with
+// --json only the failure is printed, as JSON (writeChangeError). Either way the error is
+// returned: the command fails.
+func setGatewaySyslog(out io.Writer, api *apiClient, viaService bool, dataDir string, cfg *config.Config, on, asJSON bool) error {
+	var (
+		cc  model.ConfigChange
+		err error
+	)
+	if viaService {
+		err = api.do(background(), http.MethodPost, "/api/gateway/syslog", map[string]any{"enabled": on, "client": "cli"}, &cc)
+		if rc := reportedChange(err); rc != nil {
+			cc = *rc
+		}
+	} else {
+		cc, err = gatewaySyslogOffline(dataDir, on)
+	}
+	if err != nil && asJSON {
+		return writeChangeError(out, cc, err)
+	}
+	if err != nil {
+		if cc.What != "" {
+			fmt.Fprintln(out, "Change:", syslogChangeText(cc))
+		}
+		var se *serviceError
+		refused := errors.As(err, &se) && (se.Status == http.StatusConflict || se.Status == http.StatusTooManyRequests)
+		if !gatewayTookChange(cc.Result) && !refused {
+			var st *model.Status
+			if viaService {
+				var s model.Status
+				if api.do(background(), http.MethodGet, "/api/status", nil, &s) == nil {
+					st = &s
+				}
+			}
+			printSetByHand(out, st, cfg, on)
+		}
+		return err
+	}
+	if asJSON {
+		return writeJSON(out, cc)
+	}
+	fmt.Fprintln(out, "Gateway setting", syslogChangeText(cc))
+	if on {
+		fmt.Fprintln(out, "att-monitor keeps it so: it reads the setting in its daily settings check (and after this PC's address changes)"+
+			" and sets it again whenever it differs. `att-monitor gateway syslog off` stops it.")
+		if !viaService {
+			fmt.Fprintln(out, "The service is not running: the gateway's messages are received, and the setting kept, once it runs (att-monitor start).")
+		}
+	} else {
+		fmt.Fprintln(out, "The gateway sends its log to no syslog server now, and att-monitor no longer sets it (it still reads it daily)."+
+			" `att-monitor gateway syslog on` sends it to this PC again.")
+	}
+	return nil
+}
+
+// writeChangeError prints a failed change as JSON, the way the service answers one: {error,
+// change} (web.ConfigChangeError) with the command's error and the change the monitor reported,
+// left out when it reported none. It returns err - the command still fails, and the error also
+// goes to standard error - joined with a failure to write.
+func writeChangeError(out io.Writer, cc model.ConfigChange, err error) error {
+	resp := web.ConfigChangeError{Error: err.Error()}
+	if cc != (model.ConfigChange{}) {
+		resp.Change = &cc
+	}
+	if werr := writeJSON(out, resp); werr != nil {
+		return errors.Join(err, werr)
+	}
+	return err
+}
+
+// syslogChangeText words a recorded change of the gateway's Syslog setting (its config_change)
+// as the other gateway commands do: "<what>: <before> → <after> (<result>)". It may quote the
+// gateway's page, so what a terminal would act on is escaped.
+func syslogChangeText(cc model.ConfigChange) string {
+	return fmt.Sprintf("%s: %s → %s (%s)", terminalSafe(cc.What), terminalSafe(cc.Before), terminalSafe(cc.After), terminalSafe(cc.Result))
+}
+
+// gatewayTookChange reports whether a config_change result says that the gateway took the change
+// ("verified", "applied", possibly followed by notes) rather than "failed: ..." or nothing.
+func gatewayTookChange(result string) bool {
+	r := strings.ToLower(strings.TrimSpace(result))
+	return r != "" && !strings.HasPrefix(r, "failed")
+}
+
 // printGatewaySyslog prints Status.syslog: the receiver, what it received, the store, the
-// gateway's setting and how it compares with this PC, and how to set the gateway by hand.
+// gateway's setting and how it compares with this PC, whether att-monitor keeps it sending here,
+// and - while the gateway does not send here and att-monitor does not set it (syslogHandHint) -
+// how to set it by hand.
 func printGatewaySyslog(out io.Writer, st *model.Status, cfg *config.Config) {
 	sl := st.Syslog
 	if sl == nil {
 		fmt.Fprintln(out, "The running service reports nothing about syslog: no receiver and no syslog store (syslog.enabled is false"+
 			" in config.json, or the store could not be opened: see the service log), and the gateway's Syslog setting has not been read.")
-		printSetByHand(out, st, cfg)
+		// Whether the service keeps the setting is then config.json's say.
+		if !cfg.Gateway.EnforceSyslog || gatewayAuthPaused(st) {
+			printSetByHand(out, st, cfg, true)
+		}
 		return
 	}
 	switch {
@@ -592,11 +705,79 @@ func printGatewaySyslog(out io.Writer, st *model.Status, cfg *config.Config) {
 			fmt.Fprintf(out, "Condition:        [%s] %s\n", c.Severity, terminalSafe(c.Message))
 		}
 	}
-	fmt.Fprintln(out, "This version only reads the gateway's Syslog setting (in the service's daily settings check);"+
-		" setting it automatically comes in a later version.")
-	if sl.State != "ok" {
-		printSetByHand(out, st, cfg)
+	if sl.Enforce {
+		fmt.Fprintf(out, "Kept:             yes, att-monitor keeps it sending to %s: it reads the setting in its daily settings check"+
+			" (and after this PC's address changes) and sets it again whenever it differs; `att-monitor gateway syslog off` stops it\n", syslogTargetText(sl.Target))
+	} else {
+		fmt.Fprintln(out, "Kept:             no, att-monitor only reads this setting; `att-monitor gateway syslog on` sends the gateway's log to this PC"+
+			" and keeps it so")
 	}
+	hand := syslogHandHint(st)
+	switch {
+	case syslogReceivingSince(sl) && (sl.State == "off" || sl.State == "elsewhere"):
+		fmt.Fprintln(out, "Messages have arrived since the setting was read, so it may have been changed on the gateway since.")
+	case sl.Enforce && !hand && (sl.State == "off" || sl.State == "elsewhere"):
+		fmt.Fprintln(out, "att-monitor sets it again at its next settings check, or now with `att-monitor gateway syslog on`.")
+	}
+	if hand {
+		printSetByHand(out, st, cfg, true)
+	}
+}
+
+// syslogTargetText words what att-monitor keeps the gateway's Syslog setting at.
+func syslogTargetText(t *model.SyslogTarget) string {
+	if t == nil {
+		return "this PC (its address toward the gateway is not known yet)"
+	}
+	if !t.Enabled {
+		return "nothing (off)"
+	}
+	s := terminalSafe(t.Server) + " port " + strconv.Itoa(t.Port)
+	if t.Level != "" {
+		s += ", level " + terminalSafe(t.Level)
+	}
+	return s
+}
+
+// syslogHandHint reports whether to say how to set the gateway's Syslog page by hand: only while
+// the gateway does not send its log here and att-monitor does not set it - it does not keep the
+// setting (gateway.enforce_syslog off), or setting it failed or cannot be done (the latest check
+// failed, the latest attempt to set it failed - SYSLOG_SETTING_FAILED -, the page was not
+// understood, no access code is stored, a changed gateway certificate waits for confirmation) -
+// and no message arrived since the setting was read (they show that the gateway sends here).
+// The dashboard's card says it only while the monitor cannot set the page (app.js): it offers
+// the change itself. st.Syslog must not be nil.
+func syslogHandHint(st *model.Status) bool {
+	sl := st.Syslog
+	switch {
+	case sl.State == "ok" || syslogReceivingSince(sl):
+		return false
+	case !sl.Enforce:
+		return true
+	}
+	return sl.State == "error" || (sl.GatewaySeq != 0 && sl.Gateway == nil) || hasCondition(st, "SYSLOG_SETTING_FAILED") || gatewayAuthPaused(st)
+}
+
+// hasCondition reports whether the status carries the condition code.
+func hasCondition(st *model.Status, code string) bool {
+	return slices.ContainsFunc(st.Conditions, func(c model.Condition) bool { return c.Code == code })
+}
+
+// syslogReceivingSince reports whether messages arrived after the latest read of the gateway's
+// Syslog setting (or before any read).
+func syslogReceivingSince(sl *model.SyslogStatus) bool {
+	last, err := time.Parse(time.RFC3339Nano, sl.LastAt)
+	if err != nil {
+		return false
+	}
+	read, err := time.Parse(time.RFC3339Nano, sl.GatewayAt)
+	return err != nil || last.After(read)
+}
+
+// gatewayAuthPaused reports whether the service cannot log in to the gateway now: no access code
+// is stored, or a changed gateway certificate waits for confirmation.
+func gatewayAuthPaused(st *model.Status) bool {
+	return (st.GatewayCert != nil && st.GatewayCert.Pending != "") || hasCondition(st, "NO_ACCESS_CODE") || hasCondition(st, "GATEWAY_CERT_CHANGED")
 }
 
 // gatewaySettingText words the gateway's Syslog setting.
@@ -614,13 +795,19 @@ func gatewaySettingText(g *model.SyslogSetting) string {
 	return s
 }
 
-// printSetByHand says how to make the gateway send its log to this PC.
-func printSetByHand(out io.Writer, st *model.Status, cfg *config.Config) {
+// printSetByHand says how to make the gateway send its log to this PC (on), or stop it (off), on
+// the gateway itself; st (may be nil) names this PC's address. The page enables its fields only
+// once Syslog is set to On.
+func printSetByHand(out io.Writer, st *model.Status, cfg *config.Config, on bool) {
+	page := fmt.Sprintf("open %s://%s, Diagnostics > Syslog (the page asks for the Device Access Code)", cfg.Gateway.Scheme, cfg.Gateway.Host)
+	if !on {
+		fmt.Fprintf(out, "To stop it on the gateway itself: %s, set Syslog to Off and save.\n", page)
+		return
+	}
 	pc := "this PC's IPv4 address on the gateway's network"
-	if st.LocalLink != nil && st.LocalLink.LocalIP != "" {
+	if st != nil && st.LocalLink != nil && st.LocalLink.LocalIP != "" {
 		pc = terminalSafe(st.LocalLink.LocalIP) + " (this PC)"
 	}
-	fmt.Fprintf(out, "To receive the gateway's log now, set it on the gateway itself: open %s://%s, Diagnostics > Syslog, switch Syslog on,"+
-		" Server IP Address %s, Server Port %d, and save (the page asks for the Device Access Code).\n",
-		cfg.Gateway.Scheme, cfg.Gateway.Host, pc, cfg.Syslog.Port)
+	fmt.Fprintf(out, "To set it on the gateway itself: %s, set Syslog to On (the page then enables its other fields),"+
+		" Server IP Address %s, Server Port %d, and save.\n", page, pc, cfg.Syslog.Port)
 }

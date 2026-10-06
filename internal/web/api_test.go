@@ -1064,6 +1064,7 @@ func TestJSONShapes(t *testing.T) {
 	decode[[]contracts.ExportInfo](t, hs.get("/api/exports"))
 	decode[model.Ref](t, hs.post("/api/notes", `{"text":"x"}`))
 	decode[model.ConfigChange](t, hs.post("/api/gateway/notification", `{"enabled":false}`))
+	decode[model.ConfigChange](t, hs.post("/api/gateway/syslog", `{"enabled":true}`))
 	decode[model.ConfigChange](t, hs.post("/api/gateway/trust-cert", `{}`))
 	decode[[]model.Anchor](t, hs.post("/api/anchor", ""))
 	decode[ErrorResponse](t, hs.get("/api/nope"))
