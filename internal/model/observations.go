@@ -193,6 +193,10 @@ type LocalLink struct {
 	LinkMbps  int          `json:"link_mbps,omitempty"`  // ethernet
 	RawSHA256 string       `json:"raw_sha256,omitempty"` // blob of the raw netsh output
 	Err       string       `json:"err,omitempty"`
+	// RxBytes/TxBytes are the interface's 64-bit octet counters (received/sent by this computer
+	// on the interface that reaches the gateway) at the time of the reading; nil when unknown.
+	RxBytes *uint64 `json:"rx_bytes,omitempty"`
+	TxBytes *uint64 `json:"tx_bytes,omitempty"`
 }
 
 // EgressCheck is the route this computer uses to reach the gateway and each internet destination.

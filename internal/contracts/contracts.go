@@ -12,6 +12,7 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"io"
+	"net/netip"
 	"time"
 
 	"attmonitor/internal/model"
@@ -155,6 +156,14 @@ type Gateway interface {
 	Notification(ctx context.Context) (enabled bool, raw []byte, err error)
 	// SetNotification changes the setting and returns the page before and after. Authenticated.
 	SetNotification(ctx context.Context, enabled bool) (before, after []byte, err error)
+	// Syslog reads the Syslog page (Diagnostics → Syslog): whether the gateway sends its log
+	// to a syslog server, which one and at which level. Authenticated, read-only; raw is the
+	// exact page that was read.
+	Syslog(ctx context.Context) (setting model.SyslogSetting, raw []byte, err error)
+	// SetSyslog sets the Syslog page to want (only the syslog controls change), reads it back
+	// and returns the pages before and after. It never posts a form it does not fully
+	// understand, and it fails unless the page read afterwards shows want. Authenticated.
+	SetSyslog(ctx context.Context, want model.SyslogTarget) (before, after []byte, err error)
 	// SetCertObserver installs the TLS pin policy callback.
 	SetCertObserver(CertObserver)
 	// PinnedCert returns the currently pinned certificate SHA-256 ("" if none yet).
@@ -208,6 +217,24 @@ type Actions interface {
 	TrustCert(ctx context.Context, actor, expectedSHA256 string) (model.ConfigChange, error)
 	// RecordExport appends a custody_export record and then anchors the new head.
 	RecordExport(ctx context.Context, e model.CustodyExport) (model.Ref, error)
+}
+
+// ------------------------------------------------------------------ syslog
+
+// SyslogReceiver receives the gateway's syslog datagrams (implemented by syslogrx.Receiver; the
+// monitor owns its lifecycle and writes what it drains to the ledger).
+type SyslogReceiver interface {
+	// Run listens until ctx is done. It returns nil then, or an error when it cannot listen at
+	// all (Listening reports the same error meanwhile).
+	Run(ctx context.Context) error
+	// Drain returns the messages accepted since the previous call, oldest first, and how many
+	// accepted messages were dropped by the per-minute cap and how many datagrams came from
+	// senders that are not allowed, since the previous call.
+	Drain() (msgs []model.SyslogMessage, dropped, rejected int)
+	// SetAllowed replaces the accepted senders (the gateway's address, plus configured extras).
+	SetAllowed(addrs []netip.Addr)
+	// Listening reports the bound address ("" while not listening) and why it is not listening.
+	Listening() (addr string, err error)
 }
 
 // ------------------------------------------------------------------ export

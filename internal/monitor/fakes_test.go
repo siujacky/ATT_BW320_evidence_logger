@@ -391,6 +391,16 @@ func (g *fakeGateway) SetNotification(ctx context.Context, enabled bool) ([]byte
 	return before, after, nil
 }
 
+// Syslog and SetSyslog: the syslog page is not part of these fakes yet (phase 1 of
+// docs/syslog-snmp-traffic.md adds its behaviour with the monitor integration).
+func (g *fakeGateway) Syslog(ctx context.Context) (model.SyslogSetting, []byte, error) {
+	return model.SyslogSetting{}, nil, contracts.ErrNotRecorded
+}
+
+func (g *fakeGateway) SetSyslog(ctx context.Context, want model.SyslogTarget) ([]byte, []byte, error) {
+	return nil, nil, contracts.ErrNotRecorded
+}
+
 func (g *fakeGateway) SetCertObserver(o contracts.CertObserver) {
 	g.mu.Lock()
 	g.observer = o

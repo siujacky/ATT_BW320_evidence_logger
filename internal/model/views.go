@@ -133,7 +133,9 @@ type Status struct {
 	// operator confirmation; Seq = the cert_changed gateway_event that reported it).
 	GatewayCert *GatewayCertState `json:"gateway_cert,omitempty"`
 	// Mongo is the state of the MongoDB copy of the ledger (nil when not configured).
-	Mongo  *MongoStatus  `json:"mongo,omitempty"`
+	Mongo *MongoStatus `json:"mongo,omitempty"`
+	// Syslog is the syslog receiver and the gateway's Syslog setting (nil when not configured).
+	Syslog *SyslogStatus `json:"syslog,omitempty"`
 	Ledger LedgerStatus  `json:"ledger"`
 	Stats  []WindowStats `json:"stats"`
 }
@@ -200,6 +202,12 @@ type Series struct {
 	Optical       []OpticalPoint `json:"optical"`
 	RxLowAlarmX10 *int64         `json:"rx_low_alarm_x10,omitempty"`
 	RxLowWarnX10  *int64         `json:"rx_low_warn_x10,omitempty"`
+	// Traffic is the WAN and this computer's traffic per bucket (same buckets as Points);
+	// TrafficDays the WAN volume per local day of the range; HeavyTrafficMbps the classifier's
+	// heavy-household-traffic threshold (docs/DESIGN.md §9), drawn as a reference line.
+	Traffic          []TrafficPoint `json:"traffic,omitempty"`
+	TrafficDays      []TrafficDay   `json:"traffic_days,omitempty"`
+	HeavyTrafficMbps float64        `json:"heavy_traffic_mbps,omitempty"`
 }
 
 // ---------------------------------------------------------------- verification

@@ -10,10 +10,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -140,6 +142,23 @@ type MongoConfig struct {
 	Interval   Duration `json:"interval"`
 }
 
+// SyslogConfig configures the receiver of the gateway's syslog messages
+// (docs/syslog-snmp-traffic.md). Messages are accepted only from the gateway (and Allow).
+type SyslogConfig struct {
+	Enabled bool `json:"enabled"`
+	// Listen is the UDP address the receiver binds (":514" = every interface, port 514).
+	Listen string `json:"listen"`
+	// Port is the port the gateway is told to send to (the Listen port, unless something such as
+	// a port forward sits in between).
+	Port int `json:"port"`
+	// Allow lists further senders (IP addresses) accepted besides the gateway.
+	Allow []string `json:"allow,omitempty"`
+	// FlushInterval is how often received messages are written to the ledger (one record per
+	// batch); MaxPerMinute caps the messages recorded per minute (the rest are counted).
+	FlushInterval Duration `json:"flush_interval"`
+	MaxPerMinute  int      `json:"max_per_minute"`
+}
+
 // Config is the complete configuration.
 type Config struct {
 	Version           int            `json:"version"`
@@ -150,6 +169,7 @@ type Config struct {
 	Clock             ClockConfig    `json:"clock"`
 	Web               WebConfig      `json:"web"`
 	Mongo             MongoConfig    `json:"mongo"`
+	Syslog            SyslogConfig   `json:"syslog"`
 	HeartbeatInterval Duration       `json:"heartbeat_interval"`
 	BootstrapDir      string         `json:"bootstrap_dir,omitempty"`
 
@@ -239,6 +259,13 @@ func Default() *Config {
 			Database:   "attmonitor",
 			StoreBlobs: true,
 			Interval:   D(5 * time.Second),
+		},
+		Syslog: SyslogConfig{
+			Enabled:       true,
+			Listen:        ":514",
+			Port:          514,
+			FlushInterval: D(30 * time.Second),
+			MaxPerMinute:  2000,
 		},
 		HeartbeatInterval: D(15 * time.Minute),
 	}
@@ -336,6 +363,9 @@ func (c *Config) Validate() error {
 	if c.Mongo.Enabled {
 		errs = append(errs, validateMongo(c.Mongo)...)
 	}
+	if c.Syslog.Enabled {
+		errs = append(errs, validateSyslog(c.Syslog)...)
+	}
 	seen := map[string]bool{}
 	for _, t := range c.Probes.Targets {
 		if t.Name == "" || seen[t.Name] {
@@ -402,6 +432,40 @@ func mongoSecretOption(uri string) bool {
 		}
 	}
 	return false
+}
+
+// validateSyslog checks an enabled syslog section.
+func validateSyslog(s SyslogConfig) []string {
+	var errs []string
+	host, port, err := net.SplitHostPort(s.Listen)
+	if err != nil {
+		errs = append(errs, `syslog.listen must be "host:port" or ":port", e.g. ":514"`)
+	} else {
+		if host != "" {
+			if _, err := netip.ParseAddr(host); err != nil {
+				errs = append(errs, "syslog.listen: the host must be an IP address")
+			}
+		}
+		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+			errs = append(errs, "syslog.listen: the port must be 1-65535")
+		}
+	}
+	if s.Port < 1 || s.Port > 65535 {
+		errs = append(errs, "syslog.port must be 1-65535")
+	}
+	for _, a := range s.Allow {
+		if _, err := netip.ParseAddr(a); err != nil {
+			errs = append(errs, "syslog.allow entries must be IP addresses")
+			break
+		}
+	}
+	if s.FlushInterval.Duration < time.Second {
+		errs = append(errs, "syslog.flush_interval must be >= 1s")
+	}
+	if s.MaxPerMinute < 1 {
+		errs = append(errs, "syslog.max_per_minute must be >= 1")
+	}
+	return errs
 }
 
 // validMongoDatabase applies MongoDB's database name rules on Windows.

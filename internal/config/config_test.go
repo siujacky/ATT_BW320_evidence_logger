@@ -95,6 +95,46 @@ func TestMongoConfig(t *testing.T) {
 	}
 }
 
+// TestSyslogConfig: the receiver is on by default on UDP 514; an old config.json gets the
+// defaults; bad values are refused only while the receiver is enabled.
+func TestSyslogConfig(t *testing.T) {
+	d := Default().Syslog
+	if !d.Enabled || d.Listen != ":514" || d.Port != 514 || d.FlushInterval.Duration != 30*time.Second || d.MaxPerMinute != 2000 || len(d.Allow) != 0 {
+		t.Fatalf("defaults %+v", d)
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"version":1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := Load(path); err != nil || c.Syslog.Listen != ":514" || !c.Syslog.Enabled {
+		t.Fatalf("old config: %+v %v", c.Syslog, err)
+	}
+	for name, mut := range map[string]func(*SyslogConfig){
+		"listen":       func(s *SyslogConfig) { s.Listen = "514" },
+		"listenip":     func(s *SyslogConfig) { s.Listen = "gateway:514" },
+		"port0":        func(s *SyslogConfig) { s.Listen = ":0" },
+		"target":       func(s *SyslogConfig) { s.Port = 70000 },
+		"allow":        func(s *SyslogConfig) { s.Allow = []string{"not-an-ip"} },
+		"flush":        func(s *SyslogConfig) { s.FlushInterval = D(0) },
+		"maxperminute": func(s *SyslogConfig) { s.MaxPerMinute = 0 },
+	} {
+		c := Default()
+		mut(&c.Syslog)
+		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "syslog.") {
+			t.Errorf("%s: %v", name, err)
+		}
+		c.Syslog.Enabled = false
+		if err := c.Validate(); err != nil {
+			t.Errorf("%s disabled: %v", name, err)
+		}
+	}
+	c := Default()
+	c.Syslog.Listen, c.Syslog.Allow = "192.168.1.71:5514", []string{"192.168.1.254", "::1"}
+	if err := c.Validate(); err != nil {
+		t.Errorf("valid: %v", err)
+	}
+}
+
 func TestValidateRejectsNonLoopbackListen(t *testing.T) {
 	c := Default()
 	c.Web.Listen = "0.0.0.0:8320"
