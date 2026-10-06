@@ -75,6 +75,7 @@ func Open(dir string, opts Options) (*Store, error) {
 		mono:     opts.mono,
 		ageDelay: opts.ageDelay,
 		maxFlows: maxFlows,
+		gateway:  opts.Gateway.Unmap().WithZone(""),
 	}
 	s.keepDays, s.keepMB = clampRetention(opts.KeepDays, opts.KeepMB)
 	for k := range numKinds {

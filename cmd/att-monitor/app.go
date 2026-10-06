@@ -362,7 +362,9 @@ func (s *stack) syslogChunks() contracts.SyslogChunkSource {
 func (s *stack) openNetwork() {
 	cc, gc := s.cfg.Connections, s.cfg.Geo
 	clg := s.log.With("component", "connections")
-	st, err := connstore.Open(s.paths.Connections, connstore.Options{KeepDays: cc.KeepDays, KeepMB: cc.KeepMB, Logger: clg})
+	// The gateway's own LAN address names its sessions there "gateway" (an invalid host leaves it unset).
+	gw, _ := netip.ParseAddr(strings.TrimSpace(s.cfg.Gateway.Host))
+	st, err := connstore.Open(s.paths.Connections, connstore.Options{KeepDays: cc.KeepDays, KeepMB: cc.KeepMB, Gateway: gw, Logger: clg})
 	if err != nil {
 		clg.Error("the Network page runs without connection samples: the connection store cannot be opened", "dir", s.paths.Connections, "err", err)
 	} else {

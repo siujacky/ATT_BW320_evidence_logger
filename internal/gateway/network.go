@@ -113,12 +113,14 @@ func (c *Client) Devices(ctx context.Context) ([]model.LANDevice, []byte, error)
 
 // ---------------------------------------------------------------- NAT table
 
-// ParseNATTable parses the NAT table page (nattable.ha). No capture of the real page exists yet -
-// it is behind the login - but its labels are known from a read-only tool that parsed it: a table
-// with the columns "Protocol", "TCP State", "Source Address", "Source Port", "Destination
-// Address" and "Destination Port" (one row per session), the rows "Total sessions available"
-// and "Total sessions in use", and a list labelled "Select display option". The parser therefore
-// goes by those labels, never by positions, and accepts what may differ on the real page:
+// ParseNATTable parses the NAT table page (nattable.ha): a table with the columns "Protocol", "TCP
+// State", "Source Address", "Source Port", "Destination Address" and "Destination Port" (one row
+// per session), the rows "Total sessions available" and "Total sessions in use", and a list of the
+// clients to display. On the real page (firmware 6.34.7, testdata/gateway/nattable_real.html) the
+// table has fourteen columns - also "IP Family", "Protocol Number", "Lifetime", the translated "NAT
+// Source/Destination Address/Port" and "Bidirectional" - and lists IPv6 connections too; a session
+// is the connection as the device opened it, never its translated columns. The parser goes by the
+// labels, never by positions, and accepts what may differ on another firmware:
 //
 //   - The session table is any table with a header row (<th> or <td> cells) naming a source and
 //     a destination address column. Labels are compared by alnumKey (case, white space and

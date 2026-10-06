@@ -5149,7 +5149,7 @@
       const ptr = ns && ns.ipintel && ns.ipintel.reverse_dns;
       return netAbout('How this is measured',
         'The monitor reads the gateway’s NAT table ', every ? 'every ' + fmtDur(every / 1000) : 'regularly',
-        ': every connection it translates, with the device and the remote address and port. A connection that opens and closes between two reads is not seen. IPv6 is not translated, so an IPv6 connection appears only when the gateway lists it there too; it is named after the device whose address it uses. ',
+        ': every connection it translates, with the device and the remote address and port. A connection that opens and closes between two reads is not seen. IPv6 connections are listed too; each is named after the device whose address it uses. ',
         'Organisations and countries come from the IPtoASN database kept on this PC: no address is sent anywhere to name them.',
         ptr ? ' The names under some addresses are their reverse DNS names, looked up through this PC’s DNS resolver.' : '',
         ' This is not evidence: it is never written to the evidence ledger, and it is kept ', keep ? 'for ' + fmtInt(keep) + ' days' : 'for a limited time', '.');

@@ -404,9 +404,9 @@ Every chart has a table view, and the page is read again every minute while it i
   is sent anywhere to name it.
 
 **Limits.** The NAT table is read every 4 minutes, so a connection that opens and closes between two
-reads is not seen. IPv6 is not translated, so an IPv6 connection appears only when the gateway lists
-it in its NAT table too; it is then named after the device whose address it uses (one the Device List
-lists, or another of the home network's IPv6 addresses). In a period with more than 200,000 distinct
+reads is not seen. The gateway lists IPv6 connections in the same table (they are not translated);
+each is named after the device whose address it uses (one the Device List lists, or another of the
+home network's IPv6 addresses). In a period with more than 200,000 distinct
 connections (a device file sharing or scanning the Internet) the lightest are counted only in their
 devices and as "Other", and the page says so. The syslog shows only what
 the firewall drops, never the connections it allows. Countries are where the networks are registered,

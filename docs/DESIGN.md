@@ -1185,9 +1185,13 @@ with the login page (an error status, a redirect elsewhere, a page too large or 
 session and returns what arrived of the page (§2). `Client.LoginAttempts` counts the login forms
 posted. `ParseNATTable` reads the session table by its column labels (Protocol, TCP State,
 Source/Destination Address and Port, in any order, close variants accepted) and the totals *Total
-sessions in use / available*; a row it cannot read is counted as skipped, never fatal. No capture of
-the real page exists (it is behind the login; `testdata/gateway/nattable_synthetic.html` is made up),
-so the monitor keeps copies of the pages it reads for checking (below). `Client.Devices` GETs
+sessions in use / available*; a row it cannot read is counted as skipped, never fatal. The real page
+(firmware 6.34.7; sanitized capture `testdata/gateway/nattable_real.html`) has fourteen columns: besides
+those six, *IP Family*, *Protocol Number*, *Lifetime*, the translated *NAT Source/Destination
+Address/Port* and *Bidirectional*, and it lists IPv6 connections too. Each session is the connection as
+the device opened it, never its translated columns. `nattable_synthetic.html`, made up before the page
+could be captured, keeps the parser's variants covered; the monitor keeps copies of the pages it reads,
+for checking a new firmware (below). `Client.Devices` GETs
 `devices.ha` (Device > Device List) without login, in the status pages' cookie session, and never
 posts its form (*Clear and Rescan for Devices* empties the gateway's device table); `ParseDevices`
 reads each device's MAC, name, IPv4 and IPv6 addresses, status, allocation, connection type
@@ -1286,7 +1290,9 @@ in effect lists (a device's global IPv6 address) or that lies in the /64 of a gl
 lists (a device's temporary IPv6 addresses) - is the device on the home network: the source when it
 is one (the device opened the session; the port shown is the remote one), else the destination
 (inbound, e.g. through a port forward or an IPv6 pinhole; the port shown is the device's); a
-session with no such side is the gateway's own, from its public address (device `gateway`). A LAN
+session with no such side is the gateway's own, from its public address (device `gateway`), and so
+is one on the gateway's own LAN address (`gateway.host`: its syslog to this PC, a device reaching its
+web pages). A LAN
 address is named after the Device List read in effect at the NAT read - the newest at or before it,
 else the first after it - or, when that read does not list it (a device that joined since), after
 the next read when it comes within 20 minutes: `mac:<mac>` when that read gives the address's MAC

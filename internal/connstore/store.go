@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"errors"
 	"log/slog"
+	"net/netip"
 	"path/filepath"
 	"slices"
 	"sync"
@@ -75,6 +76,11 @@ type Options struct {
 	// Now is the clock (default time.Now): it tells which day is today (never pruned, and read
 	// raw by Aggregate) and stands in for the zero time given to a method.
 	Now func() time.Time
+	// Gateway is the gateway's own address on the home network (gateway.host; the zero Addr when
+	// unknown). Its sessions - the gateway sending its syslog to this computer, answering a
+	// device's DNS query - belong to the gateway's key "gateway", like the sessions it opens from
+	// its public address, not to a device of their own named after the address.
+	Gateway netip.Addr
 
 	// mono replaces the monotonic clock in tests: it returns the time elapsed since an arbitrary
 	// origin. ageDelay replaces ageDelay in tests. settleStart, when set, is called as the
@@ -147,6 +153,8 @@ type Store struct {
 
 	// maxFlows is the constant maxFlows (the tests lower it).
 	maxFlows int
+	// gateway is Options.Gateway (unmapped, without zone).
+	gateway netip.Addr
 
 	// sums caches the summaries of whole past days, devs the Device List reads of a day.
 	sums *dayCache[sumKey, *sumEntry]

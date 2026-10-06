@@ -286,7 +286,7 @@ func printConnections(out io.Writer, nc model.NetConnections, ns *model.NetworkS
 		printConnCountries(out, nc.Countries)
 		printConnRows(out, nc, names, layout)
 		fmt.Fprintln(out, "SEEN counts the connections open at each NAT read, READS the reads that listed a connection. A connection that"+
-			" opens and closes between two reads is not seen; an IPv6 connection only when the gateway's table lists it.")
+			" opens and closes between two reads is not seen. IPv6 connections are listed too.")
 	}
 	printIPDB(out, nc.IPDB, ns)
 	printConfigWarnings(out, ns)

@@ -106,7 +106,9 @@
 // it is one (the device opened the session; the port is the remote one), else the destination
 // (Inbound: the remote side opened it, through a port forward or an IPv6 pinhole; the port is the
 // device's). A session with no such side is the gateway's own, from its public address: device
-// "gateway", the remote side the destination. A LAN address is named after the Device List read in
+// "gateway", the remote side the destination; so is one whose local side is the gateway's own LAN
+// address (Options.Gateway: its syslog to a computer, a device reaching its web pages). A LAN
+// address is named after the Device List read in
 // effect at the NAT read - the newest at or before it, else the first after it - or, when that
 // read does not list it, after the next read when it comes within devNextWithin (20 minutes: a
 // device that has just joined): "mac:<mac>" when that read lists a MAC address for the address (a

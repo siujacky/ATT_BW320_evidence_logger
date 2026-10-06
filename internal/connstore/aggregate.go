@@ -131,6 +131,7 @@ func (s *Store) scanDay(ctx context.Context, d day, sg *segment, lo, hi time.Tim
 	defer r.close()
 	key := sumKey{day: d, gz: r.gzStamp, plain: r.plainStamp}
 	sc := newScanner(s.maxFlows)
+	sc.gateway = s.gateway
 	n, badLines, badSessions, foreign := 0, 0, 0, 0
 	damage, stop := r.each(func(line []byte) error {
 		if n++; n%ctxEvery == 0 {

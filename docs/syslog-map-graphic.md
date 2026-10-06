@@ -16,7 +16,7 @@ labels builds 1.3.0, the version this ships as.
 | Asked | Source | Can it show it? |
 |---|---|---|
 | "which ip is connect to which site", from the syslog | The gateway's syslog (phase 2 of `syslog-snmp-traffic.md`) | **Partly.** The BGW320 at its most detailed level (Notice) logs only **firewall drops** (netfilter lines: `IN=`/`OUT=`, `SRC=`/`DST=`, `PROTO`, `SPT`/`DPT`, reason, hook). In the first 2,000 messages: 55 % inbound probes from the Internet (`IN=veip0.0`), 39 % outbound packets from the LAN that the gateway dropped (`IN=br1 OUT=veip0.0`, all but one from this PC), the rest local or invalid. It never logs connections it allows. |
-| "each LAN computer connect to which ip / service" | The gateway's **NAT Table** (Diagnostics → NAT Table, `nattable.ha`): every active NAT session — Protocol, TCP State, Source Address/Port, Destination Address/Port, sessions in use/available | **Yes, for IPv4**, as samples: the table shows the sessions open at the moment it is read. It needs the login (an unauthenticated GET returns the Login page). IPv6 is not NATed and does not appear. |
+| "each LAN computer connect to which ip / service" | The gateway's **NAT Table** (Diagnostics → NAT Table, `nattable.ha`): every active NAT session — Protocol, TCP State, Source Address/Port, Destination Address/Port, sessions in use/available | **Yes**, as samples: the table shows the sessions open at the moment it is read. It needs the login (an unauthenticated GET returns the Login page). (Found after deployment: the real page also lists IPv6 connections, in an *IP Family* column.) |
 | Device names | The gateway's **Device List** (`devices.ha`): name, IPv4, MAC, connection type, status, last activity — readable without login (8 devices on the owner's network) | Yes |
 | "site" | Remote IP → organisation (ASN), country — **offline**, from the public-domain IPtoASN database (`ip2asn-v4/v6.tsv.gz`, PDDL 1.0, ~7 MB, refreshed weekly); service from the port (443 HTTPS, 53 DNS, …); reverse DNS (PTR) as a hint | Yes, as "organisation / country / service". The name a device actually looked up (netflix.com) is not available: the gateway does not log DNS queries. |
 | "graph / map", "filter by date", "simple and professional" | A **Network** page: flow diagram (device → site → service), world map (countries), timeline, tables; one date filter for everything | Yes |
@@ -75,7 +75,7 @@ One page, two tabs, one date filter (1 h, 24 h, 7 d, 30 d, or a custom from/to) 
   services on the right, band width = samples — clicking a device filters everything; a **world map**
   of the remote endpoints' countries; a sortable, searchable **table** per device → site. A note says
   what the data is: samples of the gateway's NAT table every 4 minutes (short connections in between
-  are not seen; IPv6 is not NATed).
+  are not seen).
 * **Firewall** (from the syslog): tiles (inbound probes blocked, outbound packets blocked, sources,
   top country); a **world map** of where the blocked inbound probes came from; an hourly **timeline**
   (inbound / outbound); top sources (IP, organisation, country), most-targeted services, and LAN
@@ -91,7 +91,7 @@ One page, two tabs, one date filter (1 h, 24 h, 7 d, 30 d, or a custom from/to) 
 |---|---|---|---|
 | 0 | Design preview (an artifact with sample data) for the page's look | — | the demo world (`internal/web/demonet_test.go`) serves sample data |
 | 1 | Shared types and contracts; config `connections.*`, `geo.*`; data folders | model, contracts, config | done |
-| 2 | NAT table and Device List readers (fixtures from the BGW320's markup; the NAT page needs the login) | gateway | done (the NAT page's fixture is synthetic) |
+| 2 | NAT table and Device List readers (fixtures from the BGW320's markup; the NAT page needs the login) | gateway | done (sanitized capture of the real page after deployment: `nattable_real.html`) |
 | 3 | Connection store with retention | connstore | done |
 | 4 | IP intelligence: IPtoASN download/refresh/lookup, ports, PTR cache | ipintel | done |
 | 5 | Firewall aggregation of the syslog (parser + per-chunk cache) | netmap | done |
@@ -104,7 +104,7 @@ One page, two tabs, one date filter (1 h, 24 h, 7 d, 30 d, or a custom from/to) 
 ## 4. Out of scope
 
 * Sites by DNS name (the gateway does not log DNS queries).
-* IPv6 connections (not NATed, not in the NAT table).
+* ~~IPv6 connections~~: the real NAT table lists them too, so they are shown.
 * Connections the gateway allowed, from the syslog (it logs only drops).
 * Changing any gateway setting (everything here is read-only).
 
@@ -168,8 +168,10 @@ One page, two tabs, one date filter (1 h, 24 h, 7 d, 30 d, or a custom from/to) 
   `last-devices.html` (at most hourly; the Device List's without the Wi-Fi network's name), to
   check the parsers against the real firmware, and deleted once older than `keep_days` (at the
   start, with the samplers off). A read that worked but left rows out says so as a note
-  (`nat_note`), not as a problem. The NAT table's fixture is synthetic: nobody may log in to capture
-  it, so the parser goes by the column labels a read-only tool reported.
+  (`nat_note`), not as a problem. The parser was written before the page could be captured, by
+  the column labels a read-only tool reported; the deployed service's copy of the real page then
+  matched it exactly (120 sessions as listed, the translated columns left aside) and became the
+  sanitized fixture `nattable_real.html`.
 * **Reverse DNS** names only the connections table's rows (not the firewall's sources): 3 lookups
   at a time, 3 s each (at most 8 running, counting those given up on), cached in
   `geo\ptr-cache.json` (at most 50,000 addresses; a name for 7 days, "no name" for a day, at most

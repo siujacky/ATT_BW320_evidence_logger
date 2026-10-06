@@ -121,8 +121,8 @@ func (e *CooldownError) CooldownUntil() time.Time // when the next login attempt
 ```
 Fixtures: `testdata/gateway/*.html` (sanitized real pages, see README there: `syslog_real_off.html`
 is the real Syslog page; the pages derived from it, and the other `syslog_*.html`, are synthetic;
-`devices_real.html` is a sanitized capture of the Device List, `nattable_synthetic.html` is made up:
-the NAT table is behind the login).
+`devices_real.html` and `nattable_real.html` are sanitized captures of the Device List and the NAT
+table; `nattable_synthetic.html` is made up, for the parser's variants).
 
 ## internal/probe
 ```go

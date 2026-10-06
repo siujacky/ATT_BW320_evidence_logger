@@ -103,6 +103,9 @@ type scanner struct {
 	// within devNextWithin (nil: none); readDevs counts the current line's sessions by device.
 	dr, next *devRead
 	readDevs map[int32]int
+	// gateway is the gateway's own LAN address (Store.gateway; invalid when unknown): a session
+	// on it is the gateway's, whichever side it is on.
+	gateway netip.Addr
 }
 
 // newScanner returns an empty scanner that counts at most max flows one by one.
@@ -155,7 +158,7 @@ func (sc *scanner) add(t int64, dr, next *devRead) (bad int) {
 		if o == inbound {
 			lanIdx, lan, remote = dst, da.addr, sa.addr
 		}
-		dev := sc.device(lanIdx, lan, o == fromGateway, t)
+		dev := sc.device(lanIdx, lan, o == fromGateway || (sc.gateway.IsValid() && lan == sc.gateway), t)
 		sc.count(dev, flowKey{remote: remote, proto: sc.proto(p), dev: dev, port: normPort(l.S[i+5]), inbound: o == inbound}, lan, t)
 		sc.readDevs[dev]++
 	}

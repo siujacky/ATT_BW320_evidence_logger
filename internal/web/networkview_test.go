@@ -34,7 +34,7 @@ func TestDashboardNetworkPage(t *testing.T) {
 		"DEVICE", "ORGANISATION", "SERVICE", "Office PC", "Google", "HTTPS", "Other (",
 		"Where the sites are", "Sites per country", "Top countries", "United States", "other countries",
 		"Each device’s remote addresses, most seen first.", "Showing 25 of ", "Show all",
-		"How this is measured", "every 4 min", "an IPv6 connection appears only when the gateway lists it there too", "no address is sent anywhere to name them",
+		"How this is measured", "every 4 min", "IPv6 connections are listed too; each is named after the device whose address it uses", "no address is sent anywhere to name them",
 		"looked up through this PC’s DNS resolver", "This is not evidence", "kept for 30 days")
 	// The first device of the diagram, chosen with Enter: only it is shown, and the keyboard focus
 	// stays on its node, which now offers every device again.

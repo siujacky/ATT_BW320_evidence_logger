@@ -70,7 +70,8 @@ their forms. Neither page is evidence.
 | file | page | what it is |
 |---|---|---|
 | devices_real.html | devices.ha (Device > Device List; readable without login) | **sanitized capture** of the owner's gateway, firmware 6.34.7, 8 devices |
-| nattable_synthetic.html | nattable.ha (Diagnostics > NAT Table; behind the login) | **synthetic**: no capture exists yet |
+| nattable_real.html | nattable.ha (Diagnostics > NAT Table; behind the login) | **sanitized capture** read by the deployed service, firmware 6.34.7, 120 sessions |
+| nattable_synthetic.html | nattable.ha | **synthetic**: written before the page could be captured; kept for the parser's variants |
 
 ### devices_real.html (sanitized capture)
 
@@ -108,6 +109,20 @@ capture with regular expressions (other line endings, raw windows-1252 bytes, no
 line breaks instead of `<br>`, other MAC spellings, no devices at all, a network name that reads
 like a band or a port).
 
+### nattable_real.html (sanitized capture)
+
+The NAT table as the deployed service read it on 2026-10-06 (`connections\last-nattable.html`): 120
+sessions (87 IPv4, 33 IPv6), *Total sessions in use* 120, *Total sessions available* 32767, the
+client list set to *All*. The table has fourteen columns - *IP Family*, *Protocol*, *Protocol
+Number*, *Lifetime*, *TCP State*, *Source Address*, *Source Port*, *Destination Address*,
+*Destination Port*, *NAT Source Address*, *NAT Source Port*, *NAT Destination Address*, *NAT
+Destination Port*, *Bidirectional* - and the session is the connection as the device opened it, not
+its translated (NAT) columns. Sanitized: every address replaced by a documentation address, one per
+original (LAN addresses in `192.168.1.0/24`, the gateway's own `192.168.1.254` kept; the gateway's
+public address became `203.0.113.1`; IPv6 addresses sharing a /64 still share one, with new interface
+ids), the client list's device names and the nonce replaced; the markup is unchanged. A comment at
+its top says so.
+
 ### nattable_synthetic.html (synthetic, not a capture)
 
 The NAT table is behind the login and nobody may log in to the gateway to capture it, so this
@@ -115,8 +130,8 @@ page is **made up** around what an earlier read-only tool reported of the real p
 the columns *Protocol*, *TCP State*, *Source Address*, *Source Port*, *Destination Address*,
 *Destination Port* (one row per session; 356 were shown once), the label rows *Total sessions
 available* and *Total sessions in use*, and a list labelled *Select display option*. A comment
-at its top says so. Replace it with a sanitized capture once the deployed service has saved the
-real page (`connections\last-nattable.html`, docs/syslog-map-graphic.md).
+at its top says so. The real page, captured since (`nattable_real.html`), has more columns; this one
+stays for the parser's variants.
 
 The chrome is copied from `syslog_real_off.html` (title "NAT Table", NAT Table selected in the
 Diagnostics menu); the content: a form posting to `nattable.ha` with a zero nonce, the *Select

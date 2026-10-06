@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"reflect"
 	"testing"
 	"time"
@@ -521,4 +522,41 @@ func TestOpenDeviceUnderAFilter(t *testing.T) {
 			t.Errorf("%q: %d of %d open, want %d of %d", tc.dev, a.OpenDevice, a.Open, tc.open, tc.of)
 		}
 	}
+}
+
+// TestGatewayLANAddressIsTheGateway: with Options.Gateway set, the sessions on the gateway's own LAN
+// address - the gateway sending its syslog to a computer, a device reaching its web pages - count
+// for the gateway (key "gateway", like its sessions from its public address), never as a device of
+// their own named after the address.
+func TestGatewayLANAddressIsTheGateway(t *testing.T) {
+	const gwLAN = "192.168.1.254"
+	h := newHarness(t, at(0, 12, 0), Options{Gateway: netip.MustParseAddr(gwLAN)})
+	h.devices(at(0, 9, 0), device(20, 5, "office-pc", "Ethernet"))
+	h.nat(at(0, 10, 0),
+		session("udp", gwLAN, 40000, lanIP(20), 514), // the gateway's syslog to the PC
+		tcp(20, 50000, gwLAN, 443),                   // the PC reaching the gateway's web pages
+		session("udp", gatewayIP, 33024, "198.51.100.53", 53),
+	)
+	a := h.agg(day0, at(1, 0, 0))
+	checkConsistent(t, a)
+	for _, d := range a.Devices {
+		if d.Key == "ip:"+gwLAN {
+			t.Fatalf("the gateway's LAN address is a device of its own: %+v", d)
+		}
+	}
+	if f := findFlow(t, a, gatewayKey, lanIP(20), 514, "udp"); f.LAN != gwLAN || f.Inbound {
+		t.Errorf("gateway -> PC flow = %+v", f)
+	}
+	findFlow(t, a, gatewayKey, "198.51.100.53", 53, "udp")
+	if f := findFlow(t, a, macKey(5), gwLAN, 443, "tcp"); f.Inbound {
+		t.Errorf("PC -> gateway flow = %+v", f)
+	}
+	if d := findDevice(t, a, gatewayKey); d.Weight != 2 {
+		t.Errorf("gateway device = %+v, want weight 2", d)
+	}
+
+	// Without the option the address is a device like any unlisted one (the old behaviour).
+	h2 := newHarness(t, at(0, 12, 0), Options{})
+	h2.nat(at(0, 10, 0), session("udp", gwLAN, 40000, lanIP(20), 514))
+	findDevice(t, h2.agg(day0, at(1, 0, 0)), "ip:"+gwLAN)
 }

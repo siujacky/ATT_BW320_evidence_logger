@@ -71,7 +71,8 @@ type ConnStoreUsage struct {
 // ConnDevice is a device seen in the NAT samples of a period. Key identifies it across address
 // changes: "mac:<mac>" when the Device List gave the MAC address of its LAN address at the time
 // of a sample, otherwise "ip:<address>"; the gateway itself (sessions with no private address,
-// such as the gateway's own connections from its public address) is "gateway".
+// such as the gateway's own connections from its public address, and those on its own LAN
+// address) is "gateway".
 type ConnDevice struct {
 	Key        string `json:"key"`
 	Name       string `json:"name,omitempty"` // the Device List name, newest in the period

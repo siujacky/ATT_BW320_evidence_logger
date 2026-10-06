@@ -20,7 +20,7 @@ func FuzzParsers(f *testing.F) {
 		"events_checked.html", "login_nonce.html", "hiddenpage.html", "home.html", "broadbandconfig.html",
 		"syslog_select.html", "syslog_checkbox_off.html", "syslog_checkbox_on.html", "syslog_radio.html",
 		"syslog_real_off.html", "syslog_real_on_update.html", "syslog_real_on.html",
-		"nattable_synthetic.html", "devices_real.html"} {
+		"nattable_synthetic.html", "nattable_real.html", "devices_real.html"} {
 		f.Add(fixture(f, name))
 	}
 	f.Add([]byte("<form><table><tr><th>Syslog<td><select name=s><option value=1 selected>On<noscript><input type=submit name=Update></noscript></select><label for=s>Server Port</label>"))
@@ -76,7 +76,7 @@ func FuzzParsers(f *testing.F) {
 // that cannot hold a "Name:" line. The seed corpus runs with every "go test"; fuzz with
 // go test -fuzz=FuzzNetworkPages ./internal/gateway/
 func FuzzNetworkPages(f *testing.F) {
-	for _, name := range []string{"nattable_synthetic.html", "devices_real.html", "login_nonce.html", "home.html",
+	for _, name := range []string{"nattable_synthetic.html", "nattable_real.html", "devices_real.html", "login_nonce.html", "home.html",
 		"syslog_real_off.html", "sysinfo.html"} {
 		f.Add(fixture(f, name))
 	}
