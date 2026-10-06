@@ -52,6 +52,7 @@ type shellExecuteInfo struct {
 const (
 	seeMaskNoCloseProcess = 0x00000040
 	seeMaskNoAsync        = 0x00000100
+	seeMaskFlagNoUI       = 0x00000400 // errors are returned instead of shown in a dialog
 )
 
 // runElevated starts this program again with administrator rights - Windows shows its UAC
@@ -61,12 +62,26 @@ func runElevated(args []string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	code, err := shellExecuteWait("runas", exe, args, windows.SW_SHOWNORMAL, 0)
+	if errors.Is(err, windows.ERROR_CANCELLED) {
+		return 0, errElevationCancelled
+	}
+	return code, err
+}
+
+// shellExecuteWait runs file with args through ShellExecuteEx (verb "runas" asks for
+// administrator rights), waits for the process and returns its exit code. mask adds
+// SEE_MASK_* flags (tests pass seeMaskFlagNoUI so that an error never waits on a dialog).
+func shellExecuteWait(verb, file string, args []string, show int32, mask uint32) (int, error) {
 	quoted := make([]string, len(args))
 	for i, a := range args {
 		quoted[i] = syscall.EscapeArg(a)
 	}
-	verb, _ := windows.UTF16PtrFromString("runas")
-	file, err := windows.UTF16PtrFromString(exe)
+	v, err := windows.UTF16PtrFromString(verb)
+	if err != nil {
+		return 0, err
+	}
+	f, err := windows.UTF16PtrFromString(file)
 	if err != nil {
 		return 0, err
 	}
@@ -74,18 +89,19 @@ func runElevated(args []string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	dir, _ := windows.UTF16PtrFromString(filepath.Dir(exe))
-	info := shellExecuteInfo{fMask: seeMaskNoCloseProcess | seeMaskNoAsync, lpVerb: verb, lpFile: file,
-		lpParameters: params, lpDirectory: dir, nShow: windows.SW_SHOWNORMAL}
+	dir, _ := windows.UTF16PtrFromString(filepath.Dir(file))
+	info := shellExecuteInfo{fMask: seeMaskNoCloseProcess | seeMaskNoAsync | mask, lpVerb: v, lpFile: f,
+		lpParameters: params, lpDirectory: dir, nShow: show}
 	info.cbSize = uint32(unsafe.Sizeof(info))
 	if r, _, callErr := procShellExecuteExW.Call(uintptr(unsafe.Pointer(&info))); r == 0 {
-		if errors.Is(callErr, windows.ERROR_CANCELLED) {
-			return 0, errElevationCancelled
+		var errno syscall.Errno
+		if errors.As(callErr, &errno) && errno == windows.ERROR_CANCELLED {
+			return 0, windows.ERROR_CANCELLED
 		}
-		return 0, fmt.Errorf("start as administrator: %w", callErr)
+		return 0, fmt.Errorf("start %s: %w", filepath.Base(file), callErr)
 	}
 	if info.hProcess == 0 {
-		return 0, errors.New("start as administrator: no process handle")
+		return 0, fmt.Errorf("start %s: no process handle", filepath.Base(file))
 	}
 	defer windows.CloseHandle(info.hProcess)
 	if _, err := windows.WaitForSingleObject(info.hProcess, windows.INFINITE); err != nil {
