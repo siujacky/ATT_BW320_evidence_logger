@@ -61,3 +61,74 @@ stay as other shapes the label-based reader must handle (or refuse).
 | syslog_radio.html | radio buttons Enable/Disable | off; server empty, port 514, level Warning | labels are bare `<th>` texts with a trailing colon; option values `info`, `debug`, ... |
 | syslog_noport.html | drop-down Enabled/Disabled | on; 192.168.1.64, level Notice | no Server Port control: must be refused |
 | syslog_fewlevels.html | drop-down Enabled/Disabled | on; 192.168.1.64, port 514, level Notice | no "Informational" level: setting it must be refused |
+
+## The Network page's pages: Device List and NAT table
+
+The dashboard's Network page (docs/syslog-map-graphic.md) reads two more pages, never posting
+their forms. Neither page is evidence.
+
+| file | page | what it is |
+|---|---|---|
+| devices_real.html | devices.ha (Device > Device List; readable without login) | **sanitized capture** of the owner's gateway, firmware 6.34.7, 8 devices |
+| nattable_synthetic.html | nattable.ha (Diagnostics > NAT Table; behind the login) | **synthetic**: no capture exists yet |
+
+### devices_real.html (sanitized capture)
+
+One table; each device is a block of `<th scope="row">` label rows, the blocks separated by a
+row holding only `<hr class="reshr">`. Labels: *MAC Address*, *IPv4 Address / Name* (or just
+*Name* for a device without an IPv4 address), *Last Activity*, *Status*, *Allocation*,
+*Connection Type* (a `<pre>` of `<br>`-separated lines: "Wi-Fi", the band and radio, "Type:
+Home", "Name: *the Wi-Fi network's name*"; or "Ethernet LAN-1"), *Connection Speed*, *Mesh
+Client*, then repeated *IPv6 Address* / *Type* / *Valid Lifetime* / *Preferred Lifetime* groups.
+The gateway's own sloppy markup is kept: the Connection Speed rows of Wi-Fi devices are
+`<th>Connection Speed</th></td></tr>` with no value cell, and the wired device that is off shows
+the bare template `Mbps\tduplex` (a tab between the words). The page also carries a form with a
+nonce and a **Clear and Rescan for Devices** button, which empties the gateway's device table: it
+is never posted.
+
+Sanitized by replacing values only - the markup, the labels and the LF line endings are as the
+gateway sent them (a comment at the top says so):
+
+| what | replaced by |
+|---|---|
+| device names | generic names: office-pc, laptop, phone, living-room-tv, tablet, printer, thermostat, game-console |
+| MAC addresses | the documentation range `00:00:5e:00:53:01` ... `:08` (RFC 7042) |
+| IPv4 addresses | `192.168.1.101` ... `.106` |
+| IPv6 addresses | the documentation prefix `2001:db8::/32` (RFC 3849) and link-local `fe80::10xx` |
+| Wi-Fi network name | `ATT-EXAMPLE` (the parser must never keep it) |
+| Last Activity | `Mon Oct 5 12:0N:00 2026` |
+| nonce | all zeros |
+
+What it holds: one Ethernet device (LAN-1, off, no IPv4 address: a *Name* row) and seven Wi-Fi
+devices - six on 5 GHz (Radio-1 and Radio-2), one on 2.4 GHz - one of them without an IPv4
+address (*Name*); four with IPv6 groups (global and link-local addresses, `2001:db8:0::100`
+written uncompressed).
+network_test.go asserts every field of all 8 devices and derives further variants from the
+capture with regular expressions (other line endings, raw windows-1252 bytes, no separator rows,
+line breaks instead of `<br>`, other MAC spellings, no devices at all, a network name that reads
+like a band or a port).
+
+### nattable_synthetic.html (synthetic, not a capture)
+
+The NAT table is behind the login and nobody may log in to the gateway to capture it, so this
+page is **made up** around what an earlier read-only tool reported of the real page: a table with
+the columns *Protocol*, *TCP State*, *Source Address*, *Source Port*, *Destination Address*,
+*Destination Port* (one row per session; 356 were shown once), the label rows *Total sessions
+available* and *Total sessions in use*, and a list labelled *Select display option*. A comment
+at its top says so. Replace it with a sanitized capture once the deployed service has saved the
+real page (`connections\last-nattable.html`, docs/syslog-map-graphic.md).
+
+The chrome is copied from `syslog_real_off.html` (title "NAT Table", NAT Table selected in the
+Diagnostics menu); the content: a form posting to `nattable.ha` with a zero nonce, the *Select
+display option* list (All/TCP/UDP/ICMP sessions, "All sessions" selected, submitted on change,
+with a noscript **Update** button - never posted), the two totals (8192 available, 25 in use) and
+a table of 25 sessions with documentation addresses: LAN sources `192.168.1.101` ... `.106` (the
+Device List's devices) and `.150` (a device it does not list) to public `192.0.2.x`,
+`198.51.100.x` and `203.0.113.x`; TCP sessions in states such as ESTABLISHED, TIME_WAIT,
+SYN_SENT, CLOSE_WAIT, FIN_WAIT, LAST_ACK; UDP and ICMP sessions with an empty (or `&nbsp;`, or
+`-`) TCP State; one inbound session (a public source to `192.168.1.105:8080`); one of the
+gateway's own (from its public address `203.0.113.10`); one IPv6 session; rows with the
+gateway's kind of sloppy markup (missing `</td>`, a stray `</td>`, a missing `</tr>`); and one
+malformed row (source `192.168.1.300`) that must be skipped, not fatal. Other shapes of the page
+(columns in another order, address:port cells, extra columns, no totals, totals in text, upper
+case, CRLF, a cell left out, two-level headers, ...) are inline pages in network_test.go.

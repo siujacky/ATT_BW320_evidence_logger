@@ -86,8 +86,14 @@ type Options struct {
     Location         *time.Location // gateway clock zone (default time.Local)
     Logger           *slog.Logger
     HTTPClient       *http.Client   // tests only; nil → built-in client with pinning
+    // The login policy outlives the process (docs/DESIGN.md §2): restored from LoginPolicy, handed to
+    // OnLoginPolicy after every change (cmd/att-monitor keeps it in state\gateway-login.json).
+    LoginPolicy   LoginPolicy      // {LastAttempt, Failures, FullUntil}
+    OnLoginPolicy func(LoginPolicy)
 }
 func New(opts Options) *Client   // implements contracts.Gateway
+const SessionReuse = 5 * time.Minute // an authenticated session is reused this long after its last use
+func (c *Client) LoginAttempts() uint64 // the login forms posted (the monitor counts the NAT reads' logins)
 func ParseSysInfo(body []byte) (*model.SystemInfo, error)
 func ParseBroadband(body []byte) (*model.BroadbandStatus, error)
 func ParseFiber(body []byte) (*model.FiberStatus, error)
@@ -102,9 +108,21 @@ func Derive(s *model.GatewaySnapshot, fetchedAt time.Time, loc *time.Location) m
 // syslog controls - with the page's Update round first when the switch changes (firmware 6.34.7
 // disables the fields while Syslog is off), then the Save - reads the page back and fails unless it
 // shows the target. The monitor calls it to keep the page set (docs/syslog-snmp-traffic.md §3.1).
+// The Network page (docs/DESIGN.md §19), both read only - their forms are never posted:
+func ParseNATTable(body []byte) (model.NATTable, error)   // Diagnostics > NAT Table, by its column labels
+func ParseDevices(body []byte) ([]model.LANDevice, error) // Device > Device List
+var ErrNATPage, ErrDevicesPage error                       // the page is not understood (returned with the page)
+// Client.NATTable: authenticated, through the login policy, in the shared session (within 5 min of the
+// previous authenticated request it costs one GET; a page up to NATMaxBodyBytes, 16 MiB). A read that
+// fails otherwise than with the login page keeps the session. Client.Devices: unauthenticated, in the
+// status pages' session (no login, not subject to the login policy). Both return the exact page read
+// (also with an error, as much as arrived).
+func (e *CooldownError) CooldownUntil() time.Time // when the next login attempt is allowed
 ```
 Fixtures: `testdata/gateway/*.html` (sanitized real pages, see README there: `syslog_real_off.html`
-is the real Syslog page; the pages derived from it, and the other `syslog_*.html`, are synthetic).
+is the real Syslog page; the pages derived from it, and the other `syslog_*.html`, are synthetic;
+`devices_real.html` is a sanitized capture of the Device List, `nattable_synthetic.html` is made up:
+the NAT table is behind the login).
 
 ## internal/probe
 ```go
@@ -146,6 +164,14 @@ type Options struct {
     // across restarts; another gets that bookkeeping in memory only.
     Syslog      contracts.SyslogReceiver
     SyslogStore contracts.SyslogStore
+    // The Network page's samples (docs/DESIGN.md §19; nil: no samplers, Status.Connections nil).
+    // With Config.Connections.Enabled the monitor reads the NAT table every connections.interval
+    // (authenticated, under the guard of every other authenticated request, after the startup
+    // settings check, with a login budget kept in StateDir\nat-sampler.json) and the Device List
+    // every connections.devices_interval, and appends what it reads; never to the ledger. Whether
+    // or not the samplers run, it applies the store's retention limits hourly and deletes the raw
+    // page copies older than connections.keep_days.
+    Conns       contracts.ConnStore
 }
 func New(opts Options) (*Monitor, error)
 func (m *Monitor) Run(ctx context.Context) error // writes monitor_start … monitor_stop
@@ -194,6 +220,7 @@ type Options struct {
     SyslogReader  contracts.SyslogReader      // GET /api/syslog (entries linked to syslog_chunk records via Reader)
     SyslogControl contracts.SyslogControl     // POST /api/syslog/retention, POST /api/gateway/syslog
     LiveTraffic   contracts.LiveTrafficSource // GET /api/traffic/live
+    Network       contracts.NetworkView       // GET /api/network/connections, /firewall, /status (samplers from Status)
     Version  string
     Logger   *slog.Logger
 }
@@ -208,6 +235,11 @@ const DefaultSyslogLimit = 200; const MaxSyslogLimit = 5000                    /
 const MaxSyslogAnswerBytes = 16 << 20 // GET /api/syslog also ends its list before the message that would take its JSON beyond this
 const DefaultSyslogSpan = 24 * time.Hour; const MaxSyslogSpan = 31 * 24 * time.Hour
 const WarningHeader = "X-ATT-Monitor-Warning"
+// GET /api/network/connections and /firewall: range= (NetworkRanges, ending now) or from=/to=,
+// device= (connections only), limit=; answered within networkTimeout (30 s, tied to the request).
+var NetworkRanges = []string{"1h", "24h", "7d", "30d"}; const DefaultNetworkRange = "24h"
+const MaxNetworkSpan = 31 * 24 * time.Hour; const MaxNetworkLimit = 1000; const MaxNetworkDeviceChars = 128
+const NetworkFutureSlack = time.Hour // to may lie this far after the server's clock
 ```
 
 ## internal/export
@@ -254,6 +286,7 @@ func IsAdmin() bool
 func Run(run func(ctx context.Context, power <-chan string) error) error // SCM handler
 func NewEventLogHandler(level slog.Level) (slog.Handler, func(), error)    // writes to Application log
 func SecureDataDir(dir string) error    // SYSTEM+Administrators full, Users read&execute, no inheritance from parent
+func CheckDataDir(dir string) error     // SecureDataDir's refusals, changing nothing (install runs it before anything else)
 ```
 
 ## internal/sysinfo
@@ -337,9 +370,11 @@ type Options struct {
     Now              func() time.Time
     Logger           *slog.Logger
 }
-func New(o Options) (*Store, error) // implements contracts.SyslogStore (and SyslogReader)
+func New(o Options) (*Store, error) // implements contracts.SyslogStore (and SyslogReader, SyslogChunkSource)
 func (s *Store) Close() error                   // releases the open chunk's file without sealing it
-func (s *Store) Chunks() []model.SyslogChunk    // the sealed chunks kept, oldest first
+// contracts.SyslogChunkSource, for the Network page's firewall view (internal/netmap):
+func (s *Store) Chunks() []model.SyslogChunkRef // the sealed chunks kept, oldest first (From/To: earliest/latest receive time)
+func (s *Store) EachOpen(ctx context.Context, from, to time.Time, fn func(*model.SyslogMessage) error) error // the open chunk's messages
 // The writer's bookkeeping of its records (the monitor uses them when the store has them):
 func (s *Store) MarkRecorded(name string, seq uint64) error // the chunk's syslog_chunk record (kept in its sidecar)
 func (s *Store) Unrecorded() []model.SyslogChunk            // sealed chunks without a noted record, oldest first
@@ -348,6 +383,79 @@ func (s *Store) CommitPrune() ([]model.SyslogChunkRef, error)            // dele
 func (s *Store) CancelPrune()                                            // keep it (its record was refused)
 ```
 One writer (the monitor; its ledger lock keeps a second one away), any number of readers.
+
+## internal/connstore
+The connection store: the Network page's samples of the gateway's NAT table and Device List in daily
+files, within a retention limit (docs/DESIGN.md §19). Not evidence: it never writes the ledger.
+```go
+const DefaultKeepDays = 30; const DefaultKeepMB = 200
+var ErrClosed error // the writing methods after Close
+type Options struct {
+    KeepDays, KeepMB int              // retention limits (0 → the defaults; at least 1 day and 1 MiB)
+    Logger           *slog.Logger
+    Now              func() time.Time // which UTC day is today (never pruned)
+}
+func Open(dir string, opts Options) (*Store, error) // config.Paths.Connections; creates it; repairs; compresses past days and prunes in the background
+// *Store implements contracts.ConnStore: AppendNAT, AppendDevices, Aggregate, Devices, Prune,
+// SetRetention, Usage. Aggregate counts at most 200,000 flows one by one (FlowsLeftOut: the rest).
+func (s *Store) Close() error // closes the files being appended to, waits for Open's background work; reading keeps working
+// The Device List read in effect at from, then the later reads before to, oldest first: netmap's firewall
+// view names each dropped packet's LAN address after the read in effect when it was received.
+func (s *Store) EachDevices(ctx context.Context, from, to time.Time, fn func(at time.Time, devices []model.LANDevice) error) error
+```
+Files `nat-YYYY-MM-DD.jsonl` and `devices-YYYY-MM-DD.jsonl` per UTC day, gzipped (`.jsonl.gz`) once
+the day is over; files with other names in the folder are never touched. One writer (the monitor:
+its ledger lock keeps a second one away, so the CLI never opens the store), any number of readers.
+
+## internal/ipintel
+Names addresses and ports without asking anyone (docs/DESIGN.md §19): the offline IPtoASN database
+(public domain, PDDL 1.0), a table of well-known ports, and a cache of reverse DNS names.
+```go
+const DefaultURLv4 = "https://iptoasn.com/data/ip2asn-v4.tsv.gz"; const DefaultURLv6 = "https://iptoasn.com/data/ip2asn-v6.tsv.gz"
+const DefaultRefresh = 7 * 24 * time.Hour; const MinRefresh = time.Hour
+type Resolver interface { LookupAddr(ctx context.Context, addr string) ([]string, error) } // *net.Resolver is one
+type Options struct {
+    Enabled      bool          // geo.enabled; without it Lookup only classifies, PTR returns "", Run does nothing
+    Download     bool          // geo.download: fetch missing tables, look for newer ones every Refresh
+    URLv4, URLv6 string        // https, no credentials, query or fragment (with Download, Open fails otherwise); default DefaultURLv4/v6
+    Refresh      time.Duration // geo.refresh (default DefaultRefresh, at least MinRefresh)
+    ReverseDNS   bool          // connections.reverse_dns: PTR lookups in the background (off: ptr-cache.json deleted)
+    KeepDays     int           // connections.keep_days: the longest a PTR answer is kept (below its time to live)
+    UserAgent    string
+    HTTPClient   *http.Client  // tests; copied, https redirects only, no cookies
+    Resolver     Resolver      // default net.DefaultResolver (this computer's)
+    Logger       *slog.Logger
+    Now          func() time.Time
+}
+func Open(dir string, opts Options) (*DB, error) // config.Paths.Geo; reads and downloads nothing
+func (d *DB) Run(ctx context.Context)             // loads, downloads, resolves until ctx ends; saves the PTR cache
+// *DB implements contracts.IPIntel: Lookup, Service, PTR, Updated, Status (never wait for the network).
+```
+Files in its folder: `ip2asn-v4.tsv.gz`, `ip2asn-v6.tsv.gz` (as downloaded, or placed by hand),
+`ip2asn.json` (what was downloaded, when looked for), `ptr-cache.json` (the reverse DNS answers still
+current only: never one that has outlived its time to live).
+
+## internal/netmap
+Builds the Network page (docs/DESIGN.md §19) from the connection store, the IP database and the syslog
+store. Reads only; keeps nothing but in-memory caches.
+```go
+const MaxRange = 31 * 24 * time.Hour; const DefaultPeriod = 24 * time.Hour
+const DefaultLimit = 200; const MaxLimit = 1000                  // table rows (NetQuery.Limit)
+const DefaultCacheBytes = 64 << 20; const DefaultCacheChunks = 16384 // sealed chunks' firewall summaries
+const DefaultResultTTL = 30 * time.Second                        // a view is reused this long for the same request (a range ending now: by its name)
+var ErrRange error                                               // the period is not valid
+type Options struct {
+    Conns  contracts.ConnStore         // nil: Connections fails (ErrUnavailable)
+    Intel  contracts.IPIntel           // nil: addresses classified only, no organisations, countries, services
+    Syslog contracts.SyslogChunkSource // nil: Firewall fails (ErrUnavailable)
+    Logger *slog.Logger
+    Now    func() time.Time
+    CacheBytes int64; CacheChunks int; ResultTTL time.Duration // 0 → defaults; negative: no cache / no reuse
+}
+func New(o Options) *View // implements contracts.NetworkView: Connections, Firewall, NetworkStatus
+// One connections view and one firewall view are built at a time; organisations are keyed by the
+// name the IP database gives them ("org:google"), else by AS ("as64500").
+```
 
 ## Syslog and traffic contracts
 Defined in `internal/model/syslog.go`, `internal/contracts` and `internal/config` (docs/DESIGN.md §18):
@@ -366,6 +474,26 @@ config.GatewayConfig.EnforceSyslog (default true), SyslogLevel (default "")
 config.MinSyslogKeepMB, MaxSyslogKeepMB, MaxSyslogKeepDays; config.Paths.Syslog
 ```
 
+## Network page contracts
+Defined in `internal/model/network.go`, `internal/contracts` and `internal/config` (docs/DESIGN.md §19).
+None of these types is ever written to the ledger.
+```go
+contracts.ConnStore          // AppendNAT, AppendDevices, Aggregate(ctx, ConnQuery), Devices, Prune, SetRetention, Usage (connstore.Store)
+contracts.IPIntel            // Lookup, Service, PTR, Updated, Status (ipintel.DB)
+contracts.SyslogChunkSource  // Chunks, OpenChunk, EachOpen, Usage (syslogstore.Store)
+contracts.NetworkView        // Connections(ctx, NetQuery), Firewall(ctx, NetQuery), NetworkStatus (netmap.View)
+contracts.ConnQuery{From, To, Device}; contracts.NetQuery{From, To, Range, Device, Limit}
+contracts.Gateway            // + NATTable, Devices (gateway.Client)
+model.NATSession / NATTable / LANDevice; model.ConnStoreUsage / ConnDevice / ConnFlow / ConnAggregate
+model.IPInfo (Kind: model.IPKind*) / IPIntelStatus; model.ConnSamplerStatus (Status.Connections)
+model.NetConnections / NetDevice / NetOrg / NetService / NetLink / NetCountry / NetConnRow / NetTotals
+model.NetFirewall (+ OutboundDevices) / FwHour / FwSource / FwService / FwReason / FwOutRow; model.NetworkStatus (+ ConfigWarnings)
+config.ConnectionsConfig {Enabled, Interval, DevicesInterval, KeepDays, KeepMB, ReverseDNS}
+config.GeoConfig {Enabled, Download, URLv4, URLv6, Refresh}; config.Paths.Connections, Paths.Geo
+config.MinConnInterval … MaxGeoRefresh (the settings' limits: Load brings these sections into them)
+(*config.Config).Warnings() []string // what Load replaced in these sections, and by what (never saved)
+```
+
 ## cmd/att-monitor
 CLI and wiring (docs/DESIGN.md §14). Written last, during integration. `openStack` opens the ledger,
 then the syslog store: in the service and console modes with `syslog.enabled` a writable
@@ -378,3 +506,15 @@ the Windows Firewall rule of the receiver (`netsh`, through a replaceable runner
 it) and `uninstall` removes it. `gateway syslog on|off` goes through `POST /api/gateway/syslog`, or
 with the service stopped through `Monitor.SetGatewaySyslog` after `strictGatewayTLS` (a replaceable
 function, so tests never reach a gateway).
+
+The Network page (service and console modes only): `openStack` opens the connection store in
+`Paths.Connections` (`monitor.Options.Conns`; also with `connections.enabled` off, so that old
+samples are still shown and pruned) and the IP database in `Paths.Geo` (`ipintel.Open` with
+`Enabled` = `geo.enabled`), and builds `netmap.New` over them and the syslog store
+(`web.Options.Network`); a part that cannot be opened is logged and passed as an untyped nil.
+`openStack` sets up the operational log before it loads the configuration (a config.json it cannot
+use is explained there), logs `config.Warnings`, and the view passed to the dashboard adds them to
+its status (`NetworkStatus.ConfigWarnings`).
+`runMonitor` runs `(*ipintel.DB).Run` beside the MongoDB copy, and `stack.close` closes the
+connection store after the monitor stopped. The CLI never opens the connection store (it has one
+writer): `att-monitor network` reads `GET /api/network/*` of the running service.

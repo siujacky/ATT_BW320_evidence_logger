@@ -373,6 +373,126 @@ func TestLiveTrafficNeverQueuesBehindAPoll(t *testing.T) {
 	}
 }
 
+// A flow-meter read skipped because the gateway lock is held says what holds it, and speaks of the
+// evidence only for what is evidence: the Network page's samplers hold the lock too - a NAT read
+// for up to natTimeout, a login included, a Device List read for up to devTimeout - and neither is
+// evidence, nor does the next reading follow "within seconds" of one. The reason begins with
+// "skipped" (the dashboard shows it as a wait, not as a failed read); while what holds the lock
+// does not say what it does, the reason names none. Once it is done, the flow meter reads again.
+func TestLiveTrafficSaysWhatHoldsTheGateway(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name string
+		// hold holds the gateway lock as the case's holder does: its request to the gateway calls
+		// wait before it answers. It runs in a goroutine of its own.
+		hold func(r *rig, wait func())
+		want string // the reason says "the monitor was <want>"
+		// notEvidence: what holds the lock is not evidence, and the reason must not say it is.
+		notEvidence bool
+	}{
+		{"a poll's snapshot", func(r *rig, wait func()) {
+			r.gw.mu.Lock()
+			r.gw.snap = func(call int, pages []string, trigger string) (model.GatewaySnapshot, map[string][]byte, error) {
+				wait()
+				return okSnapshot(pages, time.Now()), pageBodies(pages, "ok"), nil
+			}
+			r.gw.mu.Unlock()
+			r.m.takeSnapshot(ctx, trigPeriodic, nil)
+		}, "taking a snapshot of the gateway for its evidence", false},
+		{"the settings check's read of the outage-redirect setting", func(r *rig, wait func()) {
+			r.gw.mu.Lock()
+			r.gw.notifHold = wait
+			r.gw.mu.Unlock()
+			_ = r.m.checkNotification(ctx)
+		}, "checking the gateway's outage-redirect setting", false},
+		{"the operator's change of the outage-redirect setting", func(r *rig, wait func()) {
+			r.gw.mu.Lock()
+			r.gw.notifHold = wait
+			r.gw.mu.Unlock()
+			_, _ = r.m.SetGatewayNotification(ctx, false, "web")
+		}, "changing the gateway's outage-redirect setting", false},
+		{"the settings check's read of the Syslog page", func(r *rig, wait func()) {
+			r.gw.mu.Lock()
+			read := r.gw.syslog
+			r.gw.syslog = func() (model.SyslogSetting, []byte, error) {
+				wait()
+				return read()
+			}
+			r.gw.mu.Unlock()
+			_ = r.m.checkNotification(ctx)
+		}, "checking the gateway's Syslog setting", false},
+		{"the operator's change of the Syslog page", func(r *rig, wait func()) {
+			r.gw.mu.Lock()
+			set := r.gw.setSyslog
+			r.gw.setSyslog = func(want model.SyslogTarget) ([]byte, []byte, error) {
+				wait()
+				return set(want)
+			}
+			r.gw.mu.Unlock()
+			_, _ = r.m.SetGatewaySyslog(ctx, true, "web")
+		}, "changing the gateway's Syslog setting", false},
+		{"a NAT read for the Network page", func(r *rig, wait func()) {
+			r.gw.mu.Lock()
+			r.gw.nat = func() (model.NATTable, []byte, error) {
+				wait()
+				return testNATTable(), testNATPage, nil
+			}
+			r.gw.mu.Unlock()
+			r.m.sampleNAT(ctx)
+		}, "reading the gateway's NAT table for the Network page", true},
+		{"a Device List read for the Network page", func(r *rig, wait func()) {
+			r.gw.mu.Lock()
+			r.gw.devices = func() ([]model.LANDevice, []byte, error) {
+				wait()
+				return testDevices(), testDevicesPage, nil
+			}
+			r.gw.mu.Unlock()
+			r.m.sampleDevices(ctx)
+		}, "reading the gateway's Device List for the Network page", true},
+		{"a holder that does not say what it does", func(r *rig, wait func()) {
+			r.m.gwMu.Lock()
+			defer r.m.gwMu.Unlock()
+			wait()
+		}, "using the gateway", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, _, _ := networkRig(t)
+			r.m.liveEvery = 0
+			r.m.conns.natTimeout, r.m.conns.devTimeout = time.Hour, time.Hour
+			entered, enter := gate()
+			released, release := gate()
+			defer release() // also when the test fails: nothing is left waiting
+			held := make(chan struct{})
+			go func() {
+				defer close(held)
+				tc.hold(r, func() {
+					enter()
+					<-released
+				})
+			}()
+			await(t, "the holder's request to the gateway", entered)
+			v, err := r.m.LiveTraffic(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.HasPrefix(v.Err, "skipped: ") || !strings.Contains(v.Err, "the monitor was "+tc.want) || strings.Contains(v.Err, "within seconds") {
+				t.Fatalf("the skip reason %q; want one that begins with \"skipped: \" and says the monitor was %s", v.Err, tc.want)
+			}
+			if tc.notEvidence && strings.Contains(v.Err, "evidence") {
+				t.Fatalf("the skip reason %q speaks of the evidence for a read that is not evidence", v.Err)
+			}
+			if _, triggers := r.gw.snapshotCalls(); slices.Contains(triggers, trigLive) {
+				t.Fatalf("the flow meter read the gateway while it was held: %v", triggers)
+			}
+			release()
+			await(t, "the end of the holder", held)
+			if v := liveRead(t, r); v.Err != "" || v.At == "" {
+				t.Fatalf("once the holder is done: %+v", v)
+			}
+		})
+	}
+}
+
 // A flow-meter read holds the gateway lock for liveTimeout at most: an evidence snapshot that
 // needs the lock meanwhile - the gateway answers nothing, an incident polls every 15 s - waits no
 // longer than that, not for the gateway's timeout.

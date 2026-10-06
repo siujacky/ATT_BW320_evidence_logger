@@ -171,7 +171,7 @@ func (m *Monitor) syncSyslog(ctx context.Context, w syslogWant) (model.ConfigCha
 		raw []byte
 		err error
 	)
-	if aerr := m.withGatewayAuth(func() {
+	if aerr := m.withGatewayAuth(gwUseSyslog, func() {
 		sctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer cancel()
 		set, raw, err = m.gw.Syslog(sctx)
@@ -338,7 +338,7 @@ func (m *Monitor) changeSyslog(ctx context.Context, before model.SyslogSetting, 
 	)
 	// A changed gateway certificate that a status read met since the page was read pauses the
 	// change before any request (withGatewayAuth): a failed attempt like one the client refused.
-	if aerr := m.withGatewayAuth(func() {
+	if aerr := m.withGatewayAuth(gwUseSetSyslog, func() {
 		sctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer cancel()
 		pageBefore, pageAfter, err = m.gw.SetSyslog(sctx, target)
@@ -599,7 +599,8 @@ func (m *Monitor) syslogUnreachable(ip, adapterGW string) string {
 // this computer's address toward the gateway is not known or not one the gateway can send to.
 // A switch-off that fails waits: the settings checks that follow make it (syslogOffDue). Like
 // SetGatewayNotification it does not wait for a settings check or another change that is running
-// (contracts.ErrBusy) and is refused while a changed gateway certificate waits for confirmation.
+// (contracts.ErrBusy) - but it does wait for a NAT read for the Network page in progress, at the
+// gateway lock - and is refused while a changed gateway certificate waits for confirmation.
 // A configuration that could not be saved applies until the monitor restarts: the change is then
 // returned with that error - joined to the error that kept the page from being set, if any.
 func (m *Monitor) SetGatewaySyslog(ctx context.Context, enabled bool, actor string) (model.ConfigChange, error) {
@@ -612,7 +613,8 @@ func (m *Monitor) SetGatewaySyslog(ctx context.Context, enabled bool, actor stri
 	}
 	// No settings check may run between the choice and the change: it would enforce the
 	// previous choice. A check (or another change) in progress makes this one busy rather than
-	// queue behind a login.
+	// queue behind a login; a NAT read in progress, which does not hold notifMu, is waited for at
+	// the gateway lock (natTimeout at most).
 	if !m.notifMu.TryLock() {
 		return model.ConfigChange{}, fmt.Errorf("a gateway settings check or change is already running: %w", contracts.ErrBusy)
 	}

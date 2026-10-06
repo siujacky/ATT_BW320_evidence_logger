@@ -635,6 +635,84 @@ func TestSecureDataDirRefusesCriticalFolders(t *testing.T) {
 	}
 }
 
+// CheckDataDir refuses what SecureDataDir would refuse, and changes and creates nothing: the
+// installer runs it before it stops the service, so that a data directory written by a newer
+// version (a folder this version does not know) leaves the installed service as it was.
+func TestCheckDataDir(t *testing.T) {
+	root := t.TempDir()
+	data := filepath.Join(root, "ATTMonitor")
+	if err := config.PathsFor(data).MkdirAll(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(data, "config.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckDataDir(data); err != nil {
+		t.Fatalf("a complete data directory: %v", err)
+	}
+	missing := filepath.Join(root, "new", "ATTMonitor")
+	if err := CheckDataDir(missing); err != nil {
+		t.Fatalf("a data directory still to be created: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "new")); err == nil {
+		t.Error("CheckDataDir created a folder")
+	}
+
+	// A folder of a newer version's layout.
+	if err := os.Mkdir(filepath.Join(data, "newer-feature"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err := CheckDataDir(data)
+	if err == nil || !strings.Contains(err.Error(), `"newer-feature"`) || !strings.Contains(err.Error(), "not part of an att-monitor data directory") {
+		t.Errorf("a folder this version does not know: %v", err)
+	}
+	if isProtected(t, data) {
+		t.Error("CheckDataDir changed the ACL")
+	}
+
+	file := filepath.Join(root, "file.txt")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "target")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	junction := filepath.Join(root, "junction")
+	haveJunction := exec.Command("cmd", "/c", "mklink", "/J", junction, target).Run() == nil
+	for _, tc := range []struct {
+		name, path, want string
+		skip             bool
+	}{
+		{"empty path", " ", "empty path", false},
+		{"regular file", file, "not a directory", false},
+		{"junction", junction, "reparse point", !haveJunction},
+	} {
+		if tc.skip {
+			t.Logf("%s: cannot be made here", tc.name)
+			continue
+		}
+		if err := CheckDataDir(tc.path); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: %v, want %q", tc.name, err, tc.want)
+		}
+	}
+
+	// Critical folders, as SecureDataDir refuses them.
+	sys := filepath.Join(root, "sys")
+	if err := os.Mkdir(sys, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	useCriticalStandIns(t, criticalSet{trees: []string{sys}})
+	for _, p := range []string{sys, filepath.Join(sys, "x", "ATTMonitor"), root} {
+		if err := CheckDataDir(p); err == nil {
+			t.Errorf("CheckDataDir(%s) accepted a critical folder", p)
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(sys, "x")); err == nil {
+		t.Error("CheckDataDir created a folder inside a critical one")
+	}
+}
+
 // SecurePrivateDir makes a folder admin-only; it accepts only a folder directly inside an
 // att-monitor data directory (the keys folder), never e.g. a Documents folder by mistake.
 func TestSecurePrivateDirRequiresDataDirParent(t *testing.T) {

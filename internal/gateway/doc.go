@@ -4,7 +4,7 @@
 // It has three layers:
 //
 //   - Page parsers (ParseSysInfo, ParseBroadband, ParseFiber, ParseLAN, ParseNotification,
-//     ParseSyslog, IsLoginPage, SessionsFull). They work on the exact response bytes, never
+//     ParseSyslog, ParseNATTable, ParseDevices, IsLoginPage, SessionsFull). They work on the exact response bytes, never
 //     assume valid UTF-8 (the firmware serves windows-1252 and lossy transcriptions contain
 //     U+FFFD), never depend on CRLF vs LF, and tolerate the gateway's sloppy markup (unclosed
 //     rows, nested forms, labels with trailing &nbsp;). A form reader (form.go) reads a
@@ -17,7 +17,8 @@
 //     bodies capped and hashed exactly as received) and rare, rate-limited authenticated
 //     operations on the "Broadband Status Notification" (bbevent) setting and the Syslog page
 //     (read by its labels; a change is posted only when the form is fully understood, and
-//     read back).
+//     read back). For the dashboard's Network page it also reads the NAT table (authenticated)
+//     and the Device List (unauthenticated); both only read: their forms are never posted.
 //
 // The gateway access code is only ever used to compute the login form's hashpassword field;
 // it never appears in errors, logs or returned data.

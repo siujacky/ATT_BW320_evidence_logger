@@ -725,7 +725,11 @@ func TestSyslogEndpointSecurity(t *testing.T) {
 
 	for _, hdr := range []map[string]string{nil, {"Origin": "http://evil.example", "Sec-Fetch-Site": "cross-site"}} {
 		rec := hs.serve(hs.request(http.MethodGet, "/api/syslog", nil, hdr))
-		wantStatus(t, rec, http.StatusOK)
+		if hdr == nil {
+			wantStatus(t, rec, http.StatusOK)
+		} else {
+			wantJSONError(t, rec, http.StatusForbidden) // another site's page: not even read
+		}
 		assertSecurityHeaders(t, rec.Header(), false)
 		for _, k := range []string{"Access-Control-Allow-Origin", "Access-Control-Allow-Credentials"} {
 			if v := rec.Header().Get(k); v != "" {

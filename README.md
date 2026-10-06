@@ -8,15 +8,17 @@ AT&T **BGW320** gateway (tested with the BGW320-505) and through independent Int
 classifies every 10-second cycle with conservative, versioned rules and writes everything into an
 append-only, hash-chained, Ed25519-signed ledger that public Time-Stamp Authorities time-stamp. A local
 dashboard shows what is happening, including an **MRTG-style traffic chart and a live flow meter** built
-from the gateway's own counters and the **gateway's own log messages (syslog)**. The ledger is mirrored
-into a local **MongoDB** for queries, and one command turns the last 24 hours into a **PDF for an AT&T
-service ticket**, backed by an evidence bundle that anyone can verify.
+from the gateway's own counters, the **gateway's own log messages (syslog)** and a **Network page**
+that shows which device talks to which site and what the gateway's firewall blocks. The ledger is
+mirrored into a local **MongoDB** for queries, and one command turns the last 24 hours into a **PDF for
+an AT&T service ticket**, backed by an evidence bundle that anyone can verify.
 
 > Not affiliated with or endorsed by AT&T. "AT&T", "BGW320" and the gateway's page names belong to
-> their owners. The monitor reads the gateway's own pages (its status pages need no login; with the
-> Device Access Code it checks the outage-redirect and Syslog settings about once a day) and keeps two
-> gateway settings as it needs them: the outage redirect off, and the Syslog page sending the gateway's
-> log to this PC (see below).
+> their owners. The monitor reads the gateway's own pages (its status pages and Device List need no
+> login; with the Device Access Code it checks the outage-redirect and Syslog settings about once a
+> day, and reads the NAT table for the Network page every 4 minutes in one kept web session) and keeps
+> two gateway settings as it needs them: the outage redirect off, and the Syslog page sending the
+> gateway's log to this PC (see below).
 
 ---
 
@@ -29,6 +31,7 @@ service ticket**, backed by an evidence bundle that anyone can verify.
 - [The gateway's outage "hijack" redirect](#the-gateways-outage-hijack-redirect)
 - [Traffic: MRTG-style chart and flow meter (no SNMP needed)](#traffic-mrtg-style-chart-and-flow-meter-no-snmp-needed)
 - [The gateway's syslog](#the-gateways-syslog)
+- [Network page: which device talks to which site](#network-page-which-device-talks-to-which-site)
 - [Dashboard](#dashboard)
 - [Data storage: ledger and MongoDB](#data-storage-ledger-and-mongodb)
 - [Report for an AT&T service ticket](#report-for-an-att-service-ticket)
@@ -79,6 +82,9 @@ flowchart LR
   LED -->|exact signed records| MDB["Local MongoDB<br/>queryable copy"]
   LED --> WEB["Dashboard<br/>127.0.0.1:8320"]
   LED --> EXP["Evidence bundle (zip)<br/>and ticket PDF"]
+  GW -->|NAT table every 4 min,<br/>Device List| NET["Network page data<br/>not evidence"]
+  SYS -.->|firewall drops| NET
+  NET --> WEB
 ```
 
 * Every record is a JSON line `{"h": SHA-256(b), "s": Ed25519(b), "b": "<record>"}`; each record names
@@ -99,7 +105,8 @@ flowchart LR
   Ethernet connection makes the evidence stronger.
 * An AT&T BGW320 gateway and its **Device Access Code** (printed on the gateway's label). The code is
   needed only for the gateway's settings - to keep the outage redirect off and the Syslog page sending
-  the gateway's log to this PC; everything else uses pages that need no login.
+  the gateway's log to this PC - and for the Network page's NAT table; everything else uses pages that
+  need no login.
 * [Go](https://go.dev/dl/) 1.27 or newer to build (the build fetches the right toolchain if needed).
 * Optional: [MongoDB Community Server](https://www.mongodb.com/try/download/community) running
   locally (the default `mongodb://127.0.0.1:27017`) for the queryable copy.
@@ -171,6 +178,18 @@ described above.
 the program is replaced and the service restarts; the ledger continues. **Uninstall:** Settings → Apps,
 or `att-monitor uninstall`. Either way the service, the program, its Start menu shortcut, its Settings
 entry and its firewall rule are removed, and the evidence in `C:\ProgramData\ATTMonitor` is kept.
+
+**Going back to a version before 1.3.0:** those versions do not know the Network page's folders
+(`connections\` and `geo\` in the data folder; not evidence) and refuse a data folder that holds them.
+Their `install` replaces the program first and refuses after, saying "The upgrade failed; the previous
+service was restarted" although the service then runs the older program (which logs "could not
+secure the keys directory" at every start). So, from an elevated PowerShell: run `att-monitor stop`,
+move `C:\ProgramData\ATTMonitor\connections` and `C:\ProgramData\ATTMonitor\geo` out of the data
+folder (or delete them: they hold only the Network page's samples and its IP database), then run the
+older version's `install` (which also drops the `connections` and `geo` settings from `config.json`:
+set them again after upgrading). To upgrade again later, stop the service, move the two folders
+back, and run the newer version's `install`. From 1.3.0 on, `install` checks the data folder before
+it stops the service or replaces the program, and changes nothing when it would refuse the folder.
 
 ## The gateway's outage "hijack" redirect
 
@@ -336,6 +355,104 @@ what this PC received (the exact bytes, the sender's address as Windows reported
 receive time), not that the gateway sent nothing else. The messages are supporting evidence: verdicts
 and incidents do not depend on them.
 
+## Network page: which device talks to which site
+
+The dashboard's **Network** page shows the home network's own traffic, for one period at a time (the
+last hour, 24 hours, 7 or 30 days, or a custom period of up to 31 days):
+
+* **Connections**: which device talked to which site. Tiles (devices active, sites, organisations
+  and countries, connections open now); a **flow diagram** from the devices through the
+  organisations they reached (Google, Amazon, Netflix, ...) to the services (HTTPS, QUIC, DNS, ...),
+  each band as wide as how often its connections were seen; a **world map** of the countries of the
+  remote addresses; and a searchable, sortable **table**: device → remote address (with its reverse
+  DNS name), organisation, country, service, first and last seen. Click a device to see it alone.
+* **Firewall**: what the gateway's firewall blocked. Tiles (probes blocked from the Internet, their
+  sources, packets from the home network blocked on their way out and from how many devices, the
+  most probed service); the blocked packets **per hour**; a **world map** of where the probes came
+  from; the most probed services, the most active sources, the reasons the gateway gives, and the
+  devices whose outbound packets it blocked, with their destinations.
+
+Every chart has a table view, and the page is read again every minute while it is open.
+
+**Where the data come from.**
+
+* **The gateway's NAT table** (Diagnostics → NAT Table): every connection the gateway is
+  translating, with the device's address and the remote address and port. The page is behind the
+  gateway's login, so the monitor reads it **every 4 minutes with the Device Access Code**, in one
+  web session that it keeps alive: the gateway client reuses its session for 5 minutes after its last
+  use, and the first read after a start waits for the service's settings check and uses its login,
+  so the reads need no login of their own unless they pause (during an outage, for example) or the
+  gateway ends the session. A read that fails for another reason (an error page, a page too large or
+  too slow) keeps the session: it never leads to a login by itself. Every login follows the same
+  rules as setup's (one attempt a minute at most, none after three rejections within an hour - also
+  across restarts of the service), and the reads have a budget of their own: after two reads in a
+  row that each needed a login the next waits an hour, after six logins within a day they pause
+  until the next day, and reads that keep failing are tried less and less often (up to every two
+  hours). The monitor only reads the page; it never reads it during an outage, after a failed
+  measurement cycle or while a changed gateway certificate waits for your confirmation, and it stops
+  for an hour when the gateway rejects the access code. Without a stored access code the NAT table
+  is not read (the rest of the page still works).
+* **The gateway's Device List** (Device → Device List, no login), every 15 minutes: the devices'
+  names, addresses and MAC addresses, which name the NAT table's addresses. A device keeps its name
+  when its address changes, and a device that has just joined is named after the next Device List
+  read.
+* **The gateway's syslog** (see [The gateway's syslog](#the-gateways-syslog)): at its most detailed
+  level (Notice) the BGW320 logs the packets its firewall drops. The page counts them by direction,
+  source, target and reason; a "repeated N times" line counts N more.
+* **The IPtoASN database** (https://iptoasn.com): which organisation (network) announces an address,
+  and the country where that network is registered. The database is kept on this PC, so no address
+  is sent anywhere to name it.
+
+**Limits.** The NAT table is read every 4 minutes, so a connection that opens and closes between two
+reads is not seen. IPv6 is not translated, so an IPv6 connection appears only when the gateway lists
+it in its NAT table too; it is then named after the device whose address it uses (one the Device List
+lists, or another of the home network's IPv6 addresses). In a period with more than 200,000 distinct
+connections (a device file sharing or scanning the Internet) the lightest are counted only in their
+devices and as "Other", and the page says so. The syslog shows only what
+the firewall drops, never the connections it allows. Countries are where the networks are registered,
+not where a server stands (a CDN's server is often much nearer). The gateway does not log the names
+devices look up, so sites are shown by address, organisation and reverse DNS name, not by the web
+address typed.
+
+**Privacy.**
+
+* All of it stays on this PC. It is **not evidence**: it is never written into the ledger, the
+  MongoDB copy or an evidence bundle; it lives in `connections\` and `geo\` in the data folder and is
+  shown only on the dashboard (and by `att-monitor network`).
+* Connection samples are kept for `connections.keep_days` (30 days) within `connections.keep_mb`
+  (200 MiB); older days are deleted - every hour, also while sampling is off.
+* For checking the parsers against your gateway's firmware, the service keeps a copy of the NAT table
+  page and of the Device List page it read (`connections\last-nattable.html`,
+  `connections\last-devices.html`: the first page read after each start, and pages it did not
+  understand). They hold what the samples hold - your devices' connections, names, MAC and IP
+  addresses - but not the Wi-Fi network's name, which is removed from the Device List's copy. They
+  are deleted once they are older than `connections.keep_days`, and at the start of the service
+  while `connections.enabled` is `false`.
+* Reverse DNS names of the remote addresses the connections table shows are looked up through this
+  PC's own DNS resolver (`connections.reverse_dns`, on by default) and cached in `geo\ptr-cache.json`:
+  a name for 7 days, "no name" for a day (at most `connections.keep_days`). An answer older than that
+  is no longer saved (the file is rewritten without it) and is forgotten a day later; the file is
+  deleted while `connections.reverse_dns` or `geo.enabled` is `false`.
+* The only download is the public IPtoASN data (two files of a few MB, public domain under the PDDL
+  1.0), once a week from iptoasn.com: plain downloads, the same for everyone, which never carry an
+  address. Set `geo.download` to `false` to switch them off (tables placed in `geo\` by hand are then
+  used), or `geo.enabled` to `false` to do without organisations and countries.
+* The world map is drawn from Natural Earth's country outlines (public domain), as packaged in
+  world-atlas (ISC licence; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)), shipped with the
+  program: the page loads nothing from the Internet.
+
+From the command line, through the running service:
+
+```powershell
+att-monitor network                               # the last 24 hours: devices, organisations, countries, connections
+att-monitor network --range 7d --device mac:00:00:5e:00:53:01   # one device's connections (keys are listed)
+att-monitor network --firewall --range 1h         # what the gateway's firewall dropped in the last hour
+att-monitor network --from 2026-10-01 --to 2026-10-03 --limit 100 --json
+```
+
+To stop the sampling, set `connections.enabled` to `false` in `config.json` and restart the service:
+what was recorded stays on the page until the retention limits delete it.
+
 ## Dashboard
 
 **http://127.0.0.1:8320**, on the monitoring PC only.
@@ -354,6 +471,8 @@ and incidents do not depend on them.
   and a severity filter, each linked to the ledger record of its chunk (a very long message is
   shortened in the list; *Exact datagram* under it shows all of it); the space the syslog store uses
   and how much of it to keep.
+* **Network**: which device talks to which site, and what the gateway's firewall blocks (see
+  [Network page](#network-page-which-device-talks-to-which-site)); not evidence.
 * **Evidence**: ledger head, key fingerprint, time-stamps, *Verify now*, exports and operator notes
   (for example "Called AT&T, ticket 12345").
 * **Records**: the raw ledger, record by record.
@@ -374,6 +493,8 @@ administrators):
 | `blobs\` | raw gateway pages, traceroute output and time-stamp tokens, gzip, named by SHA-256 |
 | `keys\` | the ledger signing key and the gateway access code, DPAPI-encrypted (SYSTEM and Administrators only) |
 | `syslog\` | the gateway's syslog messages in chunk files (the only evidence that is ever deleted: within `syslog.keep_mb`, each deletion recorded) |
+| `connections\` | the Network page's samples of the gateway's NAT table and Device List, one file per day (not evidence: kept for `connections.keep_days` within `connections.keep_mb`) |
+| `geo\` | the Network page's IP database (the IPtoASN tables) and reverse DNS cache (not evidence) |
 | `exports\` | evidence bundles |
 | `logs\` | service logs (never contain secrets) |
 | `config.json` | settings |
@@ -507,6 +628,9 @@ att-monitor syslog [--since 24h] [--grep TEXT] [--severity LEVEL] [--limit N] [-
                                                   the gateway's syslog messages, oldest first (through the service)
 att-monitor syslog retention [--keep-mb N] [--keep-days D] [--yes]
                                                   how much syslog is kept: shows it, or changes it
+att-monitor network [--range 1h|24h|7d|30d | --from TIME --to TIME] [--device KEY] [--firewall]
+                    [--limit N] [--json]          the Network page in short (through the service): which
+                                                  device talked to which site, or what the firewall dropped
 att-monitor verify [--json]                       verify the whole ledger
 att-monitor verify-bundle FILE.zip [--expect-fingerprint FP] [--json]
 att-monitor export --from TIME --to TIME | --incident ID [--prepared-by NAME] [--notes TEXT] [--out DIR]
@@ -525,6 +649,13 @@ keeps that level and the more severe ones (`0`-`7`, or `emerg`, `alert`, `crit`,
 answer of the service holds at most 16 MiB of messages (very long ones end it sooner: shorten `--since`
 or filter to see older ones). Each run of messages is headed by its chunk and the ledger record that
 states the chunk's SHA-256.
+`network` summarizes the dashboard's Network page: the last 24 hours unless `--range` (`1h`, `24h`,
+`7d`, `30d`) or `--from`/`--to` (TIME as above; a date-only `--to` without `--from` is that day alone;
+at most 31 days of 24 hours, so 31 whole days that include the change back from summer time are an
+hour too long) say otherwise; `--device` takes a device key as the list of devices shows it (`mac:…`,
+`ip:…`, `gateway`); `--limit` (20 unless given, at most 1000) is how many connections (with
+`--firewall`: blocked outbound destinations) are listed; `--json` prints the service's answer. It
+needs the running service.
 
 ## Configuration
 
@@ -549,10 +680,26 @@ after editing it. Main settings:
 | `syslog.allow` | `[]` | further senders (IP addresses) accepted besides the gateway |
 | `syslog.flush_interval` / `max_per_minute` | `30s` / `2000` | how often received messages are stored / the most kept per minute |
 | `syslog.keep_mb` / `keep_days` | `100` / `0` | keep at most this many MiB of syslog (1 to 1,048,576) and, above 0, nothing older than this many days |
+| `connections.enabled` | `true` | sample the gateway's NAT table and Device List for the Network page (not evidence) |
+| `connections.interval` / `devices_interval` | `4m` / `15m` | how often the NAT table (2 to 4 min: a longer interval would need a gateway login for every read; needs the access code) and the Device List (5 min to 24 h) are read |
+| `connections.keep_days` / `keep_mb` | `30` / `200` | keep the samples this many days (1 to 3650), within this many MiB (10 to 1,048,576) |
+| `connections.reverse_dns` | `true` | look up the reverse DNS names of the remote addresses shown, through this PC's resolver |
+| `geo.enabled` | `true` | name the remote addresses' organisations and countries with the offline IPtoASN database |
+| `geo.download` / `url_v4` / `url_v6` / `refresh` | `true` / iptoasn.com's files / `168h` | download the database (https only, no credentials, query or fragment: the configuration is recorded in the ledger) and look for a newer one every 7 days (1 to 90 days); `false`: use the files placed in `geo\` by hand |
+
+A `connections` or `geo` value outside its range, or one that cannot be read, never stops the
+service: it is replaced (0 or less by the default, a value beyond a limit by that limit, a URL that is
+not https or carries credentials (a user name or password), a query or a fragment by the default
+URL, a switch that is not `true` or `false` by off), and the replacement is logged in
+`logs\service.log`, reported in the Network page's status (`/api/network/status`) and shown by
+`att-monitor network`. Any other setting the service cannot work with stops it until `config.json`
+is corrected: `logs\service.log` and `att-monitor status` say why. Save the file as UTF-8 (a byte
+order mark is accepted).
 
 ## Privacy, security and network use
 
-* The dashboard listens on 127.0.0.1 only and rejects requests from other sites.
+* The dashboard listens on 127.0.0.1 only and rejects requests from other sites (a page of another
+  site cannot make it change anything, nor read anything - not even make it build an answer).
 * The gateway access code is stored DPAPI-encrypted in a folder only SYSTEM and Administrators can read;
   it never appears in logs, the ledger or exports.
 * Evidence bundles contain your gateway's serial number, your public IP address and your outage
@@ -563,13 +710,27 @@ after editing it. Main settings:
   gateway's address, within size and rate limits, stored JSON-escaped, and shown escaped on the
   dashboard and in the terminal. The service's answers (at most 16 MiB of messages each) and the
   dashboard's list (long messages shortened) stay bounded however the messages are made.
+* The Network page's data - which device talked to which site, the devices' names and MAC addresses,
+  what the firewall blocked - describe your household's traffic. They stay on this PC (readable, like
+  the rest of the data folder and the dashboard, by its users), are never evidence, never in the
+  ledger, the MongoDB copy or a bundle. The connection samples, the copies of the gateway's pages and
+  the reverse DNS names are deleted after `connections.keep_days` (the names sooner); what the
+  firewall blocked comes from the gateway's syslog, which is kept as `syslog.keep_mb` /
+  `syslog.keep_days` say. `connections\` and `geo\` stay in the data folder after an uninstall,
+  like the rest of it. Device names, organisation names and reverse DNS names are shown escaped, as
+  syslog text is.
 * Outbound traffic: pings and TCP connects to 1.1.1.1, 8.8.8.8, 9.9.9.9 and AT&T's next hop; DNS queries
   for www.google.com; HTTP checks to msftconnecttest.com and google.com; SNTP to time.windows.com,
-  time.google.com and pool.ntp.org; and **only a SHA-256 digest** to the Time-Stamp Authorities.
+  time.google.com and pool.ntp.org; and **only a SHA-256 digest** to the Time-Stamp Authorities. For
+  the Network page: the public IPtoASN files from iptoasn.com once a week (`geo.download`), and reverse
+  DNS queries for the remote addresses it shows, through this PC's resolver (`connections.reverse_dns`).
   MongoDB is used on the local PC only. Inbound: UDP 514 from the gateway (its syslog). The monitor logs
   in to the gateway about once a day (and after this PC's address changes) to check, and if needed set,
-  its outage-redirect and Syslog settings. While the dashboard's Overview is open, the flow meter reads
-  the gateway's Broadband Status page at most every 5 seconds.
+  its outage-redirect and Syslog settings, and reads the gateway's NAT table every 4 minutes in a web
+  session it keeps (no new login while the reads go on; at most six a day caused by the reads, and
+  none sooner than a minute after the previous attempt, also across restarts) and its Device List
+  (no login) every 15 minutes. While the dashboard's Overview is open, the flow meter reads the gateway's Broadband Status
+  page at most every 5 seconds.
 
 ## Development
 
@@ -582,7 +743,9 @@ internal/monitor    scheduler, classifier           internal/anchor     RFC 3161
 internal/export     evidence bundles, verifier      internal/ticket     the AT&T ticket report (HTML/PDF)
 internal/mongostore MongoDB copy and its verifier   internal/web        dashboard and JSON API
 internal/syslogrx   syslog receiver (UDP)           internal/syslogstore syslog chunks within a size limit
-internal/winsvc     service control, ACLs           internal/sysinfo    host and software identity
+internal/connstore  Network page: NAT samples       internal/ipintel    Network page: IP database, ports, PTR
+internal/netmap     Network page: the views         internal/winsvc     service control, ACLs
+internal/sysinfo    host and software identity
 ```
 
 ```powershell
@@ -599,3 +762,9 @@ captures.
 Earlier BGW320 projects that informed the gateway client:
 [Yeraze/BWG320-monitor](https://github.com/Yeraze/BWG320-monitor) and
 [TheSethRose/BGW320-CLI](https://github.com/TheSethRose/BGW320-CLI).
+
+The Network page uses the [IPtoASN](https://iptoasn.com) database (public domain, PDDL 1.0),
+downloaded at run time, and ships a world map made from [Natural Earth](https://www.naturalearthdata.com)'s
+1:110m country outlines (public domain) as packaged in [world-atlas](https://github.com/topojson/world-atlas)
+(ISC licence, whose notice is in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and in the map
+itself); `scripts/worldmap` makes it.

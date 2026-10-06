@@ -24,6 +24,9 @@ problems are on the provider's side**, with a complete chain of custody:
   MRTG-style chart and a live flow meter; the gateway offers no SNMP) and the gateway's own syslog
   messages, kept outside the ledger within a size limit, with the SHA-256 of every chunk of them
   and every deletion recorded in the ledger.
+* *Not evidence* (§19): the dashboard's **Network page** - which device on the home network talks
+  to which site (samples of the gateway's NAT table) and what the gateway's firewall blocks (its
+  syslog) - is kept apart from the evidence: never in the ledger, the MongoDB copy or a bundle.
 
 ## 2. Ground truth about this gateway (observed 2026-10-05, firmware 6.34.7)
 
@@ -34,10 +37,18 @@ problems are on the provider's side**, with a complete chain of custody:
   (`gateway_event cert_changed`) and status pages keep being read, but **authenticated requests are
   paused** (condition `GATEWAY_CERT_CHANGED`) until the operator confirms the new certificate
   (`trust-cert`): an impostor at 192.168.1.254 could otherwise collect MD5(access code + nonce).
-  Login failures are persisted (state/) so a crash-looping service cannot exceed 3 attempts per hour.
+  The login policy outlives the process: the time of the latest attempt, the rejected logins of the
+  last hour and a pause after "sessions in use" are kept in `state\gateway-login.json` and restored at
+  every start (also by the CLI, which logs in only while the service is stopped), so a service that
+  restarts in a loop cannot exceed 3 rejected attempts per hour, nor attempt a login sooner than a
+  minute after the previous one.
 * **Readable without login**: `sysinfo`, `broadbandstatistics`, `fiberstat`, `home` (slow, ~5 s),
-  `lanstatistics` (slow, ~9 s), `sitemap`, `firewall`, `logs` (firewall drop log), `diag`.
-* Login (only needed for configuration pages, e.g. `events`):
+  `lanstatistics` (slow, ~9 s), `sitemap`, `firewall`, `logs` (firewall drop log), `diag`, `devices`
+  (Device > Device List: each device's name, IPv4/IPv6 addresses, MAC, connection type, status; its
+  form's *Clear and Rescan for Devices* empties the gateway's device table and is never posted).
+  Behind the login: `nattable` (Diagnostics > NAT Table: every session the gateway translates;
+  its *Select display option* form is never posted), `syslog`, `events`.
+* Login (only needed for configuration pages, e.g. `events`, and for the NAT table):
   1. GET any protected page in a new cookie session → `Set-Cookie: SessionID=…`, login page
      **without** nonce (cookie handshake). GET again → login page **with**
      `<input type="hidden" name="nonce" value="<64 hex>" />`.
@@ -46,7 +57,28 @@ problems are on the provider's side**, with a complete chain of custody:
      Success = HTTP 302 with `Location` = the originally requested page.
   3. Pages that need login return a page whose `<title>` is `Login` (or contains
      "Access Code Required"). "all web server sessions are in use" means the session pool is
-     exhausted → back off ≥ 5 minutes. **Authenticated requests must be rare** (≤ a few per day).
+     exhausted → back off ≥ 5 minutes. **Logins must be rare** (≤ a few per day). The
+     authenticated requests are the daily settings check (the notification and Syslog pages, in
+     one session), the operator's changes, and - for the Network page (§19) - a read of the NAT
+     table every 4 minutes (`connections.interval`: 2 to 4 minutes, never longer). The client reuses
+     its session for 5 minutes after its last use, so the NAT reads keep one session alive: the first
+     of a run waits for the startup settings check and reuses its login, and they log in again only
+     after a pause in the reads longer than about a minute (an incident, skipped rounds) or when the
+     gateway no longer honours the session. A reused session is given up - and a login made - only
+     when the gateway answers with its login page or a redirect to it: any other answer (an error
+     status, a redirect elsewhere, a page too large or too slow, a read the caller stops) fails the
+     request and keeps the session, so that a page that keeps failing never turns into a login per
+     read (a session that has served no page for an hour is renewed); and a session whose login form
+     the gateway accepted is kept even when the page that verifies it does not come. The NAT reads
+     have a login budget of their own (the client counts the login forms it posts): after two reads
+     in a row that each needed a login the next waits an hour, after 6 within a day they pause until
+     the oldest is a day old, and a read that keeps failing otherwise waits an interval, then two,
+     four, ... up to two hours. Every login, whoever asks, goes through one policy: at most one
+     attempt a minute, none for 5 minutes after "sessions in use", none after 3 rejections within an
+     hour; and a rejected access code - met by a NAT read or by the settings check - stops the NAT
+     reads for an hour (or until a code is stored anew), so that they never use up the attempts the
+     settings check needs. The NAT reads' logins of the last day and their stop are kept in
+     `state\nat-sampler.json`, the policy in `state\gateway-login.json`: a restart forgets neither.
 * `events.ha` → "Broadband Status Notification" checkbox `name="bbevent"`. When checked, the
   gateway "redirects web browsing users to instructional pages" while the WAN is down
   (outage hijack). It was turned OFF during setup (see evidence/bootstrap). Form POST to
@@ -140,6 +172,9 @@ internal/ticket        AT&T service-ticket report (HTML, printed to PDF by Edge/
 internal/mongostore    MongoDB copy of the ledger + its verifier (§17)
 internal/syslogrx      syslog receiver: UDP, sender filter, size/rate caps, RFC 3164/5424 parsing (§18)
 internal/syslogstore   syslog store: chunk files within syslog.keep_mb / keep_days (§18)
+internal/connstore     Network page: NAT table and Device List reads in daily files, retention (§19)
+internal/ipintel       Network page: offline IP database (IPtoASN), port names, reverse DNS cache (§19)
+internal/netmap        Network page: the connections and firewall views (§19)
 tools/verify_bundle.py standalone third-party verifier (Python 3 stdlib + optional extras)
 ```
 
@@ -167,6 +202,10 @@ blobs/<aa>/<sha256>.gz            content-addressed raw evidence (gzip of exact 
 exports/                          evidence bundles produced on request
 quarantine/                       bytes removed during crash recovery (never deleted)
 state/                            caches (incident index, series) — NOT evidence, rebuildable
+state/gateway-login.json          the gateway client's login policy (latest attempt, rejected logins
+                                  of the last hour, a sessions-full pause), kept across restarts (§2)
+state/nat-sampler.json            the logins the NAT reads needed in the last day and a stop after a
+                                  rejected access code (§19), kept across restarts
 logs/service.log                  operational log (rotated) — NOT evidence
 syslog/                           the syslog store (§18), the only evidence that is ever deleted
                                   (within syslog.keep_mb / keep_days, every deletion recorded):
@@ -176,11 +215,28 @@ syslog/syslog-<from>_<to>.jsonl.gz       a sealed chunk (gzip of the open chunk'
 syslog/syslog-<from>_<to>.jsonl.gz.json  its sidecar: an index (its syslog_chunk payload and, once
                                   recorded, the seq of that record), rebuilt from the chunk when
                                   missing — NOT evidence
+connections/                      the Network page's samples (§19) — NOT evidence, kept for
+                                  connections.keep_days within connections.keep_mb:
+connections/nat-YYYY-MM-DD.jsonl      the NAT table reads of a UTC day, one line each (appended)
+connections/devices-YYYY-MM-DD.jsonl  the Device List reads of a UTC day
+connections/<name>.jsonl.gz       a day's file, gzip, once the day is over
+connections/last-nattable.html    raw copies of a NAT table / Device List page (the first read that
+connections/last-devices.html     worked since the start, or one not understood; at most hourly; the
+                                  Device List's without the Wi-Fi network's name), deleted once
+                                  older than connections.keep_days, and at the start while
+                                  connections.enabled is off
+geo/                              the Network page's IP database (§19) — NOT evidence:
+geo/ip2asn-v4.tsv.gz, ip2asn-v6.tsv.gz   the IPtoASN tables, as downloaded (or placed by hand)
+geo/ip2asn.json                   what was downloaded (URL, validators, SHA-256) and when looked for
+geo/ptr-cache.json                the reverse DNS cache: only the answers still current (a name 7
+                                  days, "no name" a day, at most connections.keep_days); deleted
+                                  while reverse_dns or geo is off
 ```
 ACL (set by `install`): SYSTEM and Administrators full control, Users read & execute — except
 `keys\`, which is SYSTEM + Administrators only (re-asserted at every service start). Machine-scope
 DPAPI can be decrypted by any local account that can read the blob, so the secrets' protection
-against other local users comes from that ACL.
+against other local users comes from that ACL. `connections\` and `geo\` inherit the data
+directory's ACL: the samples are as readable to local users as the dashboard that shows them.
 
 ## 6. Ledger format (normative)
 
@@ -333,6 +389,11 @@ gateway's log to this computer, in the same session. Traffic rates come from
 the counters of the recorded snapshots; the dashboard's flow meter reads `broadbandstatistics` on
 demand only (at most every 5 s whoever asks, unrecorded).
 
+Network page (§19, not evidence): the NAT table (authenticated, in the shared session) every
+`connections.interval` (4 min) and the Device List (no login) every `connections.devices_interval`
+(15 min), never during an incident, after a bad cycle or while the gateway does not answer the
+monitor's polls; the IP database looks for newer IPtoASN tables every `geo.refresh` (7 days).
+
 ## 9. Classification rules (normative, `RulesVersion = "2026.10-4"`)
 
 Inputs for each fast cycle: the cycle's probe results, the latest gateway snapshot (fresh
@@ -484,7 +545,12 @@ anchors are deferred; the first anchor after recovery covers the whole outage.
 
 Listen `127.0.0.1:8320` only. Reject requests whose Host is not `127.0.0.1:<port>`,
 `localhost:<port>` or `[::1]:<port>` (DNS-rebinding defense). State-changing requests (POST)
-require header `X-ATT-Monitor: 1` and, if present, an Origin equal to the server origin.
+require header `X-ATT-Monitor: 1` and, if present, an Origin equal to the server origin. A read of
+the API (GET or HEAD below `/api/`) whose `Sec-Fetch-Site` says another site's page sent it
+(neither `same-origin` nor `none`) is answered 403 without being served: such a page could not read
+the answer, but could make the service build costly views (a month of the Network page's) as often
+as it likes. The dashboard's own requests are same-origin, a typed address is `none`, and the CLI
+sends no such header; `/` and `/static/` stay open to any site.
 Responses: `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,
 `Content-Security-Policy: default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; frame-ancestors 'none'`.
 Static assets are embedded (`embed.FS`), no external URLs (the UI must work during outages).
@@ -510,6 +576,9 @@ Static assets are embedded (`embed.FS`), no external URLs (the UI must work duri
 | GET `/api/syslog?from=&to=&q=&severity=&limit=` | `model.SyslogList`: the syslog store's messages received in [from, to) (default the 24 h before to; at most 31 days), newest first; q: text in the raw datagram, message, app or host (ignoring case, ≤ 200 characters); severity: 0-7 or a name, keeps that level and the more severe ones; limit 200 (≤ 5000); the list also ends before the message that would take its JSON beyond 16 MiB (`MaxSyslogAnswerBytes`; a control character is a six-byte escape); `truncated` when more matched. Each entry names its `chunk` ("" = the open chunk) and `seq`, the chunk's `syslog_chunk` record (0 while open or not found) |
 | POST `/api/syslog/retention` | `{keep_mb, keep_days?, client?}`, the whole setting (keep_days absent = 0, no age limit) → `SetSyslogRetention` (§18); answers the `model.ConfigChange` |
 | GET `/api/traffic/live` | `model.LiveTraffic`: the flow meter (§18): the newest WAN rates from an on-demand read of the gateway's counters (at most every 5 s whoever asks), this computer's rates and about 15 minutes of history; never recorded |
+| GET `/api/network/connections?range=\|from=&to=&device=&limit=` | `model.NetConnections` (§19), not evidence: which device talked to which remote address in the period, from the NAT table samples - the NAT reads (count, first, last, the newest one's totals), the summary totals, every device of the period, the flow diagram (organisations, services, bands), the countries and the rows (`limit`, 200 unless given, at most 1000; `rows_total` counts them all). `range` is `1h`, `24h` (the default), `7d` or `30d`, ending now; or `from`/`to` as for `/api/syslog`; at most 31 days, ending at most an hour after the server's clock. `device` (a key as `devices` lists it: `mac:…`, `ip:…`, `gateway`; at most 128 printable ASCII characters) keeps that device's rows and bands |
+| GET `/api/network/firewall?range=\|from=&to=&limit=` | `model.NetFirewall` (§19), not evidence: what the gateway's firewall dropped in the period, from the syslog store - drops by direction, every hour's drops, the inbound sources' countries, the top sources, the probed services, the reasons, and the LAN devices' blocked packets by destination (`limit` rows; `outbound_total` and `outbound_devices` count them all); `oldest` is the oldest syslog message kept. A `device` parameter is refused (400) |
+| GET `/api/network/status` | `model.NetworkStatus`: the samplers (`Status.connections`), the connection store's volume and limits, the IP database (`model.IPIntelStatus`), the syslog kept and `config_warnings` - the page's settings in config.json the service could not use as written, each with what it uses instead (§15; left out when none) |
 
 API details (as implemented): `/api/records` adds `hash_ok` (h == SHA-256(b)) per record, an
 `X-ATT-Monitor-Warning` header for gaps / repeated or out-of-order seqs / hash mismatches among the
@@ -554,6 +623,22 @@ messages, oldest/newest receive time, keep_mb, keep_days). `Series` adds `traffi
 bucket: mean and peak WAN download/upload in Mb/s, `at_least`, this computer's rates),
 `traffic_days` (WAN volume per local day, `complete` or not) and `heavy_traffic_mbps` (80, §9).
 
+Network page (as implemented, §19): the parameters are checked before the view is asked (400; a
+`limit` above 1000 is read as 1000); a view's work - also after the samples are read, while the view
+is put together - ends with the request and after 30 s (504); a missing source (no connection store,
+no syslog store) answers 503 - the dashboard's Firewall tab then explains that no syslog store is
+kept - and a server given no network view 404. Every list of an answer is present (never `null`),
+the rows are capped at the limit asked for while the totals count them all, and `outbound_devices`
+is at least the number of devices the rows listed name. `Status.connections`
+(`model.ConnSamplerStatus`, absent without a connection store): `enabled`, the intervals, the newest
+NAT read that worked (time, sessions listed, the page's sessions in use and available),
+`nat_problem` (why the newest round did not read the table, or why its read failed: no access code,
+a changed certificate pending, an incident, the login policy, the reads' login budget, ...),
+`nat_note` (what the newest read, which worked, could not keep: rows not understood, or the read
+itself when the store refused it; never with a problem), `nat_next`, `nat_logins` (the gateway
+logins the NAT reads needed in the last 24 hours), the newest Device List read with
+`devices_problem`, and the store's volume and limits.
+
 Dashboard views (hash routes): Overview (status hero with state/cause/attribution and
 reasons; cards Internet / AT&T gateway WAN / Fiber optics (Rx/Tx power vs thresholds and the
 gateway's own alarm flags) / Local link / Evidence integrity / Syslog (the receiver, the gateway's
@@ -577,9 +662,18 @@ most 500 characters of the text and 100 of the host and the app as shown (an esc
 length), each with at most 16 runs of hidden characters, one element per run, and the exact
 datagram on request; "Load more" doubles the limit up to 5000, and is not offered when an answer
 ended at its size; the store's use and the retention form, which asks first when a change deletes
-messages now and says when the limits saved were already in force), Evidence (ledger head, key
-fingerprint, anchors, verify, exports, notes), Records (raw ledger browser). Charts are
-hand-written inline SVG (no libraries). Light/dark via `prefers-color-scheme`.
+messages now and says when the limits saved were already in force), Network (§19; two tabs with one
+period - 1 h, 24 h, 7 d, 30 d or a custom one of at most 31 days - kept in the URL and read again
+every minute while the page is visible: Connections, with a device filter - tiles, the flow diagram
+devices → organisations → services, a world map of the sites' countries and the table of each
+device's remote addresses with search, sort and "Show all"; Firewall - tiles, the drops per hour,
+a world map of the blocked sources' countries, the most probed services, the top sources and the
+packets blocked on the way out; a table view for every chart; notes that say why the NAT table is
+not read or the IP database not loaded; and what the data are and are not), Evidence (ledger
+head, key fingerprint, anchors, verify, exports, notes), Records (raw ledger browser). Charts are
+hand-written inline SVG (no libraries); the world map is `static/world.json` (Natural Earth 1:110m
+countries, public domain, via world-atlas, ISC; pre-projected SVG paths). Light/dark via
+`prefers-color-scheme`.
 
 ## 13. Evidence bundle, report, verifier
 
@@ -596,6 +690,7 @@ keys/public-key.txt base64 public key + fingerprint
 MANIFEST.sha256     sha256 of every file above
 tools/verify_bundle.py
 ```
+A bundle never holds the Network page's samples or IP database (§19): they are not evidence.
 Report sections: header (period, host, gateway model/serial/firmware, key fingerprint,
 ledger head, verification result), executive summary (monitored time and coverage %,
 availability %, incidents by state/cause, total provider-attributed downtime, longest
@@ -677,6 +772,8 @@ att-monitor syslog [--since 24h] [--grep T] [--severity L] [--limit N] [--json]
                                                             the syslog store's messages (GET /api/syslog), oldest first
 att-monitor syslog retention [--keep-mb N] [--keep-days D] [--yes]
                                                             show the store's use and limits, or change them
+att-monitor network [--range 1h|24h|7d|30d | --from T --to T] [--device KEY] [--firewall] [--limit N] [--json]
+                                                            the Network page in short (§19), through the service
 att-monitor verify [--data DIR]                             verify the full ledger
 att-monitor verify-bundle FILE.zip                          MANIFEST, REPORT, SYSLOG lines and the ledger verification
 att-monitor export --from YYYY-MM-DD[THH:MM] --to … [--incident ID] [--prepared-by NAME] [--out DIR]
@@ -687,7 +784,11 @@ att-monitor version
 ```
 Commands that write to the ledger go through the running service's localhost API; when the
 service is not running they open the ledger directly (the writer lock prevents two writers).
-`password.txt` format: lines `ip:<host>` and `password:<access code>`.
+`password.txt` format: lines `ip:<host>` and `password:<access code>`. `install` (and `setup`)
+first checks the data directory as the ACL step will (`winsvc.CheckDataDir`: SecureDataDir's
+refusals, changing nothing), so a directory it refuses leaves the running service and the installed
+program untouched. `status` says why config.json keeps the service from starting when the dashboard
+does not answer.
 
 Syslog commands (§18): `syslog` lists through the service only (`/api/syslog` names each chunk's
 record); it prints the newest `--limit` messages of the last `--since` (a duration or `Nd`, at most
@@ -714,6 +815,25 @@ monitor reported and, unless the gateway took it or the service only refused a s
 failed change - the error, and the change reported if any); either way the command then fails
 (the error on standard error, exit status 1). `mongo verify` also prints the syslog part of the
 verification (§17). The CLI opens the syslog store read-only; only the running monitor writes it.
+
+Network command (§19): `network` reads the running service's `GET /api/network/connections` (with
+`--firewall`, `/api/network/firewall`) and `/api/network/status`, and prints a summary in this
+computer's local time: the period, the NAT reads in it and the samplers' problem, if any, the
+totals, the devices (each with its key for `--device`), the organisations, the countries and the
+connections most seen (device -> remote address with its reverse DNS name, organisation,
+country, service, first and last seen, reads); with `--firewall` the drops by direction, the
+sources and their countries, the probed services, the reasons and the packets blocked on the way
+out (from how many devices); the settings of the page that the service could not use as written
+(`config_warnings`, §15) end either summary. The period is `--range` (`1h`, `24h` - the default -,
+`7d`, `30d`) or `--from`/`--to` (TIME as for `export`; a date alone as `--to` includes that whole
+day, up to now, and without `--from` is that day alone, from its local midnight - 23 or 25 hours
+when the clocks change; otherwise `--from` defaults to 24 hours before `--to`, `--to` to now),
+checked as the service checks it: at most 31 days of 24 hours, so 31 whole days that include the
+change back from summer time are refused, with that reason; `--device` only without `--firewall`;
+`--limit` 1 to 1000 rows (20 by default); `--json` prints the answer as it is.
+Text from the gateway, the IP database and reverse DNS is escaped as syslog text is. The CLI never
+opens the connection store (a single writer: the monitor): without the service the command fails
+and says where the samples are kept.
 
 **Guided setup** (`setup`, and a start without arguments from Explorer, detected by the process
 owning its console): without administrator rights it re-starts itself elevated (ShellExecuteEx
@@ -743,6 +863,28 @@ The `syslog` section configures the receiver and the store (§18): `enabled` (tr
 most 3650). In the `gateway` section, `enforce_syslog` (true) keeps the gateway's Syslog page sending
 to this computer and `syslog_level` ("") names the Log Level to set (§18); the monitor saves
 `enforce_syslog` when the operator changes it.
+The `connections` section configures the Network page's samples (§19): `enabled` (true),
+`interval` (4m; 2m to 4m: the gateway client reuses its login session for 5 minutes, and a longer
+interval would need a login for every read), `devices_interval` (15m; 5m to 24h), `keep_days` (30; 1
+to 3650), `keep_mb` (200; 10 to 1,048,576) and `reverse_dns` (true). The `geo` section its IP
+database: `enabled` (true), `download` (true), `url_v4` / `url_v6` (IPtoASN's files; https, without
+credentials, query or fragment: the configuration is recorded in the ledger, so a URL must carry no
+secret) and `refresh` (7 days, `168h0m0s`; 1 to 90 days). These two sections configure what is not
+evidence, and never keep the monitor from starting: `Load` reads them member by member and brings
+them into range,
+enabled or not - a value of 0 or less (or "") becomes the default, one below the minimum the
+minimum, one above the maximum the maximum, a download URL that is not https or carries
+credentials, a query or a fragment the default URL; a member of the wrong JSON type keeps its default, except a switch
+(`enabled`, `download`, `reverse_dns`), which is then off (nothing the owner may have meant to stop
+is read from the gateway or the Internet), and a section that is not an object has its switches
+off. Each replacement is a warning (`Config.Warnings`, never saved or recorded; it never repeats a
+URL) that the service logs at its start, and that `GET /api/network/status` (`config_warnings`)
+and `att-monitor network` show. The values used are those recorded with the configuration, and the
+next save of config.json (by `install`, or an operator's change) writes them. Any other value the
+monitor cannot work with stops the start: the operational log is set up before the configuration
+is read, so `logs\service.log` says why, as does `att-monitor status` while the dashboard does not
+answer. A UTF-8 byte order mark at the start of the file (Windows PowerShell 5.1's `Set-Content
+-Encoding UTF8` writes one) is skipped.
 
 ## 16. Engineering rules
 
@@ -837,7 +979,7 @@ can always be rebuilt from the ledger.
 * **Configuration.** `mongo {enabled, uri, database, store_blobs, interval}`, enabled by default
   against the local server. The URI must not contain credentials (validation refuses them): the
   configuration is recorded in `monitor_start`/`config_state` and so in evidence bundles. A
-  bundle never contains MongoDB data.
+  bundle never contains MongoDB data, and nothing of the Network page (§19) is copied to MongoDB.
 
 ## 18. Syslog, retention and traffic
 
@@ -1013,3 +1155,256 @@ skipped (the previous readings come back, with the reason) - it holds the lock f
 own timeout, not the gateway timeout), so an evidence snapshot waits at most that long behind it,
 and while the newest recorded snapshot found the gateway unreachable no live read is made at all
 (the next poll that reaches the gateway resumes them).
+
+## 19. The Network page: connections and the firewall (not evidence)
+
+The owner's goal of 2026-10-06 and the plan are in `docs/syslog-map-graphic.md` (its §5 lists where
+this differs from the plan). The dashboard's **Network** page shows which device on the home network
+talked to which remote address, organisation, country and service - from samples of the gateway's
+NAT table - and what the gateway's firewall dropped - from its syslog (§18).
+
+**Not evidence.** These data describe the household's own traffic, not AT&T's faults. Nothing of
+them is written to the ledger (which can never delete anything, and would keep browsing patterns
+for ever), copied to MongoDB or put into an evidence bundle; no verdict, incident or report depends
+on them (`RulesVersion` is unchanged). They live in their own folders with their own retention
+(§5) and are shown only by the localhost dashboard and `att-monitor network`.
+
+```
+gateway nattable.ha (login)    --connections.interval-->         NAT sampler    --+
+gateway devices.ha (no login)  --connections.devices_interval--> Device sampler --+--> connection store (connections\)
+syslog store (§18): the firewall's drop lines ------------------------------------+        |
+IP database (geo\): IPtoASN tables, port names, reverse DNS cache ---------------> netmap view --> GET /api/network/* --> dashboard,
+                                                                                                                        att-monitor network
+```
+
+**Gateway reads** (`internal/gateway`). `Client.NATTable` GETs `nattable.ha` (Diagnostics > NAT
+Table) through the login policy (§2) in the client's shared authenticated session - within 5 minutes
+of the previous authenticated request it costs one GET - and never posts the page's *Select display
+option* form. Its page may be up to 16 MiB (other pages 4 MiB); a read that fails otherwise than
+with the login page (an error status, a redirect elsewhere, a page too large or too slow) keeps the
+session and returns what arrived of the page (§2). `Client.LoginAttempts` counts the login forms
+posted. `ParseNATTable` reads the session table by its column labels (Protocol, TCP State,
+Source/Destination Address and Port, in any order, close variants accepted) and the totals *Total
+sessions in use / available*; a row it cannot read is counted as skipped, never fatal. No capture of
+the real page exists (it is behind the login; `testdata/gateway/nattable_synthetic.html` is made up),
+so the monitor keeps copies of the pages it reads for checking (below). `Client.Devices` GETs
+`devices.ha` (Device > Device List) without login, in the status pages' cookie session, and never
+posts its form (*Clear and Rescan for Devices* empties the gateway's device table); `ParseDevices`
+reads each device's MAC, name, IPv4 and IPv6 addresses, status, allocation, connection type
+(summarized: the Wi-Fi network's name is never kept in the samples, nor in the page's copy below),
+speed and last activity (`testdata/gateway/devices_real.html` is a sanitized capture).
+
+**Samplers** (`internal/monitor`, connections.go; only with a connection store and
+`connections.enabled`). The evidence comes first, and logins stay rare:
+
+* The NAT table is read every `connections.interval` (4 minutes; 2 to 4), the first time once this
+  run's startup settings check has been made - or found nothing to check - and a minute after the
+  start at the earliest: it reuses the check's login session (§2), and a restart, even in a loop,
+  brings no login of the NAT reads' own. It is
+  an authenticated request made under the guard of every other one: only with an access code
+  stored; never while a changed gateway certificate waits for confirmation (checked again holding
+  the gateway lock; a changed certificate met by the read's own TLS handshake is refused before
+  anything is sent); never half-way through the operator's confirmation of a changed certificate,
+  which moves the pin before its change is recorded (and undoes the move when the record fails):
+  the read holds the certificate lock (`certMu`) shared, which the confirmation holds exclusively,
+  but never waits for it - a round that meets a confirmation in progress is tried again half a
+  minute later, and a confirmation that starts during a read waits for the read. The read then waits for
+  the gateway lock (`gwMu`), like every request to the gateway (one at a time). It does **not**
+  take the settings lock (`notifMu`), which the settings check and the operator's changes of a
+  gateway setting (redirect, Syslog) hold across their requests. One of them that starts during a
+  read waits for it at the gateway lock (at most three gateway timeouts) instead of being refused
+  as busy; a read that starts during one of them waits there only for the request in progress. So a
+  read may run between the settings check's read of a setting and the change that enforces it. The
+  two share the gateway client's login session, which a read gives up only when the gateway answers
+  it with its login page (§2): a read that fails otherwise - an error page, a page too large or too
+  slow, a read stopped for the evidence - leaves the session to the change that follows, which needs
+  no login (one less than a minute after the previous attempt would be refused).
+* A refusal of the login policy (a login less than a minute after the previous attempt, the
+  gateway's sessions all in use, logins paused after rejected ones) waits until its cooldown ends,
+  and at least an interval. A rejected or unusable access code - met by a NAT read, or by the
+  settings check's login - stops the NAT reads until a code is stored anew (`att-monitor
+  set-access-code`) or for an hour at most. Any other failure waits an interval, then two, four, ...
+  up to two hours while the reads keep failing. The reads' logins are counted (the gateway client's
+  `LoginAttempts`, compared around each read, which holds the gateway lock): after two reads in a
+  row that each needed a login - the gateway may end its sessions sooner than the client assumes -
+  the next read waits an hour, and once the reads needed 6 logins within 24 hours they pause until
+  the oldest of them is 24 hours old (`nat_problem` says so, `nat_logins` counts them). A read
+  stopped for the evidence after it had sent a login is tried again an interval later, not after
+  half a minute. Those logins and the stop after a rejected code are kept in
+  `state\nat-sampler.json` and restored at the start: a restart gives no new budget and no new
+  attempt with a rejected code.
+* The Device List is read every `connections.devices_interval` (15 minutes), the first time 30 s
+  after the start, without login, holding the gateway lock like a status read.
+* Neither sampler reads while an incident is open or being closed, after a bad cycle (an incident
+  may be opening; tried again half a minute later, so that a single skipped round still reuses the
+  session) or while the newest snapshot found the gateway
+  unreachable: the gateway is polled for evidence then. A read in progress is stopped as soon as
+  that happens (looked at every 250 ms), and holds the gateway lock for at most three gateway
+  timeouts (NAT table: a login and the page) or one gateway timeout and 5 s (Device List).
+* What a read gives is appended to the connection store; `Status.connections` (§12) reports the
+  newest reads, why a round did not read and when the next is due. Failures are logged when they
+  start and every 6 hours while they go on.
+* The page of the first read that worked since the start, of a read whose page was not understood
+  and of a read whose rows were partly not understood is copied to `connections\last-nattable.html`
+  (`last-devices.html`, without the Wi-Fi network's name - the "Name:" lines of its Connection Type
+  cells), each at most once an hour, so that the parsers can be checked against the real firmware.
+  Not evidence either. The copies live no longer than the samples: they are deleted once they are
+  older than `connections.keep_days`, and at the start while `connections.enabled` is off (as are the
+  temporary files a crash left between a copy's writing and its renaming).
+* Whether or not the samplers run - also with `connections.enabled` off, or while they are held for
+  an incident and nothing is appended - the monitor applies the connection store's retention limits
+  every hour, and deletes the raw copies older than `connections.keep_days` (a worker of its own).
+
+**Connection store** (`internal/connstore`, `connections\`). One file per kind and UTC day:
+`nat-YYYY-MM-DD.jsonl` holds the NAT reads of the day, one JSON line each - `t` first (the read's
+time, RFC 3339 UTC with nanoseconds, so that lines outside a period are skipped without being
+decoded), `in_use` and `available` (the page's totals, -1 when it shows none), `strs` (the distinct
+strings of the sessions) and `s` (six integers per session: protocol, TCP state and source address
+as indexes into `strs`, source port, destination address, destination port);
+`devices-YYYY-MM-DD.jsonl` holds the Device List reads (`t`, `devices`). A line is written with one
+write at the end of the file's complete lines and fsynced; a failed write is cut back. A day's
+files are gzipped (`.jsonl.gz`) by the first append of a later day and after open: the copy is checked
+to decompress to the same bytes, fsynced and renamed into place, and the plain file deleted. Open
+repairs what a crash left: an interrupted compressed copy is deleted, an incomplete last line cut
+off, a plain file whose lines the compressed one already ends with deleted; a damaged line is
+skipped (logged once per file), never fatal. **Retention**: whole days, oldest first - every day
+that ended `connections.keep_days` (30) days ago or more, then the oldest days while the files take
+more than `connections.keep_mb` (200) MiB (compressed days at their stored size); today and later
+days are never deleted; applied at open (the size limit; the age limit an hour later, see the store's
+clock rules), every hour by the monitor whether or not the samplers run, and by the appends at most
+once an hour (a change of the limits takes effect at the next of these). Open itself only indexes
+the directory and repairs what a crash left: the compression of the days before today and the size
+limit go on in the background - the evidence collection never waits for them, the appends and Close
+do. One process writes the store - the monitor, whose ledger lock keeps a second
+one away (the CLI never opens it) - while any number of readers read a snapshot of its index; on
+Windows the readers open files with `FILE_SHARE_DELETE`, so a query never keeps the writer from
+compressing, merging or pruning a day.
+
+*Aggregation* (`Aggregate`): of each session, the side that is the home network's - a private
+(RFC 1918, `fc00::/7`), link-local or shared (`100.64.0.0/10`) address, or one the Device List read
+in effect lists (a device's global IPv6 address) or that lies in the /64 of a global IPv6 address it
+lists (a device's temporary IPv6 addresses) - is the device on the home network: the source when it
+is one (the device opened the session; the port shown is the remote one), else the destination
+(inbound, e.g. through a port forward or an IPv6 pinhole; the port shown is the device's); a
+session with no such side is the gateway's own, from its public address (device `gateway`). A LAN
+address is named after the Device List read in effect at the NAT read - the newest at or before it,
+else the first after it - or, when that read does not list it (a device that joined since), after
+the next read when it comes within 20 minutes: `mac:<mac>` when that read gives the address's MAC
+(a device that is on first), else `ip:<address>`; so a device keeps its key when its address
+changes, and a new device is not counted twice. At most 200,000 distinct flows are counted one by
+one, the heaviest: a busier period (a device file sharing or scanning the Internet) leaves out the
+lightest, whose sessions still count in their device's weight (`left_out`; the aggregate's
+`flows_left_out` counts them), so a query's memory stays bounded whatever the home network does. A
+flow is a device, remote address, port, protocol and direction, with its first and last read, the
+reads that showed it (`samples`) and its `weight` (its sessions over those reads). Whole past days
+are summarized once and cached (at most 40 days, bounded in size); only the days a period covers
+partly, and today, are read line by line.
+
+**IP database** (`internal/ipintel`, `geo\`). The IPtoASN tables (`ip2asn-v4.tsv.gz`,
+`ip2asn-v6.tsv.gz`; https://iptoasn.com, public domain under the PDDL 1.0): the address ranges
+announced on the Internet with their AS number, country (ISO 3166-1 alpha-2, where the network is
+registered - not where a server stands) and AS description, read into sorted range tables and
+searched by binary search; a readable organisation name ("Google") comes from a list of well-known
+networks or the tidied description. With `geo.download` (default on) the service downloads a missing
+table at once and looks for newer ones every `geo.refresh` (7 days) with conditional GETs
+(`If-None-Match`, `If-Modified-Since`): https only, also after a redirect (at most 5), within 64 MiB
+and 10 minutes per file; a new file is parsed and checked completely - at least 100,000 IPv4 and
+10,000 IPv6 announced ranges, sorted, not overlapping, almost every line understood - before it
+replaces the old one atomically, and a failed or suspicious download keeps the old data and is
+tried again after an hour, the pause doubling up to `geo.refresh`. `ip2asn.json` records what was
+downloaded (URL, ETag, Last-Modified, time, rows, size, SHA-256) and when newer tables were last
+looked for. Without `geo.download`, tables placed in `geo\` by hand are used (a replaced file is
+reloaded within 5 minutes). A lookup never waits: a load builds a complete new table and swaps it
+in. Only public addresses are looked up; private, shared, loopback, link-local, multicast and
+reserved addresses (documentation ranges included) are only classified. Ports are named from a
+built-in table (tcp 443 HTTPS, udp 443 QUIC, udp 53 DNS, ...). **Reverse DNS**
+(`connections.reverse_dns`, default on): the connections view asks for the names of its rows'
+public addresses; three workers look them up through this computer's resolver (3 s each, at most 8
+at a time, 512 waiting), and the names are cached (at most 50,000 addresses; a name for 7 days, "no
+name" for a day - at most `connections.keep_days` either way - a lookup that failed retried after an
+hour) in `ptr-cache.json`, saved every 5 minutes and at the stop. The cache is a list of the remote
+addresses the household talked to, so it is kept no longer than its answers hold: an answer that has
+outlived that is never saved (the file is rewritten without it, also when nothing new is learned),
+is shown a day longer at most while it is looked up again, then forgotten; with reverse DNS or the
+database off, `ptr-cache.json` is deleted. `Run` (started by `runMonitor`) does the loading,
+downloading and lookups in the background and recovers from a panic, which its status then reports. With `geo.enabled` off
+the database only classifies addresses and names ports, and says so in its status.
+
+**Privacy.** The page's data never leave this computer. Two kinds of requests go out for it: the
+downloads of the public IPtoASN files - plain GETs, the same for everyone, never carrying an
+address (`geo.download` false stops them) - and the reverse DNS queries for the public addresses
+the connections table shows, sent to this computer's own resolver (`connections.reverse_dns` false
+stops them).
+
+**Views** (`internal/netmap`, `contracts.NetworkView`):
+
+* *Connections*: the connection store's `Aggregate` of the period (with a device filter, of that
+  device; every device is still listed, for the filter, and the newest read's sessions of that
+  device are `open_device` beside every device's `open`). A flow is named after its remote
+  address's organisation - `org:<name>` for a public address whose AS the database names an
+  organisation of (one company's ASes, Google's AS15169 and AS36040, are one organisation, with
+  their ASes listed), else `as<ASN>`, `unknown` for an address the database does not know, `local`
+  for every other address - and its service - `<proto>/<port>` when the port table names the port,
+  else `other`. The flow diagram keeps the 12 heaviest organisations and the 8 heaviest named
+  services and groups the rest as "Other"; the countries are counted by sites
+  (distinct remote addresses); the rows are the flows, heaviest first, with their reverse DNS
+  names when known (the missing ones are asked for in the background). The totals count the
+  devices, the distinct remote addresses, organisations (by key) and countries, and how many of the
+  period's devices the newest Device List lists (`listed`); flows the store left out (above) count
+  as "Other", and the view says how many (`flows_left_out`).
+* *Firewall*: the syslog store's messages of the period. A drop line is `action=DROP` (or `REJECT`)
+  followed by `KEY=VALUE` fields, of which the view reads `IN=`, `OUT=`, `SRC=`, `DST=`, `PROTO=`,
+  `SPT=`, `DPT=` and `reason=` (the first of each); the `MAC=` field, which holds this network's
+  hardware addresses (the gateway writes `SRC=` right after it), is skipped and never kept, and the
+  packet an ICMP error quotes in brackets is not read. A drop is *inbound* when it came in on a WAN
+  interface (`veip0.0` on the BGW320), *outbound* when it went from a LAN interface (`br*`, `lan*`,
+  `wl*`) toward the WAN, and *local* otherwise (sent by the gateway itself, or between the LAN and
+  the gateway). syslog-ng's "Last message 'FIREWALL[8512]: nflo' repeated N times" (and BSD
+  syslogd's "last message repeated N times") counts N more drops like the previous drop in the
+  store's order - the sealed chunks oldest first, then the open chunk - also across chunk
+  boundaries (reading at most 4 chunks outside the period to find that drop); a repeat of another
+  program's message counts nothing, and N is believed up to 100,000. Times are this computer's
+  receive times. The view counts the drops by direction and by hour (every hour of the period), by reason
+  (the 20 most frequent, then the others together, each with a plain label), the inbound drops'
+  sources (top 10, with the distinct ports tried, at most 1,024 each), their countries and the
+  services they targeted (top 8, then "Other"), and the LAN devices' outbound drops by device,
+  destination, port, protocol and reason - the rows, at most the limit, with `outbound_total` and
+  `outbound_devices` (the distinct devices) counted before the limit. A drop's LAN address is named
+  after the connection store's Device List read in effect when the drop was received - the newest
+  at or before it, else the first after it (`connstore.Store.EachDevices`), as the NAT reads'
+  addresses are - so that a device whose address DHCP gave to another one is not blamed for the
+  other's packets; an address that read does not list is named after itself (`ip:<address>`).
+* *Bounds*: a period is at most 31 days (a timeline of at most 745 hours). A sealed syslog chunk
+  never changes: it is read once and its summary kept by its name and SHA-256 (at most 64 MiB by
+  estimate and 16,384 chunks, least recently used first; chunks the store no longer lists leave
+  the cache); only the chunks at the edges of a period and the open chunk are read again, exactly.
+  One connections view and one firewall view are built at a time, and a view built for the same
+  request less than 30 s earlier is returned again (both views) - for a period that ends now, the
+  same range (`24h`) is the same request, so that a second tab, a refresh or the CLI share the view.
+  Protocols and reasons are numbered in tables that stop growing at 254 entries, so a hostile log
+  cannot grow them.
+
+**API** (§12): `GET /api/network/connections`, `/api/network/firewall` and `/api/network/status`, the
+same protections as every other GET (another site's page is refused, 403); parameters checked
+before the view is asked; at most 31 days and 1,000 rows; 30 s per request, tied to it. The
+dashboard asks for 1,000 rows every minute while the page is visible. `att-monitor network` (§14) reads the same endpoints.
+
+**Wiring** (`cmd/att-monitor`). Only the service and console modes open the connection store
+(`Paths.Connections`) and the IP database (`Paths.Geo`) and build the view over them and the syslog
+store; the CLI opens neither. The store is opened also with `connections.enabled` off - the samplers
+then do not run and `Status.connections` says so, the page still shows what was recorded before, and
+the retention limits keep deleting old samples (the monitor applies them every hour, and deletes the
+raw page copies at its start) - and the database also with `geo.enabled` off. A
+part that cannot be opened is logged and left out (an untyped nil: the page shows what the others
+give), and none of it can keep evidence collection from starting: the folders are not created with
+the rest of the layout at start (the store and the database create them), a setting of the page
+that cannot be used is replaced with a warning (§15; the view's status carries the warnings), the
+database runs in its own goroutine beside the MongoDB copy (joined at the stop), the store's
+compression of past days runs in the background after it opened, and the store is closed after the
+monitor stopped. The gateway client's login policy is read from and saved to
+`state\gateway-login.json` (§2) by every mode, the CLI's included. `install` and `setup` create both
+folders inside the secured data directory. Versions before 1.3.0 refuse a data directory holding these folders (they do not know
+them): going back to one needs them moved out first (README, *Upgrade*). From 1.3.0 on, `install`
+checks the data directory before it stops the service or replaces the program
+(`winsvc.CheckDataDir`, SecureDataDir's refusals without its changes), so a data directory it
+refuses - such as one laid out by a later version - leaves the installed service as it was.

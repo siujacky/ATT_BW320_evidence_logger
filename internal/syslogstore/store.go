@@ -514,19 +514,6 @@ func (s *Store) Usage() model.SyslogUsage {
 	return u
 }
 
-// Chunks returns the sealed chunks the store keeps, oldest first, as their sidecars describe
-// them (for a sidecar rebuilt from its chunk file, the counts and the reason are not known: 0
-// and "recovered"). The monitor can compare them with its syslog_chunk records.
-func (s *Store) Chunks() []model.SyslogChunk {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]model.SyslogChunk, len(s.chunks))
-	for i, c := range s.chunks {
-		out[i] = c.meta
-	}
-	return out
-}
-
 // Unrecorded returns the sealed chunks whose syslog_chunk record the writer has not noted
 // (MarkRecorded), oldest first, as their sidecars describe them: the chunks sealed since the
 // writer could last record one - by Recover, or while the ledger refused records, also in a run

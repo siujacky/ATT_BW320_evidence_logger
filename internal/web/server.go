@@ -12,6 +12,9 @@
 //     request without a CORS preflight, which this server never grants. When the browser
 //     sends Origin it must equal this server's origin, and a Sec-Fetch-Site header, when
 //     present, must say "same-origin" (or "none"). Violations are answered 403.
+//   - Cross-site reads: a GET or HEAD of the API (/api/...) whose Sec-Fetch-Site says another
+//     site's page sent it is answered 403 without being served (crossSiteRead): such a page
+//     could not read the answer anyway, but could make the service build costly views.
 //   - Response hardening: Cache-Control no-store, X-Content-Type-Options nosniff,
 //     Referrer-Policy no-referrer and a strict Content-Security-Policy on every response.
 //     Raw gateway pages are only ever rendered under a sandbox CSP (opaque origin, no
@@ -24,7 +27,7 @@
 // ErrLedgerBroken 503 (nothing can be recorded until the service restarts), and the gateway
 // sentinels to 409/502/503 with an explanation the operator can act on. A feature the monitor
 // does not offer at all (the syslog store, the syslog control - its retention and the gateway's
-// Syslog setting - and the flow meter) answers 404.
+// Syslog setting -, the flow meter and the Network page's view) answers 404.
 package web
 
 import (
@@ -93,8 +96,9 @@ var shutdownTimeout = 5 * time.Second
 
 // Options configures the web server. Every dependency may be nil; the endpoints that need
 // a missing dependency answer 503 (e.g. the CLI may serve a read-only view). The syslog
-// store, its retention control and the flow meter are features a monitor may not offer: their
-// endpoints then answer 404 and the dashboard leaves them out or says why.
+// store, its retention control, the flow meter and the Network page's view are features a
+// monitor may not offer: their endpoints then answer 404 and the dashboard leaves them out or
+// says why.
 type Options struct {
 	Listen   string // loopback ip:port; "" = config default (127.0.0.1:8320); port 0 = ephemeral
 	Status   contracts.StatusSource
@@ -109,8 +113,13 @@ type Options struct {
 	SyslogReader  contracts.SyslogReader
 	SyslogControl contracts.SyslogControl
 	LiveTraffic   contracts.LiveTrafficSource
-	Version       string // shown in the dashboard footer ("" = "dev")
-	Logger        *slog.Logger
+	// Network builds the dashboard's Network page (GET /api/network/connections, /firewall and
+	// /status, docs/syslog-map-graphic.md): which device talked to which remote address, from the
+	// gateway's NAT table, and what the gateway's firewall dropped, from the syslog store. None of
+	// it is evidence; the samplers' state comes from Status.
+	Network contracts.NetworkView
+	Version string // shown in the dashboard footer ("" = "dev")
+	Logger  *slog.Logger
 }
 
 // Server is the localhost dashboard and JSON API.
@@ -123,6 +132,7 @@ type Server struct {
 	syslog    contracts.SyslogReader
 	syslogCtl contracts.SyslogControl
 	live      contracts.LiveTrafficSource
+	network   contracts.NetworkView
 	version   string
 	log       *slog.Logger
 
@@ -187,6 +197,7 @@ func New(opts Options) (*Server, error) {
 		syslog:    opts.SyslogReader,
 		syslogCtl: opts.SyslogControl,
 		live:      opts.LiveTraffic,
+		network:   opts.Network,
 		version:   version,
 		log:       log,
 		listen:    ap.String(),
@@ -303,6 +314,12 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 				writeError(sw, http.StatusForbidden, why)
 				return
 			}
+		} else if why := crossSiteRead(r); why != "" {
+			// Debug only: any page in the owner's browser can send these, as often as it likes.
+			s.log.Debug("web: rejected cross-site API read", "remote", r.RemoteAddr, "path", r.URL.Path,
+				"sec_fetch_site", r.Header.Get("Sec-Fetch-Site"))
+			writeError(sw, http.StatusForbidden, why)
+			return
 		}
 		if r.ContentLength > MaxBodyBytes {
 			writeError(sw, http.StatusRequestEntityTooLarge, "request body too large (limit 1 MiB)")
@@ -362,6 +379,23 @@ func csrfProblem(r *http.Request) string {
 	}
 	if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
 		return "cross-site request rejected"
+	}
+	return ""
+}
+
+// crossSiteRead returns why a read of the API (a GET or HEAD below /api/) must be refused, or "": a
+// browser said that another site's page sent it (Sec-Fetch-Site neither "same-origin" nor "none").
+// Such a page cannot read the answer (no CORS, Cross-Origin-Resource-Policy same-origin), but it
+// can make the service build it - a month of network or syslog views costs the evidence logger
+// seconds of CPU and hundreds of MiB - as often as it likes. The dashboard's own requests are
+// same-origin, an address typed or bookmarked is "none", and the CLI sends no such header. The
+// pages themselves ("/", /static/) stay open: a link to the dashboard from elsewhere still works.
+func crossSiteRead(r *http.Request) string {
+	if !strings.HasPrefix(r.URL.Path, "/api/") {
+		return ""
+	}
+	if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
+		return "cross-site request rejected: the API answers this dashboard only"
 	}
 	return ""
 }
@@ -503,6 +537,9 @@ func (s *Server) routes() http.Handler {
 	rt.handle(http.MethodGet, "/api/syslog", s.handleSyslog)
 	rt.handle(http.MethodPost, "/api/syslog/retention", s.handleSyslogRetention)
 	rt.handle(http.MethodGet, "/api/traffic/live", s.handleLiveTraffic)
+	rt.handle(http.MethodGet, "/api/network/connections", s.handleNetworkConnections)
+	rt.handle(http.MethodGet, "/api/network/firewall", s.handleNetworkFirewall)
+	rt.handle(http.MethodGet, "/api/network/status", s.handleNetworkStatus)
 	rt.handle(http.MethodGet, "/api/blobs/{id}", s.handleBlob)
 	rt.handle(http.MethodGet, "/api/blobs/{id}/view", s.handleBlobView)
 	rt.handle(http.MethodPost, "/api/verify", s.handleVerify)

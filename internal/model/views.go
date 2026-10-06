@@ -136,8 +136,11 @@ type Status struct {
 	Mongo *MongoStatus `json:"mongo,omitempty"`
 	// Syslog is the syslog receiver and the gateway's Syslog setting (nil when not configured).
 	Syslog *SyslogStatus `json:"syslog,omitempty"`
-	Ledger LedgerStatus  `json:"ledger"`
-	Stats  []WindowStats `json:"stats"`
+	// Connections is the NAT table and Device List samplers of the Network page (nil when not
+	// configured).
+	Connections *ConnSamplerStatus `json:"connections,omitempty"`
+	Ledger      LedgerStatus       `json:"ledger"`
+	Stats       []WindowStats      `json:"stats"`
 }
 
 // GatewayCertState is the gateway certificate pin as the monitor currently applies it.

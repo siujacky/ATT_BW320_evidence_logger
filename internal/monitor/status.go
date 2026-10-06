@@ -38,13 +38,15 @@ func (m *Monitor) Status() model.Status {
 		u := st.Usage()
 		usage = &u
 	}
+	conns := m.connStatus() // the samplers' lock and the connection store's: not while holding mu
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s := model.Status{
-		Probes: probes,
-		Now:    fmtTS(now),
-		Mongo:  mongo,
+		Probes:      probes,
+		Now:         fmtTS(now),
+		Mongo:       mongo,
+		Connections: conns,
 		Monitor: model.MonitorInfo{
 			Version: m.opts.Software.Version,
 			RunID:   runID,

@@ -120,10 +120,13 @@ func TestLiveTrafficEndpointSecurity(t *testing.T) {
 	if hs.live.calls != 0 {
 		t.Errorf("%d readings for requests that were refused", hs.live.calls)
 	}
-	// Nothing grants another origin the answer.
+	// Another site's page is refused before the gateway is read, and nothing grants it the answer.
 	rec = hs.serve(hs.request(http.MethodGet, "/api/traffic/live", nil, map[string]string{"Origin": "http://evil.example", "Sec-Fetch-Site": "cross-site"}))
-	wantStatus(t, rec, http.StatusOK)
+	wantJSONError(t, rec, http.StatusForbidden)
 	if v := rec.Header().Get("Access-Control-Allow-Origin"); v != "" {
 		t.Errorf("Access-Control-Allow-Origin: %q", v)
+	}
+	if hs.live.calls != 0 {
+		t.Errorf("%d readings for a cross-site request", hs.live.calls)
 	}
 }

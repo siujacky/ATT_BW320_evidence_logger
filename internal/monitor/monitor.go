@@ -5,21 +5,34 @@
 // serves the live status, chart series and incident views to the dashboard
 // (contracts.StatusSource) as well as operator actions (contracts.Actions), the syslog controls
 // (contracts.SyslogControl: how much is kept, and the gateway's Syslog page) and the flow meter
-// (contracts.LiveTrafficSource).
+// (contracts.LiveTrafficSource). It also samples the gateway's NAT table and Device List for the
+// dashboard's Network page (connections.go, into Options.Conns).
 //
 // Everything the monitor learns is appended to the evidence ledger; its in-memory state is
 // a cache that is rebuilt from the ledger at startup (state/monitor-state.json only speeds
-// that up and is never evidence). The flow meter is the exception: a display only, never
-// recorded.
+// that up and is never evidence). The flow meter and the Network page's samples are the
+// exceptions: never recorded.
 //
 // Concurrency: one goroutine per activity (fast cycle, gateway poll, service checks, local
 // link, clock, heartbeat, anchoring, notification check, traceroutes, incident close,
-// segment compression, syslog receiver and syslog flush). Locks, always acquired in this order:
+// segment compression, syslog receiver and syslog flush, NAT table and Device List samplers, the
+// connection store's retention).
+// Locks, always acquired in this order:
 //
 //	notifMu   makes "read the redirect and Syslog settings, then enforce them" atomic w.r.t.
-//	          operator changes
+//	          operator changes; TrustCert holds it too, so that neither runs half-way through a
+//	          certificate confirmation
+//	certMu    (read-write) keeps the NAT sampler's reads, which do not take notifMu, out of
+//	          TrustCert's window: TrustCert holds it exclusively while it moves the pinned
+//	          certificate, records the config_change and may undo the move, so that no
+//	          authenticated request uses a pin whose change is not recorded; a NAT read holds it
+//	          shared, never waiting for it (connections.go)
 //	syslogMu  serializes the syslog store's operations with their records (syslog.go)
-//	gwMu      serializes requests to the gateway (one web session at a time)
+//	gwMu      serializes requests to the gateway (one web session at a time); a settings check
+//	          or an operator change that finds a NAT read in progress waits for it here. Taken
+//	          with lockGateway, which names what it is used for (gwUse) - except by the flow
+//	          meter, which only tries it (TryLock) and, when it is held, says what holds it
+//	          (live.go)
 //	anchorMu  serializes anchoring
 //	stMu      serializes appends: "append a record + apply it to memory" is atomic w.r.t.
 //	          state-cache writes, an incident record is built and appended in one step,
@@ -30,7 +43,14 @@
 //	          syslog retention) and SaveConfig
 //	mu        guards the in-memory state (never held during I/O)
 //
-// liveMu guards the flow meter (live.go) and is never held while another lock is taken.
+// liveMu guards the flow meter (live.go) and connSamplers.mu the Network page's samplers
+// (connections.go); neither is held while another lock is taken. The NAT sampler's read is an
+// authenticated request: it holds certMu shared (never waiting for it) and then gwMu, and not
+// notifMu - an operator's change or a settings check that starts during the read waits for it at
+// gwMu instead of being refused as busy. No cycle: the only wait for certMu is TrustCert's, which
+// holds nothing but notifMu then and never takes gwMu; a read holding certMu takes only locks
+// later in the order (gwMu, then those of the certificate observer that its TLS handshake may call:
+// cfgMu, stMu, mu), whose holders never wait for certMu or notifMu.
 package monitor
 
 import (
@@ -79,6 +99,13 @@ type Options struct {
 	// kept). The monitor records a syslog_chunk record for every sealed chunk and a
 	// syslog_prune record for every deletion.
 	SyslogStore contracts.SyslogStore
+	// Conns keeps the samples behind the dashboard's Network page (nil: no samplers, and
+	// Status.Connections is nil). With connections.enabled the monitor reads the gateway's NAT
+	// table every connections.interval (an authenticated request, under the guard of every other
+	// one) and its Device List every connections.devices_interval, and appends what it reads;
+	// whether or not it does, it applies the store's retention limits every hour. None of it is
+	// evidence: nothing of it is written to the ledger (connections.go).
+	Conns contracts.ConnStore
 }
 
 // Compile-time interface conformance.
@@ -392,13 +419,27 @@ type Monitor struct {
 	runCtx atomic.Pointer[context.Context]
 	live   liveState
 
+	// conns are the Network page's samplers (connections.go; nil without Options.Conns).
+	conns *connSamplers
+	// startupChecked is closed once this run's startup settings check has been made - or found
+	// that there was nothing to check (no access code) - by notificationLoop (startupCheckDone):
+	// the first NAT read waits for it, so that it reuses the check's login session (it logs in by
+	// itself only when the check did not) and a restart never brings a login of its own.
+	startupChecked     chan struct{}
+	startupCheckedOnce sync.Once
+
 	running       atomic.Bool
 	shutdownSeen  atomic.Bool
 	gwAuth        atomic.Bool // an authenticated gateway operation holds gwMu (raised and read under cfgMu)
 	appendFailing atomic.Bool // the latest append failed (fast path of noteAppendSuccess)
 	records       atomic.Uint64
+	// gwUse is what the holder of gwMu uses the gateway for (lockGateway, one of the gwUse words),
+	// for the reason a flow-meter read skipped meanwhile gives (errLiveBusy); nil while gwMu is
+	// free, held by the flow meter, or just taken or about to be released.
+	gwUse atomic.Pointer[string]
 
-	notifMu  sync.Mutex // serializes notification check/enforce and operator changes
+	notifMu  sync.Mutex   // serializes notification check/enforce, operator changes and TrustCert
+	certMu   sync.RWMutex // TrustCert's move of the pin (exclusive) against the NAT reads (shared)
 	syslogMu sync.Mutex
 	gwMu     sync.Mutex
 	anchorMu sync.Mutex
@@ -494,6 +535,7 @@ func New(opts Options) (*Monitor, error) {
 		kClose:           newKicker(),
 		kNotif:           newKicker(),
 		traceReqs:        make(chan traceReq, 16),
+		startupChecked:   make(chan struct{}),
 	}
 	if opts.Anchorer != nil && opts.Config.Anchoring.Enabled {
 		m.anchorer = opts.Anchorer
@@ -502,6 +544,7 @@ func New(opts Options) (*Monitor, error) {
 	m.syslogOn = opts.Syslog != nil && opts.SyslogStore != nil && opts.Config.Syslog.Enabled
 	m.syslog = bookOf(opts.SyslogStore, m.log)
 	m.syslogMarkLater, m.syslogUnverified = map[string]uint64{}, map[string]bool{}
+	m.conns = newConnSamplers(opts.Conns, opts.Config.Connections, m.set.gwTimeout)
 	m.st.incidents = map[string]model.Incident{}
 	m.st.points = newPointStore()
 	m.st.alarms = map[string]alarmMark{}
@@ -585,6 +628,14 @@ func (m *Monitor) Run(ctx context.Context) error {
 	}
 	if m.syslogOn {
 		workers = append(workers, worker{"syslog-receiver", m.syslogReceiverLoop}, worker{"syslog", m.syslogLoop})
+	}
+	if m.samplersOn() {
+		workers = append(workers, worker{"connections-nat", m.natLoop}, worker{"connections-devices", m.devicesLoop})
+	}
+	if m.conns != nil {
+		// Whether or not the samplers run: the store's retention limits and the raw page copies'
+		// age apply also with connections.enabled off (connRetentionLoop).
+		workers = append(workers, worker{"connections-retention", m.connRetentionLoop})
 	}
 	var wg sync.WaitGroup
 	for _, w := range workers {

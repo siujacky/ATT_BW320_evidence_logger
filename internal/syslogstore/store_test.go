@@ -109,14 +109,14 @@ func TestReopenIndexesSealedChunks(t *testing.T) {
 	if h.count("sidecar") != 0 {
 		t.Fatalf("log:\n%s", h.all())
 	}
-	if got := s.Chunks(); !slices.Equal(got, chunks) {
+	if got := s.Chunks(); !slices.Equal(got, refsOf(chunks)) {
 		t.Fatalf("Chunks\n%+v\nwant\n%+v", got, chunks)
 	}
 	recovered, err := s.Recover(t0)
 	if err != nil || len(recovered) != 1 {
 		t.Fatalf("Recover: %+v %v", recovered, err)
 	}
-	if got := s.Chunks(); !slices.Equal(got, append(chunks, recovered[0])) {
+	if got := s.Chunks(); !slices.Equal(got, refsOf(append(chunks, recovered[0]))) {
 		t.Fatalf("Chunks after Recover: %+v", got)
 	}
 	if got := entryTexts(queryAll(t, s)); !slices.Equal(got, append(reversed(more), reversed(ms)...)) {

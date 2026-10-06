@@ -61,7 +61,9 @@ func (m *Monitor) SetGatewayNotification(ctx context.Context, enabled bool, acto
 	}
 	// No enforcement check may run between the gateway change and clearing
 	// enforce_notification_off below (it would switch the setting straight back off). A check
-	// (or another change) in progress makes this one busy rather than queue behind a login.
+	// (or another change) in progress makes this one busy rather than queue behind a login. A
+	// NAT read for the Network page does not hold notifMu: one in progress is waited for at the
+	// gateway lock (natTimeout at most).
 	if !m.notifMu.TryLock() {
 		return model.ConfigChange{}, fmt.Errorf("a gateway notification check or change is already running: %w", contracts.ErrBusy)
 	}

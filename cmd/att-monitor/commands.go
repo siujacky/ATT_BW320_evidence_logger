@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"math"
 	"net/http"
@@ -158,9 +159,14 @@ func cmdStatus(args []string) error {
 		st = "unknown (" + err.Error() + ")"
 	}
 	fmt.Println("Service:", st)
-	api, ok := serviceAPI(defaultDataDir(*data))
+	dataDir := defaultDataDir(*data)
+	api, ok := serviceAPI(dataDir)
 	if !ok {
 		fmt.Println("Dashboard: not reachable")
+		if p := configProblem(dataDir); p != "" {
+			fmt.Println("Config:   ", p)
+			fmt.Println("           The service does not start until config.json is corrected (logs\\service.log says so too).")
+		}
 		return nil
 	}
 	var s model.Status
@@ -188,6 +194,19 @@ func cmdStatus(args []string) error {
 	}
 	fmt.Printf("Ledger:    head #%d %s…  last anchor %s  key %s\n", s.Ledger.HeadSeq, short(s.Ledger.HeadHash, 12), s.Ledger.LastAnchorTime, short(s.Ledger.Fingerprint, 16))
 	return nil
+}
+
+// configProblem says why the configuration in dataDir keeps the service from starting: config.json
+// was read but cannot be used (not JSON, or a value the monitor cannot work with). "" when it can be
+// used, when there is none yet (the service writes the defaults) or when it cannot be read here (an
+// error that is this command's, not the service's).
+func configProblem(dataDir string) string {
+	_, err := config.Load(config.PathsFor(dataDir).Config)
+	var pe *fs.PathError
+	if err == nil || errors.As(err, &pe) {
+		return ""
+	}
+	return err.Error()
 }
 
 func short(s string, n int) string {
@@ -594,14 +613,17 @@ func reportVerify(rep model.VerifyReport, asJSON bool) error {
 // ------------------------------------------------------------------ export / notes / anchor
 
 // parseWhen accepts YYYY-MM-DD, YYYY-MM-DDTHH:MM (local) or RFC 3339.
-func parseWhen(s string) (time.Time, error) {
+func parseWhen(s string) (time.Time, error) { return parseWhenIn(s, time.Local) }
+
+// parseWhenIn is parseWhen with loc as the local time zone.
+func parseWhenIn(s string, loc *time.Location) (time.Time, error) {
 	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
 		if t, err := time.Parse(layout, s); err == nil {
 			return t, nil
 		}
 	}
 	for _, layout := range []string{"2006-01-02T15:04:05", "2006-01-02T15:04", "2006-01-02 15:04", "2006-01-02"} {
-		if t, err := time.ParseInLocation(layout, s, time.Local); err == nil {
+		if t, err := time.ParseInLocation(layout, s, loc); err == nil {
 			return t, nil
 		}
 	}

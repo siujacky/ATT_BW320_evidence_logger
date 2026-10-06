@@ -18,9 +18,11 @@ import (
 // counters that were reset, "at least" when a wrap is ambiguous). This computer's rates come from
 // the newest local-link readings the monitor already has. It is a display, not evidence: nothing
 // of it is recorded, stored or fed into the monitor's state, and while nobody asks the gateway
-// gets no extra request. The evidence comes first: a read never waits for the gateway lock (it
-// is skipped while a poll or another gateway operation holds it), holds it for at most
-// liveTimeout, and is not made while the newest recorded snapshot found the gateway unreachable.
+// gets no extra request. The evidence comes first, and so does every other use the monitor makes
+// of the gateway: a read never waits for the gateway lock (it is skipped while a snapshot, a
+// settings check, a read for the Network page or another gateway operation holds it, and says
+// which), holds it for at most liveTimeout, and is not made while the newest recorded snapshot
+// found the gateway unreachable.
 // (The gateway client's TLS pin policy applies to these reads as to any other: a changed
 // certificate is reported by the first request that meets it.)
 
@@ -104,17 +106,31 @@ func (m *Monitor) liveRead(call *liveCall) {
 	})
 }
 
-// errLiveBusy: the flow meter left the gateway alone because the monitor itself was reading it.
-var errLiveBusy = errors.New("skipped: the monitor was reading the gateway for its evidence, which comes first; the next reading follows within seconds")
+// gwUseAny names what holds the gateway lock in errLiveBusy when its holder could not be told.
+const gwUseAny = "using the gateway (for its evidence, a settings check or the Network page)"
+
+// errLiveBusy is why the flow meter left the gateway alone: the monitor itself was using it. use
+// says for what (Monitor.gwUse, as the holder of the gateway lock named it; "" when that could
+// not be told: the holder had just taken the lock, or was about to release it) - not always for
+// its evidence, nor for seconds only: a NAT read for the Network page holds the lock for up to
+// natTimeout, a login included. The reason begins with "skipped", which the dashboard shows as a
+// wait for the next read rather than as a failed one.
+func errLiveBusy(use string) error {
+	if use == "" {
+		use = gwUseAny
+	}
+	return errors.New("skipped: the monitor was " + use + ", and the flow meter does not queue behind it; the next reading follows once that is done")
+}
 
 // liveSnapshot reads the gateway's Broadband Status page for the flow meter. Like every gateway
 // request it holds the gateway lock (one request at a time, never during an authenticated
-// operation), but it never waits for it: while a poll or another gateway operation holds the
-// lock the read is skipped (errLiveBusy), and it holds the lock for at most liveTimeout, so the
-// evidence snapshots - every 15 s during an incident - are delayed by liveTimeout at most. It is
-// not made at all while the newest recorded snapshot found the gateway unreachable: it would
-// only wait for its timeout, and the next poll tells when the gateway answers again. The reads
-// end with Run. The page is neither stored nor recorded.
+// operation), but it never waits for it: while a snapshot, a settings check, a read for the
+// Network page or another gateway operation holds the lock the read is skipped, saying which
+// (errLiveBusy), and it holds the lock for at most liveTimeout, so the evidence snapshots - every
+// 15 s during an incident - are delayed by liveTimeout at most. It is not made at all while the
+// newest recorded snapshot found the gateway unreachable: it would only wait for its timeout, and
+// the next poll tells when the gateway answers again. The reads end with Run. The page is
+// neither stored nor recorded.
 func (m *Monitor) liveSnapshot() (model.GatewaySnapshot, error) {
 	ctx := context.Background()
 	if p := m.runCtx.Load(); p != nil {
@@ -130,7 +146,11 @@ func (m *Monitor) liveSnapshot() (model.GatewaySnapshot, error) {
 			fmtHuman(last.At))
 	}
 	if !m.gwMu.TryLock() {
-		return model.GatewaySnapshot{}, errLiveBusy
+		var use string
+		if p := m.gwUse.Load(); p != nil {
+			use = *p
+		}
+		return model.GatewaySnapshot{}, errLiveBusy(use)
 	}
 	defer m.gwMu.Unlock()
 	if err := ctx.Err(); err != nil {

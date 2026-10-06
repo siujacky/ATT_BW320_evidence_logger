@@ -1,6 +1,8 @@
 package web
 
 import (
+	"bytes"
+	"encoding/json"
 	"io/fs"
 	"net/http"
 	"os"
@@ -21,6 +23,8 @@ func TestStaticFilesServedWithContentTypes(t *testing.T) {
 		{"/static/app.js", "text/javascript; charset=utf-8", "'use strict';"},
 		{"/static/style.css", "text/css; charset=utf-8", "prefers-color-scheme: dark"},
 		{"/static/favicon.svg", "image/svg+xml", "<svg"},
+		// The Network page's world map: JSON, never sniffed or run as a script (nosniff).
+		{"/static/world.json", "application/json; charset=utf-8", `"countries":[`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.path, func(t *testing.T) {
@@ -69,6 +73,62 @@ func TestIndexCarriesEscapedVersion(t *testing.T) {
 	s2, _ := New(Options{})
 	if !strings.Contains(string(s2.index.data), `content="dev"`) {
 		t.Error(`empty version should render as "dev"`)
+	}
+}
+
+// TestWorldMapData checks static/world.json, the Network page's world map (scripts/worldmap):
+// the countries of Natural Earth 1:110m as SVG paths keyed by ISO 3166-1 alpha-2 code. The
+// dashboard sets each path's d attribute from it, so a path may hold nothing but the commands
+// M, L and Z with plain numbers; it must stay small enough to load at once.
+func TestWorldMapData(t *testing.T) {
+	b, err := staticFS.ReadFile("static/world.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b) > 200<<10 {
+		t.Errorf("world.json is %d bytes, more than 200 KiB", len(b))
+	}
+	var world struct {
+		Source    string `json:"source"`
+		License   string `json:"license"`
+		W         int    `json:"w"`
+		H         int    `json:"h"`
+		Countries []struct {
+			ID   string `json:"id"`
+			Name string `json:"n"`
+			D    string `json:"d"`
+		} `json:"countries"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&world); err != nil {
+		t.Fatalf("world.json: %v", err)
+	}
+	if world.W != 1000 || world.H < 300 || world.H > 600 || !strings.Contains(world.Source, "Natural Earth") {
+		t.Errorf("world.json: w %d, h %d, source %q", world.W, world.H, world.Source)
+	}
+	// world-atlas's ISC licence asks for its copyright and permission notice in every copy: the map
+	// carries it, and so does the program that embeds the map.
+	if !strings.Contains(world.License, "Copyright") || !strings.Contains(world.License, "Michael Bostock") ||
+		!strings.Contains(world.License, "provided that the above copyright notice and this permission notice appear in all copies") {
+		t.Errorf("world.json does not carry world-atlas's licence notice: %q", world.License)
+	}
+	if len(world.Countries) < 150 {
+		t.Fatalf("world.json has %d countries", len(world.Countries))
+	}
+	code := regexp.MustCompile(`^[A-Z]{2}$`)
+	path := regexp.MustCompile(`^(M-?[0-9.]+,-?[0-9.]+L(-?[0-9.]+,-?[0-9.]+ ?)+Z)+$`)
+	ids := map[string]bool{}
+	for _, c := range world.Countries {
+		if !code.MatchString(c.ID) || c.Name == "" || !path.MatchString(c.D) {
+			t.Errorf("country %q (%q): path %.60q", c.ID, c.Name, c.D)
+		}
+		ids[c.ID] = true
+	}
+	for _, want := range []string{"US", "CA", "BR", "GB", "DE", "FR", "NL", "IE", "CN", "JP", "IN", "AU", "RU", "ZA"} {
+		if !ids[want] {
+			t.Errorf("world.json has no %s", want)
+		}
 	}
 }
 

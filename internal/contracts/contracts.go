@@ -164,6 +164,14 @@ type Gateway interface {
 	// and returns the pages before and after. It never posts a form it does not fully
 	// understand, and it fails unless the page read afterwards shows want. Authenticated.
 	SetSyslog(ctx context.Context, want model.SyslogTarget) (before, after []byte, err error)
+	// NATTable reads the NAT table page (Diagnostics → NAT Table): every connection the gateway
+	// is translating. Authenticated and read only: the page's display selector is never posted.
+	// raw is the exact page that was read (also with a parse error).
+	NATTable(ctx context.Context) (table model.NATTable, raw []byte, err error)
+	// Devices reads the Device List page (Device → Device List). Unauthenticated and read only:
+	// its "Clear and Rescan for Devices" form is never posted. raw is the exact page read, also
+	// with an error once the gateway answered.
+	Devices(ctx context.Context) (devices []model.LANDevice, raw []byte, err error)
 	// SetCertObserver installs the TLS pin policy callback.
 	SetCertObserver(CertObserver)
 	// PinnedCert returns the currently pinned certificate SHA-256 ("" if none yet).
@@ -281,6 +289,95 @@ type SyslogControl interface {
 	// it off on the gateway and stops enforcing. Both are read back from the gateway and recorded
 	// (gateway_event syslog_setting with the pages before and after, config_change).
 	SetGatewaySyslog(ctx context.Context, enabled bool, actor string) (model.ConfigChange, error)
+}
+
+// SyslogChunkSource gives the firewall view of the Network page (internal/netmap) the syslog
+// store's messages chunk by chunk, so that what a sealed chunk holds - which never changes - is
+// read once and cached by its name (implemented by syslogstore.Store).
+type SyslogChunkSource interface {
+	// Chunks lists the sealed chunks kept, oldest first (From/To are the earliest and the latest
+	// receive time of a chunk's messages).
+	Chunks() []model.SyslogChunkRef
+	// OpenChunk opens the exact stored bytes (gzip) of a sealed chunk; ErrNotFound when it is gone.
+	OpenChunk(name string) (io.ReadCloser, error)
+	// EachOpen calls fn, oldest first, for each message of the open chunk (not sealed yet) that
+	// was received in [from, to). Returning ErrStop ends it early with a nil error.
+	EachOpen(ctx context.Context, from, to time.Time, fn func(*model.SyslogMessage) error) error
+	// Usage reports the stored volume, the oldest and newest message and the retention limits.
+	Usage() model.SyslogUsage
+}
+
+// ------------------------------------------------------------------ network (the Network page)
+
+// ConnQuery selects the NAT samples of a period.
+type ConnQuery struct {
+	From, To time.Time // [From, To)
+	Device   string    // a ConnDevice.Key ("" = every device)
+}
+
+// ConnStore keeps the samples of the gateway's NAT table and Device List (implemented by
+// connstore.Store) in daily files under connections\, within connections.keep_days and
+// connections.keep_mb. None of it is evidence: it is never written to the ledger.
+// All methods are safe for concurrent use.
+type ConnStore interface {
+	// AppendNAT adds one NAT table read; AppendDevices one Device List read.
+	AppendNAT(t time.Time, nat model.NATTable) error
+	AppendDevices(t time.Time, devices []model.LANDevice) error
+	// Aggregate summarizes the NAT reads of [q.From, q.To) by device and flow, naming each LAN
+	// address after the Device List read nearest before (else after) that NAT read. Its work is
+	// bounded: whole past days come from a cache.
+	Aggregate(ctx context.Context, q ConnQuery) (model.ConnAggregate, error)
+	// Devices returns the newest Device List read (nil before the first) and when it was read.
+	Devices() ([]model.LANDevice, time.Time)
+	// Prune deletes the oldest files beyond the retention limits. The monitor calls it every hour
+	// whether or not its samplers run; appends also do it, at most once an hour.
+	Prune(now time.Time) error
+	// SetRetention changes the limits (keepDays >= 1, keepMB >= 1).
+	SetRetention(keepDays, keepMB int)
+	Usage() model.ConnStoreUsage
+}
+
+// IPIntel names addresses and ports without asking anyone (implemented by ipintel.DB): the
+// offline IPtoASN database (the address ranges of every network with its AS number, name and
+// country), a table of well-known ports and a cache of reverse DNS names. Safe for concurrent use.
+type IPIntel interface {
+	// Lookup classifies addr and, when it is public, looks it up in the IP database. It never
+	// blocks on the network.
+	Lookup(addr netip.Addr) model.IPInfo
+	// Service names a port ("tcp", 443 → "HTTPS"; "udp", 443 → "QUIC"); "" when unknown.
+	Service(proto string, port int) string
+	// PTR returns the cached reverse DNS name of a public addr ("" when not known). With resolve,
+	// an address not cached yet is queued for a lookup in the background (bounded: a few at a time,
+	// each with a short timeout), so a later call may know it. Never blocks on the network.
+	PTR(addr netip.Addr, resolve bool) string
+	// Updated is when the loaded IP database was written (zero when none is loaded).
+	Updated() time.Time
+	Status() model.IPIntelStatus
+}
+
+// NetQuery asks for the Network page's views of [From, To).
+type NetQuery struct {
+	From, To time.Time
+	// Range is the name the period was asked by when it ends now ("24h": From and To are then that
+	// period as of the request), "" for a period given by its boundaries. The views key the views
+	// they keep for reuse by it: a request for the same range a few seconds later - a second tab,
+	// the CLI - gets the view built for the first.
+	Range  string
+	Device string // a device key ("" = every device); connections only
+	Limit  int    // table rows (0 = the default; capped)
+}
+
+// NetworkView builds the dashboard's Network page (implemented by netmap.View) from the
+// connection store, the IP database and the syslog store. Every call's work is bounded.
+type NetworkView interface {
+	// Connections: which device talked to which remote address (the NAT table samples).
+	Connections(ctx context.Context, q NetQuery) (model.NetConnections, error)
+	// Firewall: what the gateway's firewall dropped (the syslog).
+	Firewall(ctx context.Context, q NetQuery) (model.NetFirewall, error)
+	// NetworkStatus: the connection store, the IP database and the syslog kept (Samplers is left
+	// nil: the web layer takes it from the monitor's Status; ConfigWarnings is added by the
+	// wiring in cmd/att-monitor, from config.Warnings).
+	NetworkStatus() model.NetworkStatus
 }
 
 // LiveTrafficSource gives the dashboard's flow meter (implemented by monitor.Monitor): each call

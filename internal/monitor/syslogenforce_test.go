@@ -1144,7 +1144,7 @@ func TestNotificationChangePausedByACertificateMetMidway(t *testing.T) {
 		t.Fatalf("syslog %+v", s)
 	}
 	ran := false
-	if err := r.m.withGatewayAuth(func() { ran = true }); !errors.Is(err, contracts.ErrGatewayCertRejected) || ran {
+	if err := r.m.withGatewayAuth(gwUseSetNotif, func() { ran = true }); !errors.Is(err, contracts.ErrGatewayCertRejected) || ran {
 		t.Fatalf("withGatewayAuth while pending: %v (ran %v)", err, ran)
 	}
 }

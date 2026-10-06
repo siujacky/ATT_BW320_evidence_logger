@@ -60,6 +60,16 @@ func cmdInstall(args []string) error {
 	return installService(o)
 }
 
+// The service control and the program copy of installService, replaceable so that a test of what
+// it refuses can never reach the real service or Program Files.
+var (
+	installStatus = winsvc.Status
+	installStop   = winsvc.Stop
+	installStart  = winsvc.Start
+	installCopy   = copyFile
+	installTarget = installDir
+)
+
 // installService copies the program to Program Files, prepares and secures the data
 // directory, stores the access code, sets up the Windows Firewall rule of the syslog receiver,
 // creates (or upgrades) the service, starts it and waits for the dashboard. An upgrade that fails
@@ -69,24 +79,31 @@ func installService(o installOptions) error {
 	if out == nil {
 		out = io.Discard
 	}
+	// Before anything changes: a data directory that SecureDataDir would refuse below - a mistyped
+	// --data, or one laid out by a newer version whose folders this one does not know - leaves the
+	// running service and the installed program as they are, instead of a refusal after the
+	// program was replaced (and the service restarted with it).
+	if err := winsvc.CheckDataDir(o.DataDir); err != nil {
+		return fmt.Errorf("data directory: %w (nothing was changed)", err)
+	}
 	paths := config.PathsFor(o.DataDir)
 	src, err := os.Executable()
 	if err != nil {
 		return err
 	}
-	dstDir := installDir()
+	dstDir := installTarget()
 	if err := os.MkdirAll(dstDir, 0o755); err != nil {
 		return err
 	}
 	dst := filepath.Join(dstDir, "att-monitor.exe")
 
-	state, _ := winsvc.Status()
+	state, _ := installStatus()
 	upgrade := state != "" && state != winsvc.StatusNotInstalled
 	stoppedForUpgrade := false
 	if upgrade {
 		fmt.Fprintln(out, "Service already installed — upgrading the executable in place.")
 		if state == "running" || state == "start pending" {
-			if err := winsvc.Stop(60 * time.Second); err != nil {
+			if err := installStop(60 * time.Second); err != nil {
 				return fmt.Errorf("stop service for upgrade: %w", err)
 			}
 			stoppedForUpgrade = true
@@ -96,7 +113,7 @@ func installService(o installOptions) error {
 	succeeded := false
 	defer func() {
 		if stoppedForUpgrade && !succeeded {
-			if err := winsvc.Start(); err != nil {
+			if err := installStart(); err != nil {
 				fmt.Fprintln(out, "WARNING: the upgrade failed and the service could not be restarted:", err)
 			} else {
 				fmt.Fprintln(out, "The upgrade failed; the previous service was restarted.")
@@ -104,7 +121,7 @@ func installService(o installOptions) error {
 		}
 	}()
 	if !strings.EqualFold(filepath.Clean(src), filepath.Clean(dst)) {
-		if err := copyFile(src, dst); err != nil {
+		if err := installCopy(src, dst); err != nil {
 			return fmt.Errorf("copy executable to %s: %w", dst, err)
 		}
 	}
@@ -176,7 +193,7 @@ func installService(o installOptions) error {
 		succeeded = true
 		return nil
 	}
-	if err := winsvc.Start(); err != nil {
+	if err := installStart(); err != nil {
 		return fmt.Errorf("start service: %w", err)
 	}
 	succeeded = true // the (new) service is running; dashboard readiness below is informational

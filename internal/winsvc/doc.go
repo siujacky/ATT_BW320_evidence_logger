@@ -12,7 +12,8 @@
 //   - SecureDataDir applies the protected data-directory ACL (SecurePrivateDir the
 //     administrators-only variant for the key folder). Both refuse system and profile
 //     folders, volume roots and folders holding unrelated files, because the change
-//     propagates through the whole tree.
+//     propagates through the whole tree; CheckDataDir makes SecureDataDir's refusals without
+//     changing anything, for the installer to run before it stops the service.
 //
 // Query-only operations (Status) open the SCM with the minimum rights so they work without
 // elevation; Install and Uninstall require an elevated administrator.

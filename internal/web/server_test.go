@@ -155,6 +155,36 @@ func TestCSRFProtection(t *testing.T) {
 	}
 }
 
+// TestCrossSiteReadsRefused: a GET or HEAD of the API that a browser says another site's page sent
+// (Sec-Fetch-Site cross-site or same-site) is answered 403 before any handler runs - such a page
+// cannot read the answer, but could make the service build costly views as often as it likes. The
+// dashboard's own requests (same-origin), an address typed in (none) and the CLI (no header) are
+// served; the pages themselves are served to any site, so that a link to the dashboard works.
+func TestCrossSiteReadsRefused(t *testing.T) {
+	hs := newHarness(t)
+	for _, site := range []string{"cross-site", "same-site"} {
+		for _, m := range []string{http.MethodGet, http.MethodHead} {
+			for _, path := range []string{"/api/status", "/api/network/connections?range=24h", "/api/network/firewall",
+				"/api/network/status", "/api/syslog", "/api/records"} {
+				rec := hs.serve(hs.request(m, path, nil, map[string]string{"Sec-Fetch-Site": site, "Origin": "http://evil.example"}))
+				if rec.Code != http.StatusForbidden {
+					t.Errorf("%s %s from a %s page: %d", m, path, site, rec.Code)
+				}
+				assertSecurityHeaders(t, rec.Header(), false)
+			}
+		}
+	}
+	if n := hs.status.calls.Load(); n != 0 {
+		t.Errorf("the status was built %d times for refused requests", n)
+	}
+	for _, hdr := range []map[string]string{nil, {"Sec-Fetch-Site": "same-origin"}, {"Sec-Fetch-Site": "none"}} {
+		wantStatus(t, hs.serve(hs.request(http.MethodGet, "/api/status", nil, hdr)), http.StatusOK)
+	}
+	for _, path := range []string{"/", "/static/app.js"} {
+		wantStatus(t, hs.serve(hs.request(http.MethodGet, path, nil, map[string]string{"Sec-Fetch-Site": "cross-site"})), http.StatusOK)
+	}
+}
+
 func TestCSRFAppliesToEveryUnsafeMethod(t *testing.T) {
 	hs := newHarness(t)
 	for _, m := range []string{http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch} {

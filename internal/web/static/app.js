@@ -196,6 +196,23 @@
   const MIB = 1048576;
   // The flow meter asks for a reading this often while the Overview is shown (GET /api/traffic/live).
   const LIVE_REFRESH_MS = 5000;
+  // The Network page (docs/syslog-map-graphic.md): its periods (range= of /api/network/*, each
+  // ending now), how often it reads its data again while shown, the longest period the server
+  // reads, the table rows asked for (the most an answer holds), the longest device key the
+  // server accepts, and how many connections the table shows before "Show all".
+  const NET_RANGES = [['1h', '1 h'], ['24h', '24 h'], ['7d', '7 d'], ['30d', '30 d']];
+  const NET_RANGE_MS = dict({ '1h': 3600e3, '24h': 86400e3, '7d': 7 * 86400e3, '30d': 30 * 86400e3 });
+  const NET_REFRESH_MS = 60000;
+  const NET_MAX_SPAN_MS = 31 * 86400e3;
+  const NET_LIMIT = 1000;
+  const NET_DEVICE_MAX = 128;
+  const NET_TABLE_PAGE = 25;
+  // The flow diagram is drawn at least this wide (room for its three columns of labels);
+  // narrower, its box scrolls sideways.
+  const NET_SANKEY_MIN_W = 760;
+  // The flow diagram's spacing (sankeyLayout, spreadLabels): nodes at least minH px tall and pad
+  // px apart; label centres (13 px type) at least gap px apart and edge px inside the node area.
+  const NET_SANKEY = { pad: 10, minH: 3, gap: 16, edge: 6 };
 
   // ------------------------------------------------------------------ app state
 
@@ -328,6 +345,7 @@
     hm: new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }),
     day: new Intl.DateTimeFormat(undefined, { weekday: 'short', month: 'short', day: 'numeric' }),
     sec: new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', second: '2-digit' }),
+    date: new Intl.DateTimeFormat(undefined, { year: 'numeric', month: 'short', day: 'numeric' }),
   };
 
   /** toDate parses RFC 3339 (any fraction length), numbers (ms) and Dates. */
@@ -944,6 +962,8 @@
     [/^\/incidents\/([^/]+)$/, 'incidents', (c, m, q, ctx) => renderIncident(c, safeDecode(m[1]), ctx)],
     [/^\/gateway$/, 'gateway', (c, m, q, ctx) => renderGateway(c, ctx)],
     [/^\/syslog$/, 'syslog', (c, m, q, ctx) => renderSyslog(c, q, ctx)],
+    [/^\/network$/, 'network', (c, m, q, ctx) => renderNetwork(c, q, ctx, 'connections')],
+    [/^\/network\/firewall$/, 'network', (c, m, q, ctx) => renderNetwork(c, q, ctx, 'firewall')],
     [/^\/evidence$/, 'evidence', (c, m, q, ctx) => renderEvidence(c, ctx)],
     [/^\/records$/, 'records', (c, m, q, ctx) => renderRecords(c, q, ctx)],
   ];
@@ -1196,7 +1216,7 @@
         h('a', { href: '#/gateway' }, 'Turn it off on the Gateway page')));
     }
     if (cnd.code === 'NO_ACCESS_CODE') {
-      body.append(h('p', { class: 'src' }, 'Monitoring needs no access code — only checking or changing the gateway’s settings (the outage redirect and the Syslog page) does. To store it, run ',
+      body.append(h('p', { class: 'src' }, 'Monitoring needs no access code — only checking or changing the gateway’s settings (the outage redirect and the Syslog page) and reading its NAT table (the connections on the Network page) do. To store it, run ',
         h('code', null, 'att-monitor set-access-code --file PATH'), ' as administrator (the device access code is printed on the gateway’s label).'));
     }
     if (cnd.code === 'ANCHOR_UNTRUSTED') {
@@ -1348,7 +1368,7 @@
     const btn = h('button', { type: 'button', class: 'btn btn-primary', disabled: true }, 'Trust the new certificate');
     const body = h('div', { class: 'banner-body' },
       h('p', { class: 'banner-title' }, COND_TITLES.GATEWAY_CERT_CHANGED),
-      h('p', null, 'The AT&T gateway presented a different TLS certificate from the one att-monitor pinned. Status pages are still read and recorded (they need no login), but authenticated actions — checking or changing the gateway’s outage-redirect and Syslog settings — are paused, so the gateway’s access code is never sent to a device that may not be your gateway.'),
+      h('p', null, 'The AT&T gateway presented a different TLS certificate from the one att-monitor pinned. Status pages are still read and recorded (they need no login), but authenticated actions — checking or changing the gateway’s outage-redirect and Syslog settings, and reading its NAT table for the connections on the Network page — are paused, so the gateway’s access code is never sent to a device that may not be your gateway.'),
       fps,
       cnd.message ? h('p', { class: 'src' }, 'Monitor: ', cnd.message) : null,
       since || seq ? h('p', { class: 'src' }, since ? ['Since ', timeEl(since)] : null, since && seq ? ' · ' : null,
@@ -2567,11 +2587,12 @@
     ctx.interval(() => { if (!document.hidden) load(); }, SERIES_REFRESH_MS);
   }
 
-  /** rangeControl offers the RANGES as a segmented radio group; groupLabel names the group. */
-  function rangeControl(current, onChange, groupLabel) {
+  /** rangeControl offers the RANGES (or the given ranges, [value, label] pairs) as a segmented
+   *  radio group; groupLabel names the group. */
+  function rangeControl(current, onChange, groupLabel, ranges) {
     const name = 'range-' + Math.random().toString(36).slice(2, 8);
     const group = h('div', { class: 'seg', role: 'radiogroup', 'aria-label': groupLabel || 'Chart time range' });
-    for (const [value, label] of RANGES) {
+    for (const [value, label] of ranges || RANGES) {
       const id = name + '-' + value;
       const input = h('input', { type: 'radio', name, id, value });
       input.checked = value === current;
@@ -2904,8 +2925,8 @@
     const D1 = 24 * H1;
     const span = to - from;
     const maxTicks = Math.max(2, Math.floor(widthPx / 72));
-    const steps = [5 * 60e3, 10 * 60e3, 15 * 60e3, 30 * 60e3, H1, 2 * H1, 3 * H1, 6 * H1, 12 * H1, D1, 2 * D1, 7 * D1];
-    const step = steps.find((st) => span / st <= maxTicks) || 7 * D1;
+    const steps = [5 * 60e3, 10 * 60e3, 15 * 60e3, 30 * 60e3, H1, 2 * H1, 3 * H1, 6 * H1, 12 * H1, D1, 2 * D1, 3 * D1, 7 * D1, 14 * D1];
+    const step = steps.find((st) => span / st <= maxTicks) || 14 * D1;
     let d = new Date(from);
     if (step >= D1) {
       d.setHours(0, 0, 0, 0);
@@ -4568,6 +4589,1809 @@
       ['Stored in', m.chunk ? [h('code', { class: 'wrap-any' }, String(m.chunk)), h('span', { class: 'sub small' }, 'chunk of the syslog store; evidence: ',
         chunkRecordLink(m, 'ledger record #'))] : null],
     ]));
+  }
+
+  // ------------------------------------------------------------------ network view
+
+  // Address kinds of the IP database (model.IPKind*) in words: what a remote address that is not
+  // on the Internet is.
+  const IP_KINDS = dict({
+    public: 'Internet', private: 'Private network', shared: 'Carrier-grade NAT', loopback: 'Loopback',
+    'link-local': 'Link-local', multicast: 'Multicast', reserved: 'Reserved range', invalid: 'Not an IP address',
+  });
+
+  // Country names: the browser's own (Intl.DisplayNames), else the world map's.
+  const REGION_NAMES = (() => {
+    try {
+      return typeof Intl === 'object' && typeof Intl.DisplayNames === 'function' ? new Intl.DisplayNames(undefined, { type: 'region' }) : null;
+    } catch (_) {
+      return null;
+    }
+  })();
+  const worldNames = new Map(); // ISO code -> the world map's name of the country
+
+  // The device filter last chosen on the Connections tab, for its link on the Firewall tab.
+  const netLast = { device: '' };
+
+  // Colour slot (1-8) of each device while the page is open: the colour follows the device, never
+  // its rank, so neither a filter nor a refresh repaints a device. From the ninth device on, the
+  // devices are grey (slot 0) and told apart by their names: hues are never cycled.
+  const deviceSlots = new Map();
+
+  function deviceSlot(key) {
+    const k = String(key == null ? '' : key);
+    if (!deviceSlots.has(k)) deviceSlots.set(k, deviceSlots.size < 8 ? deviceSlots.size + 1 : 0);
+    return deviceSlots.get(k);
+  }
+
+  function deviceDot(key) {
+    return h('span', { class: 'dev-dot bg' + deviceSlot(key), 'aria-hidden': 'true' });
+  }
+
+  /** netList returns the objects of an answer's list (anything else in it, or no list, is left out). */
+  function netList(v) {
+    return Array.isArray(v) ? v.filter((x) => x && typeof x === 'object') : [];
+  }
+
+  /** countryName names an ISO 3166-1 alpha-2 code ("US" -> "United States"): the browser's name,
+   *  else the world map's; "" is Unknown (an address the IP database does not place); anything
+   *  that is not a code is shown as given. */
+  function countryName(code) {
+    const c = String(code == null ? '' : code);
+    if (c === '') return 'Unknown';
+    if (/^[A-Z]{2}$/.test(c)) {
+      try {
+        const n = REGION_NAMES ? REGION_NAMES.of(c) : '';
+        if (n && n !== c) return n;
+      } catch (_) { /* a code the browser does not know */ }
+      if (worldNames.has(c)) return worldNames.get(c);
+    }
+    return netText(c, 40);
+  }
+
+  /** netText returns untrusted text (a device name from the gateway, an organisation from the IP
+   *  database, a reverse DNS name) for a label, an option or a tooltip: at most max characters
+   *  as shown, its hidden characters written as escapes (escapedText), "…" when cut. */
+  function netText(text, max) {
+    const c = clipText(text, max || 60, 8);
+    return escapedText(c.text) + (c.more ? '…' : '');
+  }
+
+  /** netShown is netText for a table cell: the hidden characters set apart (visibleText). */
+  function netShown(text, max) {
+    const c = clipText(text, max || 80, 8);
+    return [visibleText(c.text), c.more ? h('span', { class: 'muted', title: fmtInt(c.more) + ' more characters' }, '…') : null];
+  }
+
+  /** netShare writes v as a share of total ("36 %", "< 1 %"). */
+  function netShare(v, total) {
+    if (!(total > 0) || !(v >= 0)) return '—';
+    const p = (100 * v) / total;
+    return p > 0 && p < 1 ? '< 1 %' : Math.round(p) + ' %';
+  }
+
+  /** portText writes a port with its protocol ("443/tcp"); "" without a port. */
+  function portText(port, proto) {
+    return Number(port) > 0 ? port + (proto ? '/' + proto : '') : '';
+  }
+
+  /** unnamedPort reports whether a service's name is only its protocol and port, as the server
+   *  names a port its port table does not know ("tcp 8071", "port 8071"): portText ("8071/tcp")
+   *  says that alone, rather than beside it. */
+  function unnamedPort(x) {
+    return Number(x.port) > 0 && String(x.name == null ? '' : x.name) === (x.proto ? String(x.proto) : 'port') + ' ' + Number(x.port);
+  }
+
+  /** goDurMs reads a Go duration ("4m0s", "1h30m") as milliseconds; null when it is not one. */
+  function goDurMs(v) {
+    const t = String(v == null ? '' : v).trim();
+    if (!/^(\d+(\.\d+)?(h|m|s|ms|us|µs|ns))+$/.test(t)) return null;
+    const unit = { h: 3600e3, m: 60e3, s: 1e3, ms: 1, us: 1e-3, 'µs': 1e-3, ns: 1e-6 };
+    let ms = 0;
+    for (const m of t.matchAll(/(\d+(?:\.\d+)?)(h|ms|m|s|us|µs|ns)/g)) ms += Number(m[1]) * unit[m[2]];
+    return ms;
+  }
+
+  /** agoEl says how long ago v was ("2 min ago"), with the time in UTC on hover. */
+  function agoEl(v, now) {
+    const d = toDate(v);
+    if (!d) return h('span', { class: 'muted' }, '?');
+    return h('time', { datetime: d.toISOString(), title: F.full.format(d) + ' · UTC: ' + utcText(v, d) }, sinceText(v, now) + ' ago');
+  }
+
+  /** netTimeEl shows a time of today as its time of day, any other with its date; UTC on hover. */
+  function netTimeEl(v) {
+    const d = toDate(v);
+    return timeEl(v, d && localDateValue(d) === localDateValue(new Date()) ? F.hm : F.short);
+  }
+
+  function netTile(label, value, sub, title) {
+    return h('div', { class: 'tile', title: title || null },
+      h('p', { class: 'tile-label' }, label), h('p', { class: 'tile-value' }, value), sub ? h('p', { class: 'tile-sub' }, sub) : null);
+  }
+
+  /** netAbout is a page's explanation: what the figures are, where they come from. */
+  function netAbout(title, ...text) {
+    return h('div', { class: 'banner tone-info net-about' }, icon('info'),
+      h('div', { class: 'banner-body' }, h('p', { class: 'banner-title' }, title), h('p', null, ...text)));
+  }
+
+  /** keepFocus runs render, which rebuilds parts of root, and gives the keyboard focus back to the
+   *  element that had it - or to the one that took its place: the element of the new content with
+   *  the same data-fk. A refresh every minute must not send a keyboard user back to the start of
+   *  the page. */
+  function keepFocus(root, render) {
+    const a = document.activeElement;
+    const key = a && a !== document.body && root.contains(a) && a.getAttribute ? a.getAttribute('data-fk') : null;
+    render();
+    if (key && !root.contains(a)) {
+      const b = Array.from(root.querySelectorAll('[data-fk]')).find((e) => e.getAttribute('data-fk') === key);
+      if (b) b.focus();
+    }
+  }
+
+  // ------------------------------------------------------------------ network view: period & URL
+
+  /** netPeriod reads the Network page's period from its URL (range=, or from= and to=), else the
+   *  one chosen last (24 hours at first): {range} for a period ending now, {range: 'custom', from,
+   *  to} (ms) for another. */
+  function netPeriod(q) {
+    const r = q.get('range');
+    if (NET_RANGE_MS[r]) return { range: r };
+    const from = toMs(q.get('from'));
+    const to = toMs(q.get('to'));
+    if (from != null && to != null && from < to && to - from <= NET_MAX_SPAN_MS) return { range: 'custom', from, to };
+    const saved = loadPref('netRange', '24h');
+    return { range: NET_RANGE_MS[saved] ? saved : '24h' };
+  }
+
+  /** netDeviceParam reads the device filter from the URL: a device key as the server accepts one
+   *  (printable ASCII without spaces, at most NET_DEVICE_MAX characters), else none. */
+  function netDeviceParam(q) {
+    const d = q.get('device') || '';
+    return d.length <= NET_DEVICE_MAX && /^[\x21-\x7e]+$/.test(d) ? d : '';
+  }
+
+  function netPeriodWords(p) {
+    switch (p.range) {
+      case '1h': return 'Last hour';
+      case '24h': return 'Last 24 hours';
+      case '7d': return 'Last 7 days';
+      case '30d': return 'Last 30 days';
+      default: return F.short.format(new Date(p.from)) + ' – ' + F.short.format(new Date(p.to));
+    }
+  }
+
+  /** netPeriodParams writes a period as the network endpoints read it (range=, or from= and to=). */
+  function netPeriodParams(p) {
+    const out = new URLSearchParams();
+    if (p.range === 'custom') {
+      out.set('from', new Date(p.from).toISOString());
+      out.set('to', new Date(p.to).toISOString());
+    } else {
+      out.set('range', p.range);
+    }
+    return out;
+  }
+
+  /** netHash is the URL of a tab of the Network page with a period and, on Connections, a device. */
+  function netHash(tab, p, device) {
+    const params = netPeriodParams(p);
+    if (tab === 'connections' && device) params.set('device', device);
+    return '#/network' + (tab === 'firewall' ? '/firewall' : '') + '?' + params.toString();
+  }
+
+  // ------------------------------------------------------------------ network view: the page
+
+  /** renderNetwork shows the Network page (docs/syslog-map-graphic.md §2.3): which device on the
+   *  home network talks to which remote address, organisation, country and service, from samples
+   *  of the gateway's NAT table (tab "connections"), and what the gateway's firewall drops, from
+   *  its syslog (tab "firewall"). One period for both tabs (1 h to 30 days ending now, or a
+   *  custom one) and, on Connections, a device filter; both are kept in the URL. The data are read
+   *  again every minute while the page is visible; the controls, the search box and the keyboard
+   *  focus stay where they are. None of it is evidence. */
+  function renderNetwork(c, q, ctx, tab) {
+    let token = 0; // the newest load: an older answer is dropped
+    let abort = null; // cancels the requests out: a newer load replaces them
+    let period = netPeriod(q);
+    let device = tab === 'connections' ? netDeviceParam(q) : '';
+    if (tab === 'connections') netLast.device = device;
+    const ipdbLine = h('p', { class: 'small muted' });
+    c.append(h('div', { class: 'view-head' },
+      h('div', { class: 'net-head-text' }, h('h1', null, 'Network'), h('p', { class: 'muted' }, 'Which device talks to which site, and what the gateway’s firewall blocks.')),
+      ipdbLine));
+    const tabConn = h('a', { href: netHash('connections', period, netLast.device), 'aria-current': tab === 'connections' ? 'page' : null }, 'Connections');
+    const tabFw = h('a', { href: netHash('firewall', period, ''), 'aria-current': tab === 'firewall' ? 'page' : null }, 'Firewall');
+    c.append(h('nav', { class: 'tabs', 'aria-label': 'Network views' }, tabConn, tabFw));
+
+    const seg = rangeControl(period.range, setRange, 'Period', NET_RANGES.concat([['custom', 'Custom…']])).querySelector('.seg');
+    const devSel = h('select', { name: 'device', 'data-fk': 'net-device' }, h('option', { value: '' }, 'All devices'));
+    devSel.value = '';
+    const readLine = h('p', { class: 'small muted net-read' });
+    const fromIn = h('input', { type: 'datetime-local', required: true });
+    const toIn = h('input', { type: 'datetime-local', required: true });
+    const customOut = h('div', { 'aria-live': 'polite' });
+    // Cancel closes the form of a custom period not applied yet (with a custom period in use, the
+    // form shows it, and there is nothing to cancel).
+    const cancel = h('button', { type: 'button', class: 'btn', hidden: period.range === 'custom' }, 'Cancel');
+    const custom = h('form', { class: 'net-custom', 'aria-label': 'Custom period', hidden: period.range !== 'custom' },
+      h('div', { class: 'form-grid' }, field('From (local time)', fromIn), field('To (local time)', toIn)),
+      h('div', { class: 'btn-row' }, h('button', { type: 'submit', class: 'btn btn-primary' }, 'Apply'), cancel), customOut);
+    c.append(h('div', { class: 'net-toolbar' }, seg,
+      tab === 'connections' ? h('label', { class: 'net-device' }, 'Device', devSel) : null, readLine), custom);
+    const notes = h('div', { class: 'conditions' });
+    const content = h('div', { class: 'net-content' }, h('p', { class: 'loading' }, 'Loading…'));
+    c.append(notes, content);
+
+    const parts = tab === 'connections'
+      ? { flow: netFlow(ctx, setDevice), map: netMap(ctx, NET_CONN_MAP), table: netConnTable(ctx) }
+      : { timeline: fwTimeline(ctx), map: netMap(ctx, NET_FW_MAP) };
+    let lastNs = null; // the network status shown
+    let shown = false; // data shown at least once
+    let devKey = null; // the devices listed in the select
+
+    function fillCustom() {
+      const to = period.range === 'custom' ? period.to : Date.now();
+      const from = period.range === 'custom' ? period.from : to - NET_RANGE_MS[period.range];
+      fromIn.value = datetimeLocalValue(new Date(from));
+      toIn.value = datetimeLocalValue(new Date(to));
+    }
+    fillCustom();
+
+    /** setRange applies a period chosen in the period control. "Custom…" only opens the form
+     *  (filled with the period shown, unless it is open already): the period changes with Apply,
+     *  so until then the period in use stays checked, as the data, the URL and the refresh are. */
+    function setRange(r) {
+      if (r === 'custom') {
+        if (custom.hidden) {
+          fillCustom();
+          replace(customOut);
+          custom.hidden = false;
+        }
+        markRange();
+        return;
+      }
+      if (!NET_RANGE_MS[r]) return;
+      custom.hidden = true;
+      period = { range: r };
+      savePref('netRange', r);
+      markRange();
+      load();
+    }
+
+    /** markRange checks the period in use in the period control ("Custom…" once a custom period
+     *  is applied) and offers Cancel while a custom period waits for Apply. */
+    function markRange() {
+      for (const input of seg.querySelectorAll('input')) input.checked = input.getAttribute('value') === period.range;
+      cancel.hidden = period.range === 'custom';
+    }
+
+    /** closeCustom closes the form of a custom period not applied: the period stays as it is.
+     *  From Cancel (hidden with the form), the keyboard focus goes back to the period control. */
+    function closeCustom(refocus) {
+      if (period.range === 'custom' || custom.hidden) return;
+      custom.hidden = true;
+      replace(customOut);
+      const on = Array.from(seg.querySelectorAll('input')).find((input) => input.checked);
+      if (refocus && on) on.focus();
+    }
+    cancel.addEventListener('click', () => closeCustom(true));
+    // The period in use stays checked while the form is open, so choosing it again changes
+    // nothing (no change event): its click closes the form.
+    seg.addEventListener('click', (e) => {
+      const t = e.target;
+      if (t && t.localName === 'input' && t.getAttribute('value') === period.range) closeCustom(false);
+    });
+
+    custom.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const f = toMs(fromIn.value);
+      const t = toMs(toIn.value);
+      let why = '';
+      if (f == null || t == null) why = 'Choose when the period starts and when it ends.';
+      else if (f >= t) why = 'The start must be before the end.';
+      else if (t - f > NET_MAX_SPAN_MS) why = 'The period may be at most 31 days long.';
+      else if (t > Date.now() + 3600e3) why = 'The period may end at most an hour from now.';
+      if (why) {
+        replace(customOut, notice('critical', why));
+        return;
+      }
+      replace(customOut);
+      period = { range: 'custom', from: f, to: t };
+      markRange();
+      load();
+    });
+
+    /** setDevice applies a device filter ('' = every device). From the diagram's "Show every
+     *  device" (src 'all'), which goes with the filter, the keyboard focus moves to the filter. */
+    function setDevice(key, src) {
+      device = String(key || '');
+      netLast.device = device;
+      devSel.value = device;
+      if (src === 'all') devSel.focus();
+      load();
+    }
+    devSel.addEventListener('change', () => setDevice(devSel.value));
+
+    /** syncUrl keeps the period and the device in the URL, without routing again, and in the tabs' links. */
+    function syncUrl() {
+      const hash = netHash(tab, period, device);
+      if (window.location.hash !== hash) window.history.replaceState(null, '', hash);
+      setAttr(tabConn, 'href', netHash('connections', period, netLast.device));
+      setAttr(tabFw, 'href', netHash('firewall', period, ''));
+    }
+
+    ctx.cleanup(() => { if (abort) abort.abort(); });
+
+    async function load() {
+      const mine = ++token;
+      if (abort) abort.abort();
+      abort = typeof AbortController === 'function' ? new AbortController() : null;
+      const signal = abort ? abort.signal : null;
+      syncUrl();
+      content.classList.add('is-loading');
+      content.setAttribute('aria-busy', 'true');
+      const params = netPeriodParams(period);
+      if (device) params.set('device', device);
+      params.set('limit', String(NET_LIMIT));
+      const statusReq = api('/api/network/status', { signal }).then((ns) => ({ ns }), (err) => ({ err }));
+      try {
+        const data = await api('/api/network/' + tab + '?' + params.toString(), { signal });
+        const st = await statusReq;
+        if (!ctx.alive || mine !== token) return;
+        show(st.ns && typeof st.ns === 'object' ? st.ns : null, data && typeof data === 'object' ? data : {});
+      } catch (e) {
+        if (!ctx.alive || mine !== token) return;
+        // Without a syslog store the firewall view is unavailable (503): the status says so, and
+        // the tab explains it (fwNotes, fwAbout) rather than show the error alone.
+        if (tab === 'firewall' && e.status === 503) {
+          const st = await statusReq;
+          if (ctx.alive && mine === token && st.ns && typeof st.ns === 'object' && !st.ns.syslog) {
+            show(st.ns, {});
+            return;
+          }
+        }
+        if (ctx.alive && mine === token) failed(e);
+      } finally {
+        if (mine === token) {
+          content.classList.remove('is-loading');
+          content.removeAttribute('aria-busy');
+        }
+      }
+    }
+
+    function failed(e) {
+      if (e.status === 404) {
+        // A monitor without the Network page: nothing to show, which is no error.
+        replace(notes);
+        replace(content, callout('info', sentence(capitalize(e.message))));
+        return;
+      }
+      replace(notes, errorNotice(e));
+      if (!shown) replace(content);
+    }
+
+    function show(ns, d) {
+      lastNs = ns;
+      shown = true;
+      keepFocus(c, () => {
+        const updated = d.ipdb || (ns && ns.ipintel && ns.ipintel.loaded ? ns.ipintel.updated : '');
+        replace(ipdbLine, updated ? ['Address data: IPtoASN, ', timeEl(updated, F.date)] : 'No IP address database loaded yet');
+        readNote();
+        if (tab === 'connections') showConnections(ns, d);
+        else showFirewall(ns, d);
+      });
+    }
+
+    /** readNote says when the data were last read: the NAT table, or the gateway's syslog. The
+     *  monitor's status (every 10 s) is fresher than the network status (every minute). */
+    function readNote() {
+      const now = app.status && app.status.now;
+      if (tab === 'connections') {
+        const smp = (app.status && app.status.connections) || (lastNs && lastNs.samplers);
+        if (!smp || typeof smp !== 'object') {
+          replace(readLine);
+          return;
+        }
+        const every = goDurMs(smp.interval);
+        replace(readLine, smp.nat_at ? ['NAT table last read ', agoEl(smp.nat_at, now)] : 'NAT table not read yet',
+          smp.enabled && every ? ' · every ' + fmtDur(every / 1000) : '');
+        return;
+      }
+      const sl = syslogStatus(app.status);
+      const last = (sl && sl.last_at) || (lastNs && lastNs.syslog && lastNs.syslog.newest);
+      replace(readLine, 'From the gateway’s syslog', last ? [' · last message ', agoEl(last, now)] : '');
+    }
+    ctx.onStatus = readNote;
+
+    // ---------------------------------------------------------------- Connections
+
+    function showConnections(ns, d) {
+      const devices = netList(d.devices);
+      for (const dv of devices) deviceSlot(dv.key);
+      fillDevices(devices);
+      replace(notes, ...connNotes(ns));
+      const endsNow = period.range !== 'custom';
+      if (!(Number(d.samples) > 0)) {
+        placeChildren(content, h('section', { class: 'card' }, emptyNote(connEmptyText(ns))), connAbout(ns));
+        return;
+      }
+      parts.flow.update(d, { device, words: netPeriodWords(period) });
+      parts.map.update(d.countries);
+      parts.table.update(d, endsNow);
+      placeChildren(content, connTiles(ns, d, endsNow), connLeftOut(d), parts.flow.el, parts.map.el, parts.table.el, connAbout(ns));
+    }
+
+    /** fillDevices lists the period's devices in the device filter, keeping the choice (a device
+     *  not seen in the period stays listed as such). The select is rebuilt only when the list
+     *  changed, so that a refresh does not close it under the pointer. */
+    function fillDevices(devices) {
+      const key = JSON.stringify([devices.map((dv) => [dv.key, dv.name, dv.ipv4]), device]);
+      if (key === devKey) return;
+      devKey = key;
+      const opts = [h('option', { value: '' }, 'All devices')];
+      let found = device === '';
+      for (const dv of devices) {
+        const k = String(dv.key == null ? '' : dv.key);
+        if (!k) continue;
+        found = found || k === device;
+        const name = netText(dv.name || dv.ipv4 || k, 40);
+        opts.push(h('option', { value: k }, dv.ipv4 && dv.ipv4 !== dv.name ? name + ' (' + netText(dv.ipv4, 40) + ')' : name));
+      }
+      if (!found) opts.push(h('option', { value: device }, device + ' (not seen in this period)'));
+      replace(devSel, ...opts);
+      devSel.value = device;
+    }
+
+    /** cfgWarnNotes says which of the Network page's settings in config.json the service could not
+     *  use as written, and what it uses instead (NetworkStatus.config_warnings): a mistyped value
+     *  then shows here, not only in the service log. */
+    function cfgWarnNotes(ns) {
+      const ws = ns && Array.isArray(ns.config_warnings) ? ns.config_warnings.filter((w) => typeof w === 'string' && w) : [];
+      if (!ws.length) return [];
+      return [callout('warning', h('strong', null, 'Some Network page settings in config.json are not used as written. '),
+        ws.length === 1 ? sentence(capitalize(ws[0])) : h('ul', null, ...ws.map((w) => h('li', null, sentence(capitalize(w))))))];
+    }
+
+    function connNotes(ns) {
+      const out = [];
+      if (!ns) return out;
+      out.push(...cfgWarnNotes(ns));
+      const smp = ns.samplers && typeof ns.samplers === 'object' ? ns.samplers : null;
+      if (!smp) {
+        out.push(callout('info', 'This att-monitor reports nothing about its reads of the NAT table: the connections shown are those stored.'));
+      } else if (!smp.enabled) {
+        out.push(callout('info', h('strong', null, 'Connections are not being recorded. '),
+          'Reading the gateway’s NAT table is turned off in the configuration (connections.enabled); what is shown was recorded before.'));
+      } else if (smp.nat_problem) {
+        out.push(callout('warning', h('strong', null, 'The NAT table is not being read. '), sentence(capitalize(String(smp.nat_problem))),
+          smp.nat_at ? [' The newest read is from ', timeEl(smp.nat_at, F.short), '.'] : ''));
+      } else if (smp.nat_note) {
+        // The newest read worked - the line above says when - but did not keep all it showed: rows
+        // not understood (a firmware the parser does not know yet), or the read itself when the
+        // connection store refused it (its error makes it a warning).
+        const refused = ns.store && typeof ns.store === 'object' && ns.store.error;
+        out.push(callout(refused ? 'warning' : 'info', h('strong', null, 'The NAT table is read, but not all of it is kept. '),
+          sentence(capitalize(String(smp.nat_note)))));
+      }
+      if (smp && smp.enabled && smp.devices_problem) {
+        out.push(callout('info', h('strong', null, 'The Device List could not be read. '), sentence(capitalize(String(smp.devices_problem))),
+          ' Devices it did not name are shown by their addresses.'));
+      }
+      const ip = ns.ipintel && typeof ns.ipintel === 'object' ? ns.ipintel : null;
+      if (ip && !ip.enabled) {
+        out.push(callout('info', 'Organisations and countries are not shown: the IP address database is turned off in the configuration (geo.enabled).'));
+      } else if (ip && !ip.loaded) {
+        out.push(callout('info', h('strong', null, 'The IP address database is not loaded yet, so organisations and countries are not shown. '),
+          ip.download
+            ? 'att-monitor downloads the public IPtoASN tables to this PC (only the files are fetched: no address is sent anywhere); they appear once loaded.'
+            : 'Place the IPtoASN tables (ip2asn-v4.tsv.gz and ip2asn-v6.tsv.gz) in the geo folder of the data directory, or allow the download (geo.download).',
+          ip.error ? [' Last attempt: ', sentence(String(ip.error))] : ''));
+      }
+      return out;
+    }
+
+    function connEmptyText(ns) {
+      const smp = ns && ns.samplers;
+      if (period.range === 'custom') return 'No read of the NAT table in this period.';
+      if (smp && smp.enabled && !smp.nat_at) {
+        // A first read is announced only when nothing stands in its way (the problem is said above).
+        const next = smp.nat_problem ? null : toDate(smp.nat_next);
+        return 'The NAT table has not been read yet' + (next ? ': the first read is due at ' + F.time.format(next) + '.' : '.');
+      }
+      return 'No read of the NAT table in this period.';
+    }
+
+    function connTiles(ns, d, endsNow) {
+      const t = d.totals && typeof d.totals === 'object' ? d.totals : {};
+      const smp = ns && ns.samplers;
+      // "Now" only while the newest read in the period is recent (reads paused hours ago are not now).
+      const every = smp ? goDurMs(smp.interval) : null;
+      const age = ageSeconds(d.last, app.status && app.status.now);
+      const fresh = endsNow && age != null && age * 1000 <= Math.max(10 * 60e3, 2.5 * (every || 4 * 60e3));
+      const listed = smp && Number(smp.devices) > 0 && !device ? Number(smp.devices) : 0;
+      // The gateway's own connections count as a device, but the Device List does not list it. The
+      // devices of the period that the newest Device List lists (totals.listed) are at most all of
+      // it; the others have left the network since.
+      const gw = !device && netList(d.devices).some((dv) => dv.key === 'gateway');
+      const inList = Math.min(listed, Math.max(0, Math.floor(Number(t.listed)) || 0));
+      const nc = Number(t.countries) || 0;
+      // Under a device filter the open connections are that device's (open_device): the NAT
+      // table's own count, every device's, goes to the tooltip.
+      const open = device ? Number(d.open_device) || 0 : d.open;
+      const what = device ? 'connections of this device in the NAT table' : 'connections in the NAT table';
+      const table = Number(d.in_use) >= 0 && Number(d.available) >= 0
+        ? 'The gateway’s NAT table: ' + fmtInt(d.in_use) + ' sessions in use, ' + fmtInt(d.available) + ' available'
+          + (device ? '; every device’s connections at that read: ' + fmtInt(d.open) : '') : null;
+      return h('section', { 'aria-label': 'Summary' }, h('div', { class: 'tiles net-tiles' },
+        netTile('Devices active', fmtInt(t.devices), device ? 'the device chosen'
+          : listed ? fmtInt(inList) + ' of the ' + fmtInt(listed) + ' in the gateway’s Device List' + (gw ? ', and the gateway' : '')
+            : 'in this period'),
+        netTile('Sites', fmtInt(t.sites), 'remote addresses'),
+        netTile('Organisations', fmtInt(t.orgs), 'in ' + fmtInt(nc) + ' countr' + (nc === 1 ? 'y' : 'ies')),
+        netTile(fresh ? 'Open now' : 'Open at the last read', fmtInt(open),
+          fresh || !toDate(d.last) ? what : [what + ' at ', timeEl(d.last, F.short)], table)));
+    }
+
+    /** connLeftOut says when the period holds more distinct connections than the store counts one
+     *  by one: the lightest count only in their devices and as "Other". */
+    function connLeftOut(d) {
+      const n = Math.floor(Number(d.flows_left_out)) || 0;
+      if (n <= 0) return null;
+      return callout('info', h('strong', null, 'A very busy period. '),
+        fmtInt(n) + ' connection' + (n === 1 ? ' was' : 's were') + ' too light to count one by one among so many (a device may be file sharing or scanning the Internet): they count in their devices and as “Other”, and the sites and organisations are at least the numbers shown. A shorter period, or one device, shows more of them.');
+    }
+
+    function connAbout(ns) {
+      const smp = ns && ns.samplers;
+      const every = smp ? goDurMs(smp.interval) : null;
+      const keep = ns && ns.store && Number(ns.store.keep_days) > 0 ? Number(ns.store.keep_days) : null;
+      const ptr = ns && ns.ipintel && ns.ipintel.reverse_dns;
+      return netAbout('How this is measured',
+        'The monitor reads the gateway’s NAT table ', every ? 'every ' + fmtDur(every / 1000) : 'regularly',
+        ': every connection it translates, with the device and the remote address and port. A connection that opens and closes between two reads is not seen. IPv6 is not translated, so an IPv6 connection appears only when the gateway lists it there too; it is named after the device whose address it uses. ',
+        'Organisations and countries come from the IPtoASN database kept on this PC: no address is sent anywhere to name them.',
+        ptr ? ' The names under some addresses are their reverse DNS names, looked up through this PC’s DNS resolver.' : '',
+        ' This is not evidence: it is never written to the evidence ledger, and it is kept ', keep ? 'for ' + fmtInt(keep) + ' days' : 'for a limited time', '.');
+    }
+
+    // ---------------------------------------------------------------- Firewall
+
+    function showFirewall(ns, d) {
+      replace(notes, ...fwNotes(ns));
+      if (ns && !ns.syslog) {
+        placeChildren(content, fwAbout(ns));
+        return;
+      }
+      const cover = fwCoverage(d);
+      if (!(Number(d.drops) > 0)) {
+        placeChildren(content, cover, h('section', { class: 'card' }, emptyNote('The gateway’s firewall dropped nothing in this period.')), fwAbout(ns));
+        return;
+      }
+      parts.timeline.update(d);
+      parts.map.update(d.countries);
+      placeChildren(content, fwTiles(d), cover, parts.timeline.el, parts.map.el,
+        h('div', { class: 'grid-2' }, fwServices(d), fwSources(d)), fwOutbound(d), fwAbout(ns));
+    }
+
+    function fwNotes(ns) {
+      const out = cfgWarnNotes(ns);
+      if (ns && !ns.syslog) {
+        out.push(callout('info', 'This att-monitor keeps no syslog store, so there are no firewall messages to show.'));
+        return out;
+      }
+      const sl = syslogStatus(app.status);
+      if (sl && !sl.enabled) {
+        out.push(callout('info', h('strong', null, 'The syslog receiver is off. '),
+          'It is turned off in the configuration (syslog.enabled): no new firewall messages arrive; what is shown was received before.'));
+      } else if (sl && (sl.state === 'off' || sl.state === 'elsewhere')) {
+        out.push(callout('warning', h('strong', null, 'The gateway does not send its log to this PC. '),
+          'Blocked packets are not seen until it does. ', h('a', { href: '#/syslog' }, 'Open the Syslog page')));
+      }
+      return out;
+    }
+
+    /** fwCoverage says when the syslog kept starts after the period does: the period's start shows
+     *  nothing because no message of it is kept (none was received yet, or the retention limit
+     *  deleted them), not because nothing was dropped. */
+    function fwCoverage(d) {
+      const oldest = toMs(d.oldest);
+      const from = toMs(d.from);
+      if (oldest == null || from == null || oldest <= from) return null;
+      return callout('info', 'The syslog kept starts at ', timeEl(d.oldest, F.short),
+        ': anything the gateway logged before was not received here or is no longer kept (the syslog’s retention limit deletes the oldest messages), so the first ',
+        fmtDur((oldest - from) / 1000), ' of this period show nothing.');
+    }
+
+    function fwTiles(d) {
+      const svc = netList(d.services).find((x) => Number(x.port) > 0);
+      // Counted by the server over every outbound drop of the period, also beyond the rows listed.
+      const devs = Math.max(0, Math.floor(Number(d.outbound_devices)) || 0);
+      const countries = netList(d.countries).filter((x) => x.code).length;
+      return h('section', { 'aria-label': 'Summary' }, h('div', { class: 'tiles net-tiles' },
+        netTile('Inbound blocked', fmtInt(d.inbound), 'probes from the Internet'),
+        netTile('Sources', fmtInt(d.sources), 'addresses in ' + fmtInt(countries) + ' countr' + (countries === 1 ? 'y' : 'ies')),
+        netTile('Outbound blocked', fmtInt(d.outbound), devs ? 'packets from ' + fmtInt(devs) + ' device' + (devs === 1 ? '' : 's') : 'packets from the home network'),
+        netTile('Most probed', svc ? (unnamedPort(svc) ? portText(svc.port, svc.proto) : netText(svc.name || portText(svc.port, svc.proto), 24)) : '—',
+          svc ? (unnamedPort(svc) ? '' : portText(svc.port, svc.proto) + ' · ') + netShare(Number(svc.count), Number(d.inbound)) + ' of the probes'
+            : 'no inbound probe')));
+    }
+
+    /** fwServices lists what the inbound probes tried to reach, as the server names it
+     *  (model.FwService): a port with its protocol ("SSH", 22/tcp), a protocol without ports
+     *  ("ICMP", "ICMPv6": port 0, with a protocol), and the rest grouped ("Other": no port, no
+     *  protocol) - only that one is "Other ports". */
+    function fwServices(d) {
+      const list = netList(d.services);
+      const fr = netFigure({ id: 'net-fw-services', title: 'Most probed services', sub: 'What the blocked inbound packets were trying to reach.' });
+      const total = Number(d.inbound) || list.reduce((a, x) => a + (Number(x.count) || 0), 0);
+      const items = list.map((x) => {
+        const port = Number(x.port) > 0;
+        const rest = !port && !x.proto && (x.name == null || x.name === '' || x.name === 'Other');
+        // A port without a name is named by its port alone ("8071/tcp", not "tcp 8071 8071/tcp").
+        const bare = unnamedPort(x);
+        return {
+          name: rest ? 'Other ports' : bare ? portText(x.port, x.proto) : netText(x.name || (port ? 'Port ' + x.port : x.proto || 'Unknown'), 40),
+          note: bare ? '' : portText(x.port, x.proto), value: Number(x.count) || 0,
+        };
+      });
+      add(fr.body, [items.length ? netBars(items, total, 'Most probed services') : emptyNote('No inbound probe in this period.')]);
+      fr.setTable(() => netTableView('Most probed services', table(
+        [{ label: 'Service' }, { label: 'Port' }, { label: 'Probes', num: true }, { label: 'Share', num: true }],
+        items.map((x) => [x.name, x.note || '—', fmtInt(x.value), netShare(x.value, total)]), { compact: true }).firstChild));
+      return fr.fig;
+    }
+
+    function fwSources(d) {
+      const list = netList(d.top_sources);
+      const top = list.slice(0, 6); // as many as the services beside them; the table view has all
+      const fr = netFigure({ id: 'net-fw-sources', title: 'Top sources', sub: 'Addresses whose packets were blocked most often.' });
+      const where = (x) => [x.org ? netText(x.org, 48) : x.asn ? 'AS' + x.asn : '', countryName(x.country)].filter(Boolean).join(' · ');
+      const total = Math.max(Number(d.sources) || 0, list.length);
+      add(fr.body, [top.length
+        ? h('ol', { class: 'src-list', 'aria-label': 'Top sources' }, top.map((x) => h('li', null,
+          h('span', { class: 'src-who' }, h('span', { class: 'mono src-addr' }, netShown(x.addr, 64)), h('span', { class: 'sub small muted wrap-any' }, where(x))),
+          h('span', { class: 'src-n' }, fmtInt(x.count), h('span', { class: 'sub small muted' }, fmtInt(x.ports) + ' port' + (Number(x.ports) === 1 ? '' : 's'))))))
+        : emptyNote('No source in this period.'),
+      total > top.length ? h('p', { class: 'card-foot' }, 'The ', fmtInt(top.length), ' most active of ', fmtInt(total), ' source addresses',
+        list.length > top.length ? '; the table view lists ' + fmtInt(list.length) + '.' : '.') : null]);
+      fr.setTable(() => netTableView('Top sources', table(
+        [{ label: 'Address' }, { label: 'Organisation' }, { label: 'Country' }, { label: 'Packets', num: true }, { label: 'Ports', num: true }, { label: 'Last' }],
+        list.map((x) => [h('span', { class: 'mono' }, netShown(x.addr, 64)), [netShown(x.org || '—', 60), x.asn ? h('span', { class: 'sub small muted' }, 'AS' + x.asn) : null],
+          countryName(x.country), fmtInt(x.count), fmtInt(x.ports), netTimeEl(x.last)]), { compact: true }).firstChild));
+      return fr.fig;
+    }
+
+    function fwOutbound(d) {
+      const rows = netList(d.outbound_rows);
+      const total = Number(d.outbound_total) || rows.length;
+      const body = rows.length
+        ? h('div', { class: 'table-scroll' }, h('table', { class: 'tbl net-out' },
+          h('thead', null, h('tr', null, ['Device', 'Destination', 'Organisation', 'Service', 'Reason'].map((l) => h('th', { scope: 'col' }, l)),
+            h('th', { scope: 'col', class: 'num' }, 'Packets'), h('th', { scope: 'col', class: 'num' }, 'Last'))),
+          h('tbody', null, rows.map((r) => h('tr', null,
+            h('td', null, h('span', { class: 'dev' }, deviceDot(r.device), h('span', null, netShown(r.name || r.lan || r.device, 48))),
+              r.lan && r.lan !== r.name ? h('span', { class: 'sub small muted' }, netShown(r.lan, 48)) : null),
+            h('td', null, h('span', { class: 'mono' }, netShown(r.remote, 64))),
+            h('td', null, netShown(r.org || (r.remote ? 'Unknown' : '—'), 60), r.asn ? h('span', { class: 'sub small muted' }, 'AS' + r.asn) : null),
+            h('td', null, netShown(r.service || '—', 40), portText(r.port, r.proto) ? h('span', { class: 'sub small muted' }, portText(r.port, r.proto)) : null),
+            h('td', null, h('span', { class: 'chip net-reason', title: r.reason ? 'The gateway’s reason: ' + escapedText(r.reason) : null }, netText(r.label || r.reason || '?', 72))),
+            h('td', { class: 'num' }, fmtInt(r.count)),
+            h('td', { class: 'num' }, netTimeEl(r.last)))))))
+        : emptyNote('No packet from a device on the home network was blocked in this period.');
+      return h('section', { class: 'card', 'aria-labelledby': 'net-out-h' },
+        h('div', { class: 'card-head' }, h('div', null, h('h2', { id: 'net-out-h' }, 'Blocked on the way out'),
+          h('p', { class: 'chart-sub' }, 'Packets a device on the home network sent that the gateway’s firewall did not forward.'))),
+        body,
+        total > rows.length ? h('p', { class: 'card-foot' }, 'The ', fmtInt(rows.length), ' destinations with the most packets of ', fmtInt(total), '.') : null);
+    }
+
+    function fwAbout(ns) {
+      const keep = ns && ns.syslog && Number(ns.syslog.keep_mb) > 0 ? Number(ns.syslog.keep_mb) : null;
+      return netAbout('What the syslog can show',
+        'At its most detailed level the gateway logs only the packets its firewall drops, never the connections it allows; those are on the ',
+        h('a', { href: netHash('connections', period, netLast.device) }, 'Connections tab'),
+        '. Firewall lines are kept with the rest of the gateway’s syslog, within its size limit', keep ? ' (' + fmtInt(keep) + ' MiB)' : '', '. This is not evidence of an outage.');
+    }
+
+    load();
+    ctx.interval(() => { if (!document.hidden) load(); }, NET_REFRESH_MS);
+  }
+
+  // The two world maps: the Connections tab's (remote addresses by country) and the Firewall
+  // tab's (blocked inbound packets by source country).
+  const NET_CONN_MAP = {
+    id: 'net-map-conn', title: 'Where the sites are', legend: 'Sites per country',
+    sub: 'Country each remote address is registered in. A CDN’s server is often nearer than its country.',
+    value: (x) => Number(x.sites) || 0, valueLabel: 'Sites', unit: (n) => fmtInt(n) + ' site' + (n === 1 ? '' : 's'),
+    extra: (x) => Number(x.weight) || 0, extraLabel: 'Times seen', extraUnit: (n) => 'seen ' + fmtInt(n) + ' time' + (n === 1 ? '' : 's'),
+  };
+  const NET_FW_MAP = {
+    id: 'net-map-fw', title: 'Where the probes came from', legend: 'Probes per country',
+    sub: 'Country each blocked source address is registered in.',
+    value: (x) => Number(x.weight) || 0, valueLabel: 'Probes', unit: (n) => fmtInt(n) + ' probe' + (n === 1 ? '' : 's'),
+    extra: (x) => Number(x.sites) || 0, extraLabel: 'Source addresses', extraUnit: (n) => fmtInt(n) + ' source address' + (n === 1 ? '' : 'es'),
+  };
+
+  // ------------------------------------------------------------------ network view: figures
+
+  /** netFigure builds a card of the Network page with a Table toggle, as chartFrame does for the
+   *  charts: o {id (remembered in app.tableViews), title, sub}. Returns {fig, body, sub,
+   *  tableBtn, setTable(fn)}: body holds the graphic; fn() builds the table view of the data
+   *  shown, when the table is shown and again with every update while it is. */
+  function netFigure(o) {
+    const sub = h('p', { class: 'chart-sub' }, o.sub || null);
+    const tableBtn = h('button', { type: 'button', class: 'btn btn-small', 'aria-pressed': 'false', title: 'Show the data as a table', 'data-fk': o.id + ':table' }, 'Table');
+    const body = h('div', { class: 'net-graphic' });
+    const tableWrap = h('div', { hidden: true });
+    const fig = h('figure', { class: 'chart' },
+      h('figcaption', { class: 'chart-head' }, h('div', null, h('span', { class: 'chart-title' }, o.title), sub), tableBtn),
+      body, tableWrap);
+    let build = null;
+    function apply() {
+      const on = app.tableViews.has(o.id);
+      tableBtn.setAttribute('aria-pressed', String(on));
+      body.hidden = on;
+      tableWrap.hidden = !on;
+      if (on && build) replace(tableWrap, build());
+      else replace(tableWrap);
+    }
+    tableBtn.addEventListener('click', () => {
+      if (app.tableViews.has(o.id)) app.tableViews.delete(o.id); else app.tableViews.add(o.id);
+      apply();
+    });
+    return { fig, body, sub, tableBtn, setTable(fn) { build = fn; apply(); } };
+  }
+
+  /** netTableView wraps the tables of a figure's table view (table() results) in one scrolling,
+   *  focusable region. */
+  function netTableView(label, ...tables) {
+    return h('div', { class: 'chart-table', tabindex: '0', role: 'region', 'aria-label': label + ' — table view' },
+      tables.map((t) => (t && t.classList && t.classList.contains('table-scroll') ? t.firstChild : t)));
+  }
+
+  /** netBars draws a ranked list as labelled bars: one series, so every bar is in the first
+   *  slot's colour, as long as its share of the largest. items: [{name, note, value}]; shares are
+   *  of total. */
+  function netBars(items, total, label) {
+    const top = items.reduce((a, x) => Math.max(a, x.value), 0) || 1;
+    return h('ol', { class: 'bars', 'aria-label': label }, items.map((x) => {
+      const fill = h('span', { class: 'bar-fill' });
+      fill.style.width = Math.max(0.5, Math.min(100, (100 * x.value) / top)) + '%'; // CSSOM: allowed by the CSP
+      return h('li', null,
+        h('span', { class: 'bar-head' }, h('span', { class: 'bar-name' }, x.name, x.note ? h('span', { class: 'muted' }, ' ' + x.note) : null),
+          h('span', { class: 'bar-val' }, fmtInt(x.value), h('span', { class: 'muted' }, ' · ' + netShare(x.value, total)))),
+        h('span', { class: 'bar-track', 'aria-hidden': 'true' }, fill));
+    }));
+  }
+
+  /** placeTipAt places a tooltip at (x, y) of its box (width × height), beside the point and
+   *  inside the box. */
+  function placeTipAt(tip, x, y, width, height) {
+    tip.hidden = false;
+    const tw = tip.offsetWidth;
+    const th = tip.offsetHeight;
+    let left = x + 14;
+    if (left + tw > width) left = x - 14 - tw;
+    if (left < 0) left = Math.max(0, Math.min(width - tw, x - tw / 2));
+    let top = y + 14;
+    if (height && top + th > height) top = Math.max(0, y - 14 - th);
+    tip.style.left = Math.round(left) + 'px'; // CSSOM (not a style attribute): allowed by the CSP
+    tip.style.top = Math.round(top) + 'px';
+  }
+
+  // ------------------------------------------------------------------ network view: flow diagram
+
+  /** sankeyModel turns GET /api/network/connections into the flow diagram: three columns -
+   *  devices, organisations, services - and the bands between them (links: device → organisation
+   *  and organisation → service). A node is as tall as the larger of the weights of its bands in
+   *  and out; nodes without a band (the devices a device filter leaves out) and bands that name no
+   *  node are not drawn. */
+  function sankeyModel(data) {
+    const cols = [[], [], []];
+    const index = [new Map(), new Map(), new Map()];
+    const node = (col, key, x) => {
+      const k = String(key == null ? '' : key);
+      if (!k || index[col].has(k)) return;
+      const n = Object.assign({ col, key: k, in: 0, out: 0, value: 0, links: [] }, x);
+      index[col].set(k, n);
+      cols[col].push(n);
+    };
+    for (const d of netList(data.devices)) {
+      node(0, d.key, { name: String(d.name || d.ipv4 || d.key), sub: d.ipv4 && d.ipv4 !== d.name ? String(d.ipv4) : '', sites: Number(d.sites) || 0, slot: deviceSlot(d.key), device: true });
+    }
+    for (const o of netList(data.orgs)) {
+      const name = String(o.name || (o.asn ? 'AS' + o.asn : o.key));
+      // One company's ASes are one organisation: its tooltip lists them all.
+      const asns = Array.isArray(o.asns) && o.asns.length > 1 ? o.asns.map((a) => 'AS' + Number(a)).join(', ') : o.asn ? 'AS' + o.asn : '';
+      node(1, o.key, {
+        name: o.key === 'other' && Number(o.members) > 0 ? name + ' (' + fmtInt(o.members) + ')' : name,
+        sub: [asns, o.country ? countryName(o.country) : ''].filter(Boolean).join(', '), sites: Number(o.sites) || 0,
+      });
+    }
+    for (const sv of netList(data.services)) {
+      // A port without a name is named by its port alone ("8443/tcp").
+      node(2, sv.key, unnamedPort(sv) ? { name: portText(sv.port, sv.proto), sub: '' } : { name: String(sv.name || sv.key), sub: portText(sv.port, sv.proto) });
+    }
+    const links = [];
+    for (const l of netList(data.links)) {
+      const w = Number(l.weight);
+      if (!(w > 0)) continue;
+      let a = index[0].get(String(l.from));
+      let b = index[1].get(String(l.to));
+      if (!a || !b) {
+        a = index[1].get(String(l.from));
+        b = index[2].get(String(l.to));
+      }
+      if (!a || !b) continue;
+      const link = { a, b, w };
+      links.push(link);
+      a.out += w;
+      b.in += w;
+      a.links.push(link);
+      b.links.push(link);
+    }
+    for (const col of cols) for (const n of col) n.value = Math.max(n.in, n.out);
+    return { cols: cols.map((col) => col.filter((n) => n.value > 0)), links };
+  }
+
+  /** sankeyLayout places the nodes and bands of a sankeyModel: columns at xs (each nodeW wide),
+   *  nodes between top and top + height. One scale for every column (k pixels per unit of
+   *  weight), so that a band is as wide where it leaves as where it arrives; the nodes of a column
+   *  stacked in their order, pad apart, centred, none shorter than minH. A node's bands leave in
+   *  the order of the nodes they reach and arrive in the order of the nodes they come from, so
+   *  that they do not cross at the nodes. Sets n.x, n.y, n.h, and l.width, l.y0, l.y1 (the band's
+   *  centre at each end) and l.d (a cubic Bézier path, drawn with stroke-width l.width); returns k. */
+  function sankeyLayout(m, o) {
+    let k = Infinity;
+    for (const col of m.cols) {
+      if (!col.length) continue;
+      const avail = Math.max(1, o.height - o.pad * (col.length - 1));
+      let kc = avail / col.reduce((a, n) => a + n.value, 0);
+      for (let i = 0; i < 8; i++) { // the nodes below minH take minH: share the rest among the others
+        let small = 0;
+        let rest = 0;
+        for (const n of col) {
+          if (n.value * kc < o.minH) small++;
+          else rest += n.value;
+        }
+        const next = rest > 0 ? (avail - small * o.minH) / rest : kc;
+        if (!(next > 0) || Math.abs(next - kc) < 1e-9) break;
+        kc = next;
+      }
+      k = Math.min(k, kc);
+    }
+    if (!isFinite(k) || k < 0) k = 0;
+    m.cols.forEach((col, ci) => {
+      const hs = col.map((n) => Math.max(o.minH, n.value * k));
+      const total = hs.reduce((a, b) => a + b, 0) + o.pad * Math.max(0, col.length - 1);
+      let y = o.top + Math.max(0, (o.height - total) / 2);
+      col.forEach((n, i) => {
+        n.x = o.xs[ci];
+        n.y = y;
+        n.h = hs[i];
+        y += hs[i] + o.pad;
+      });
+    });
+    for (const col of m.cols) {
+      for (const n of col) {
+        let sy = n.y + (n.h - n.out * k) / 2;
+        for (const l of n.links.filter((x) => x.a === n).sort((p, q) => p.b.y - q.b.y)) {
+          l.width = l.w * k;
+          l.y0 = sy + l.width / 2;
+          sy += l.width;
+        }
+        let ty = n.y + (n.h - n.in * k) / 2;
+        for (const l of n.links.filter((x) => x.b === n).sort((p, q) => p.a.y - q.a.y)) {
+          l.y1 = ty + (l.w * k) / 2;
+          ty += l.w * k;
+        }
+      }
+    }
+    const f = (v) => v.toFixed(1);
+    for (const l of m.links) {
+      const x0 = l.a.x + o.nodeW;
+      const x1 = l.b.x;
+      const xm = (x0 + x1) / 2;
+      l.d = `M${f(x0)} ${f(l.y0)}C${f(xm)} ${f(l.y0)} ${f(xm)} ${f(l.y1)} ${f(x1)} ${f(l.y1)}`;
+    }
+    return k;
+  }
+
+  /** spreadLabels moves label centres ys (in the order of their nodes) at least gap apart, within
+   *  [lo, hi], as little as it can: pushed down from the top, then back up from the bottom. */
+  function spreadLabels(ys, gap, lo, hi) {
+    const out = ys.slice();
+    for (let i = 0; i < out.length; i++) out[i] = Math.max(out[i], i ? out[i - 1] + gap : lo);
+    for (let i = out.length - 1; i >= 0; i--) out[i] = Math.min(out[i], i < out.length - 1 ? out[i + 1] - gap : hi);
+    return out;
+  }
+
+  /** sankeyHeight is the height of the flow diagram's node area for a longest column of most
+   *  nodes, o: NET_SANKEY: 30 px a node, at least 200 px and at most 640 px - a limit raised for
+   *  a longer column (a household's devices over 30 days) to what it needs: its labels gap px
+   *  apart, and its nodes at their minimum height, pad px apart, with 200 px left for their
+   *  weights. Held at 640 px, a column of more than about 40 nodes would squeeze every node to
+   *  the minimum height (and the other columns with it: they share one scale), push its first
+   *  labels above the drawing and its last nodes below it. */
+  function sankeyHeight(most, o) {
+    const n = Math.max(1, Math.floor(Number(most)) || 1);
+    const cap = Math.max(640, (n - 1) * o.gap + 2 * o.edge, (n - 1) * o.pad + n * o.minH + 200);
+    return Math.min(cap, Math.max(200, n * 30));
+  }
+
+  /** sankeyColumns places the flow diagram's three columns in a drawing W px wide, nodes nodeW
+   *  wide. The labels of the devices (left of their nodes) take c0 characters at most (the
+   *  longest name and its share), within 28 % of the width; those of the services (on the right)
+   *  c2 (name, port and share), within 32 %; 13 px type is about 7.2 px a character. Returns {xs:
+   *  the x of each column, room: the characters of a label each column has room for}. The
+   *  margins are rounded up, never down, so that the longest label gets all the room its margin
+   *  was widened for and is not cut by a character. */
+  function sankeyColumns(W, c0, c2, nodeW) {
+    const fits = (px) => Math.max(4, Math.floor(px / 7.2));
+    const left = Math.ceil(Math.max(110, Math.min(W * 0.28, 26 + 7.2 * c0)));
+    const right = Math.ceil(Math.max(120, Math.min(W * 0.32, 30 + 7.2 * c2)));
+    const xs = [left, 0, W - right - nodeW];
+    xs[1] = Math.round(xs[0] + (xs[2] - xs[0]) * 0.52);
+    const room = [Math.min(28, fits(left - 26) - 6), Math.min(28, fits(xs[2] - xs[1] - nodeW - 30) - 6), fits(right - 30)].map((r) => Math.max(4, r));
+    return { xs, room };
+  }
+
+  /** netFlow is the flow diagram of the Connections tab: devices on the left (in their colours),
+   *  the organisations they reached in the middle (the top ones, the rest as "Other"), the
+   *  services on the right; a band's width is how often its connections were seen when the NAT
+   *  table was read. Hovering a band or a node, or focusing a node, shows its figures and lifts
+   *  its bands. The nodes take the keyboard focus, one tab stop for the diagram: the arrow keys
+   *  move between them, Home and End to the ends of a column; clicking a device, or Enter on it,
+   *  shows only that device (onDevice), and again every device. On a narrow screen the diagram
+   *  scrolls in its box; a long column of devices makes it taller (sankeyHeight). The table view
+   *  lists the bands. Returns {el, update(data, o)}, o:
+   *  {device (the filter), words (the period)}. */
+  function netFlow(ctx, onDevice) {
+    const fr = netFigure({ id: 'net-flow', title: 'Devices and the sites they reach' });
+    const only = h('p', { class: 'small net-only', hidden: true });
+    const scroll = h('div', { class: 'sk-scroll' });
+    const tip = h('div', { class: 'tip', hidden: true, 'aria-hidden': 'true' });
+    const wrap = h('div', { class: 'sk-wrap' }, scroll, tip);
+    // Shown on narrow screens only (style.css): the diagram keeps a legible size and scrolls.
+    const hint = h('p', { class: 'sk-hint' }, 'The diagram is wider than the screen: scroll it sideways, or show it as a table.');
+    add(fr.body, [only, wrap, hint]);
+    let model = null;
+    let filter = '';
+    let W = 0;
+    let svg = null;
+    let nodeEls = new Map(); // node -> its <g>
+    let active = ''; // "col:key" of the node with tabindex 0
+
+    const nodeId = (n) => n.col + ':' + n.key;
+    const total = (col) => model.cols[col].reduce((a, n) => a + n.value, 0);
+    // A service's label also says its port and share ("HTTPS 443/tcp · 81 %"): its name gets the rest.
+    const noteLen = (n) => (n.col === 2 && n.sub ? n.sub.length + 9 : 6);
+    const labelOf = (n) => netText(n.name, n.col === 2 ? Math.max(4, room[2] - noteLen(n)) : room[n.col]);
+    // The characters of a label each column has room for (sankeyColumns), set by draw(): the
+    // labels are cut to it, never clipped by the drawing's edge.
+    let room = [28, 28, 28];
+
+    function draw() {
+      if (!model || !model.links.length) return;
+      // The box's width rounded down: an SVG a fraction of a pixel too wide would scroll.
+      const avail = Math.floor(scroll.getBoundingClientRect().width);
+      if (!avail) return; // hidden (the table view): drawn when shown again
+      const prev = document.activeElement;
+      const focusKey = prev && svg && svg.contains(prev) ? prev.getAttribute('data-fk') : null;
+      W = Math.max(NET_SANKEY_MIN_W, avail);
+      const most = Math.max(1, ...model.cols.map((col) => col.length));
+      const height = sankeyHeight(most, NET_SANKEY);
+      const top = 30;
+      const H = top + height + 12;
+      const nodeW = 10;
+      // Room for the labels: devices on the left (name and share), services on the right (name,
+      // port and share), as much as their texts take, within a share of the width.
+      const chars = (col) => model.cols[col].reduce((a, n) => Math.max(a, netText(n.name, 28).length + noteLen(n)), 0);
+      const place = sankeyColumns(W, chars(0), chars(2), nodeW);
+      const xs = place.xs;
+      room = place.room;
+      sankeyLayout(model, { top, height, xs, nodeW, pad: NET_SANKEY.pad, minH: NET_SANKEY.minH });
+
+      svg = s('svg', { class: 'sk-svg', width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: 'group', 'aria-label': 'Flow diagram: devices on the left, the organisations they connected to in the middle, the services on the right' });
+      svg.append(
+        s('text', { class: 'sk-head', x: xs[0] + nodeW, y: 14, 'text-anchor': 'end', 'aria-hidden': 'true' }, 'DEVICE'),
+        s('text', { class: 'sk-head', x: xs[1], y: 14, 'aria-hidden': 'true' }, 'ORGANISATION'),
+        s('text', { class: 'sk-head', x: xs[2], y: 14, 'aria-hidden': 'true' }, 'SERVICE'));
+      const bands = s('g', { class: 'sk-bands', 'aria-hidden': 'true' });
+      for (const l of model.links) {
+        const cls = l.a.col === 0 ? 'sk-band c' + l.a.slot : 'sk-band sk-neutral';
+        l.el = s('path', { class: cls, d: l.d, 'stroke-width': Math.max(1, l.width).toFixed(1) });
+        l.el.addEventListener('pointerenter', (e) => lift([l], bandTip(l), e));
+        l.el.addEventListener('pointermove', (e) => moveTip(e));
+        l.el.addEventListener('pointerleave', unlift);
+        bands.append(l.el);
+      }
+      svg.append(bands);
+      nodeEls = new Map();
+      const nodes = s('g', { class: 'sk-nodes' });
+      model.cols.forEach((col, ci) => {
+        const ys = spreadLabels(col.map((n) => n.y + n.h / 2), NET_SANKEY.gap, top + NET_SANKEY.edge, top + height - NET_SANKEY.edge);
+        const sum = total(ci);
+        col.forEach((n, i) => nodes.append(nodeEl(n, ys[i], sum, ci, xs, nodeW)));
+      });
+      svg.append(nodes);
+      const ids = [...nodeEls.keys()].map(nodeId);
+      if (!ids.includes(active)) active = ids[0] || '';
+      for (const [n, g] of nodeEls) g.setAttribute('tabindex', nodeId(n) === active ? '0' : '-1');
+      replace(scroll, svg);
+      tip.hidden = true;
+      if (focusKey) {
+        const g = [...nodeEls.values()].find((x) => x.getAttribute('data-fk') === focusKey);
+        if (g) g.focus();
+      }
+    }
+
+    /** nodeEl draws a node: its bar, its label (outside the bar: devices on the left, the others
+     *  on the right) and an area that takes the pointer and the focus. */
+    function nodeEl(n, ly, sum, ci, xs, nodeW) {
+      const left = ci === 0;
+      const lx = left ? n.x - 8 : n.x + nodeW + 8;
+      const text = labelOf(n);
+      const pct = netShare(n.value, sum);
+      const note = ci === 2 && n.sub ? ' ' + n.sub + ' · ' + pct : ' ' + pct;
+      const wEst = 7.2 * (text.length + note.length) + 12;
+      const hx = left ? Math.max(2, lx - wEst) : n.x - 3;
+      const hw = left ? n.x + nodeW + 3 - hx : nodeW + 3 + 8 + wEst;
+      const y0 = Math.min(n.y, ly - 10) - 2;
+      const y1 = Math.max(n.y + n.h, ly + 10) + 2;
+      const isOnly = n.device && filter === n.key;
+      const label = netText(n.name, 80) + (n.sub && ci !== 2 ? ' (' + n.sub + ')' : '') + ': seen ' + fmtInt(n.value) + ' time' + (n.value === 1 ? '' : 's') +
+        ', ' + pct + (n.sites ? ', ' + fmtInt(n.sites) + ' remote address' + (n.sites === 1 ? '' : 'es') : '') + '.' +
+        (n.device ? (isOnly ? ' Shown alone: press Enter to show every device.' : ' Press Enter to show only this device.') : '');
+      const g = s('g', {
+        class: 'sk-node' + (n.device ? ' is-device' : ''), tabindex: '-1', role: n.device ? 'button' : 'img',
+        'aria-label': label, 'aria-pressed': n.device ? String(isOnly) : null, 'data-fk': 'sk:' + nodeId(n),
+      },
+      s('rect', { class: 'sk-hit', x: hx.toFixed(1), y: y0.toFixed(1), width: Math.max(1, hw).toFixed(1), height: (y1 - y0).toFixed(1) }),
+      s('rect', { class: 'sk-ring', x: (hx - 2).toFixed(1), y: (y0 - 1).toFixed(1), width: (Math.max(1, hw) + 4).toFixed(1), height: (y1 - y0 + 2).toFixed(1), rx: 4 }),
+      s('rect', { class: n.device ? 'sk-bar f' + n.slot : 'sk-bar sk-bar-n', x: n.x, y: n.y.toFixed(1), width: nodeW, height: n.h.toFixed(1), rx: 2 }),
+      s('text', { class: 'sk-label', x: lx, y: ly.toFixed(1), dy: '0.35em', 'text-anchor': left ? 'end' : 'start' },
+        text, s('tspan', { class: 'sk-pct' }, note)));
+      g.addEventListener('pointerenter', (e) => lift(n.links, nodeTip(n, pct), e));
+      g.addEventListener('pointermove', (e) => moveTip(e));
+      g.addEventListener('pointerleave', unlift);
+      g.addEventListener('focus', () => {
+        active = nodeId(n);
+        for (const [m2, g2] of nodeEls) g2.setAttribute('tabindex', m2 === n ? '0' : '-1');
+        g.classList.add('is-focus');
+        lift(n.links, nodeTip(n, pct), null, n);
+      });
+      g.addEventListener('blur', () => {
+        g.classList.remove('is-focus');
+        unlift();
+      });
+      g.addEventListener('keydown', (e) => onKey(e, n));
+      if (n.device) g.addEventListener('click', () => onDevice(isOnly ? '' : n.key));
+      nodeEls.set(n, g);
+      return g;
+    }
+
+    function onKey(e, n) {
+      const col = model.cols[n.col];
+      const i = col.indexOf(n);
+      let next = null;
+      switch (e.key) {
+        case 'ArrowDown': next = col[Math.min(col.length - 1, i + 1)]; break;
+        case 'ArrowUp': next = col[Math.max(0, i - 1)]; break;
+        case 'Home': next = col[0]; break;
+        case 'End': next = col[col.length - 1]; break;
+        case 'ArrowRight':
+        case 'ArrowLeft': {
+          const other = model.cols[n.col + (e.key === 'ArrowRight' ? 1 : -1)];
+          const mid = n.y + n.h / 2;
+          if (other && other.length) next = other.reduce((a, b) => (Math.abs(b.y + b.h / 2 - mid) < Math.abs(a.y + a.h / 2 - mid) ? b : a));
+          break;
+        }
+        case 'Enter':
+        case ' ':
+          if (n.device) {
+            e.preventDefault();
+            onDevice(filter === n.key ? '' : n.key);
+          }
+          return;
+        case 'Escape': unlift(); return;
+        default: return;
+      }
+      e.preventDefault();
+      const g = next && nodeEls.get(next);
+      if (g && next !== n) g.focus();
+    }
+
+    function bandTip(l) {
+      const a = netText(l.a.name, 40);
+      const b = netText(l.b.name, 40);
+      return [
+        h('div', { class: 'tip-time' }, a, ' → ', b),
+        h('div', { class: 'tip-row' }, l.a.col === 0 ? lineKey(l.a.slot) : h('span'), h('span', { class: 'val' }, fmtInt(l.w)), h('span', { class: 'lab' }, 'times seen')),
+        h('div', { class: 'tip-utc' }, netShare(l.w, l.a.value) + ' of ' + a + ', ' + netShare(l.w, l.b.value) + ' of ' + b),
+      ];
+    }
+
+    function nodeTip(n, pct) {
+      return [
+        h('div', { class: 'tip-time' }, netText(n.name, 48)),
+        n.sub ? h('div', { class: 'tip-utc' }, n.sub) : null,
+        h('div', { class: 'tip-row' }, n.device ? lineKey(n.slot) : h('span'), h('span', { class: 'val' }, fmtInt(n.value)), h('span', { class: 'lab' }, 'times seen · ' + pct)),
+        n.sites ? h('div', { class: 'tip-row' }, h('span'), h('span', { class: 'val' }, fmtInt(n.sites)), h('span', { class: 'lab' }, 'remote addresses')) : null,
+        n.device ? h('div', { class: 'tip-utc' }, filter === n.key ? 'Click or press Enter to show every device' : 'Click or press Enter to show only this device') : null,
+      ];
+    }
+
+    /** lift highlights bands (the others recede) and shows the tooltip: at the pointer (e), or
+     *  beside a node that has the focus. */
+    function lift(links, content, e, n) {
+      if (!svg) return;
+      svg.classList.add('sk-dim');
+      for (const l of model.links) if (l.el) l.el.classList.remove('is-hot');
+      for (const l of links) if (l.el) l.el.classList.add('is-hot');
+      replace(tip, content);
+      if (e) moveTip(e);
+      else if (n) {
+        const x = (n.col === 0 ? n.x + 14 : n.x + 10) - scroll.scrollLeft;
+        placeTipAt(tip, x, n.y + n.h / 2, wrap.clientWidth, wrap.clientHeight);
+      }
+    }
+
+    function moveTip(e) {
+      const r = wrap.getBoundingClientRect();
+      placeTipAt(tip, e.clientX - r.left, e.clientY - r.top, wrap.clientWidth, wrap.clientHeight);
+    }
+
+    function unlift() {
+      tip.hidden = true;
+      if (!svg) return;
+      svg.classList.remove('sk-dim');
+      for (const l of model.links) if (l.el) l.el.classList.remove('is-hot');
+    }
+
+    function buildTable() {
+      const byW = (p, q) => q.w - p.w;
+      const dev = model.links.filter((l) => l.a.col === 0).sort(byW).map((l) => [
+        h('span', { class: 'dev' }, deviceDot(l.a.key), h('span', null, netShown(l.a.name, 60))), netShown(l.b.name, 60), fmtInt(l.w), netShare(l.w, l.a.value)]);
+      const org = model.links.filter((l) => l.a.col === 1).sort(byW).map((l) => [
+        netShown(l.a.name, 60), [netShown(l.b.name, 40), l.b.sub ? h('span', { class: 'sub small muted' }, l.b.sub) : null], fmtInt(l.w), netShare(l.w, l.a.value)]);
+      return netTableView('Devices and the sites they reach',
+        table([{ label: 'Device' }, { label: 'Organisation' }, { label: 'Times seen', num: true }, { label: 'Share of the device', num: true }], dev,
+          { compact: true, caption: 'Devices → organisations' }),
+        table([{ label: 'Organisation' }, { label: 'Service' }, { label: 'Times seen', num: true }, { label: 'Share of the organisation', num: true }], org,
+          { compact: true, caption: 'Organisations → services' }));
+    }
+
+    const ro = new ResizeObserver(() => {
+      const w = Math.floor(scroll.getBoundingClientRect().width);
+      if (w && Math.max(NET_SANKEY_MIN_W, w) !== W) draw();
+    });
+    ro.observe(scroll);
+    ctx.cleanup(() => ro.disconnect());
+
+    return {
+      el: fr.fig,
+      update(data, o) {
+        filter = o.device || '';
+        model = sankeyModel(data);
+        replace(fr.sub, o.words + '. Band width: how often the connection was open when the NAT table was read.');
+        const sel = filter ? model.cols[0].find((n) => n.key === filter) : null;
+        only.hidden = !filter;
+        replace(only, filter ? ['Only ', h('strong', null, sel ? netText(sel.name, 48) : filter), ' is shown. ',
+          h('button', { type: 'button', class: 'link-btn', 'data-fk': 'net-flow:all' }, 'Show every device')] : null);
+        const all = only.querySelector('button');
+        if (all) all.addEventListener('click', () => onDevice('', 'all'));
+        if (!model.links.length) {
+          svg = null;
+          replace(scroll, emptyNote(filter ? 'This device had no connection in this period.' : 'No connection was seen in this period.'));
+        } else {
+          W = 0;
+          draw();
+        }
+        fr.setTable(() => (model.links.length ? buildTable() : emptyNote('No connection in this period.')));
+      },
+    };
+  }
+
+  // ------------------------------------------------------------------ network view: world map
+
+  let worldReq = null;
+
+  /** worldData reads the world map once (static/world.json: the Natural Earth 1:110m countries,
+   *  pre-projected to SVG paths, keyed by ISO code) and keeps it; a failed read is tried again
+   *  the next time. */
+  function worldData() {
+    if (!worldReq) {
+      worldReq = api('/static/world.json').then((w) => {
+        if (!w || !(Number(w.w) > 0) || !(Number(w.h) > 0) || !Array.isArray(w.countries)) throw new Error('The world map data are not valid.');
+        const countries = w.countries.filter((x) => x && typeof x.id === 'string' && typeof x.d === 'string');
+        for (const x of countries) if (typeof x.n === 'string' && x.n && !worldNames.has(x.id)) worldNames.set(x.id, x.n);
+        return { w: Number(w.w), h: Number(w.h), countries };
+      });
+      worldReq.catch(() => { worldReq = null; });
+    }
+    return worldReq;
+  }
+
+  /** mapBreaks returns the lower bounds of the map's five colour steps for values up to max:
+   *  1, then numbers of the 1-2-5 series spaced evenly on a log scale, the last one below max,
+   *  e.g. [1, 2, 5, 20, 50] for 152 sites; 1 to 5 for small values. */
+  function mapBreaks(max) {
+    const m = Math.max(1, Number(max) || 1);
+    if (m <= 5) return [1, 2, 3, 4, 5];
+    const nice = (v) => {
+      const p = Math.pow(10, Math.floor(Math.log10(v)));
+      const f = v / p;
+      return (f < 1.5 ? 1 : f < 3.5 ? 2 : f < 7.5 ? 5 : 10) * p;
+    };
+    const out = [1];
+    for (let i = 1; i < 5; i++) out.push(Math.max(out[i - 1] + 1, Math.min(nice(Math.pow(m, i / 5)), Math.floor(m))));
+    return out;
+  }
+
+  /** mapStep is the colour step (1-5) of a value, 0 for none. */
+  function mapStep(v, breaks) {
+    if (!(v > 0)) return 0;
+    let step = 1;
+    for (let i = 1; i < breaks.length; i++) if (v >= breaks[i]) step = i + 1;
+    return step;
+  }
+
+  /** netMap is a world map card: the countries shaded in five steps of one hue (mapBreaks) by
+   *  o.value, a legend, a tooltip on hover and from the keyboard (the map takes the focus; the
+   *  arrow keys step through the countries with a value, largest first), and beside it the top
+   *  countries as bars - Unknown ("") among them - and the others the map has no shape for
+   *  (renderSide). o: NET_CONN_MAP or NET_FW_MAP. Returns {el, update(countries)}. */
+  function netMap(ctx, o) {
+    const fr = netFigure({ id: o.id, title: o.title, sub: o.sub });
+    const plot = h('div', {
+      class: 'map-plot', tabindex: '0', role: 'group', 'aria-roledescription': 'map', 'data-fk': o.id + ':map',
+      'aria-label': o.title + '. Use the arrow keys to read the countries, T for the table view.',
+    });
+    const tip = h('div', { class: 'tip', hidden: true, 'aria-hidden': 'true' });
+    plot.append(tip);
+    const live = h('div', { class: 'sr-only', 'aria-live': 'polite' });
+    const legend = h('div', { class: 'map-legend' });
+    const side = h('div', { class: 'map-side' });
+    add(fr.body, [h('div', { class: 'map-wrap' }, h('div', { class: 'map-main' }, plot, legend), side), live]);
+    let world = null;
+    let svg = null;
+    const paths = new Map(); // ISO code -> its paths
+    let rows = []; // [{code, value, extra}], largest first
+    let total = 0;
+    let breaks = [1, 2, 3, 4, 5];
+    let hot = '';
+    let idx = -1;
+
+    worldData().then((wd) => {
+      if (!ctx.alive) return;
+      world = wd;
+      build();
+      paint();
+      if (rows.length) renderSide(); // country names known now
+    }).catch(() => {
+      if (ctx.alive) plot.insertBefore(emptyNote('The world map could not be loaded; the list beside it and the table view show every country.'), tip);
+    });
+
+    function build() {
+      svg = s('svg', { class: 'map-svg', viewBox: `0 0 ${world.w} ${world.h}`, 'aria-hidden': 'true', focusable: 'false' });
+      for (const x of world.countries) {
+        const p = s('path', { d: x.d, class: 'map-0', 'data-cc': x.id });
+        if (!paths.has(x.id)) paths.set(x.id, []);
+        paths.get(x.id).push(p);
+        svg.append(p);
+      }
+      svg.addEventListener('pointermove', (e) => {
+        const p = e.target && e.target.closest ? e.target.closest('path') : null;
+        if (!p) {
+          hide();
+          return;
+        }
+        const r = plot.getBoundingClientRect();
+        showCountry(p.getAttribute('data-cc') || '', e.clientX - r.left, e.clientY - r.top, true);
+      });
+      svg.addEventListener('pointerleave', hide);
+      plot.insertBefore(svg, tip);
+    }
+
+    function paint() {
+      if (!svg) return;
+      const byCode = new Map(rows.map((r) => [r.code, r]));
+      for (const [code, ps] of paths) {
+        const r = byCode.get(code);
+        const cls = 'map-' + (r ? mapStep(r.value, breaks) : 0) + (code === hot ? ' is-hot' : '');
+        for (const p of ps) {
+          p.setAttribute('class', cls);
+          if (code === hot) svg.append(p); // on top, so that its outline shows
+        }
+      }
+    }
+
+    function rowOf(code) {
+      return rows.find((r) => r.code === code) || null;
+    }
+
+    function tipLines(code) {
+      const r = rowOf(code);
+      return [
+        h('div', { class: 'tip-time' }, countryName(code)),
+        r ? h('div', { class: 'tip-row' }, h('span'), h('span', { class: 'val' }, o.unit(r.value)), h('span', { class: 'lab' }, netShare(r.value, total))) : h('div', { class: 'tip-utc' }, 'none'),
+        r && r.extra ? h('div', { class: 'tip-utc' }, o.extraUnit(r.extra)) : null,
+      ];
+    }
+
+    function showCountry(code, x, y, pointer) {
+      if (hot !== code) {
+        hot = code;
+        paint();
+      }
+      replace(tip, tipLines(code));
+      placeTipAt(tip, x, y, plot.clientWidth, plot.clientHeight);
+      if (!pointer) {
+        const r = rowOf(code);
+        live.textContent = countryName(code) + ': ' + (r ? o.unit(r.value) + ', ' + netShare(r.value, total) : 'none');
+      }
+    }
+
+    /** showRow shows a country chosen from the keyboard: beside its shape when the browser can
+     *  measure it, else in the corner. */
+    function showRow(r) {
+      let x = 8;
+      let y = 8;
+      const p = paths.get(r.code);
+      if (p && p[0] && typeof p[0].getBBox === 'function' && world) {
+        try {
+          const b = p[0].getBBox();
+          const k = plot.clientWidth / world.w;
+          x = (b.x + b.width / 2) * k;
+          y = (b.y + b.height / 2) * k;
+        } catch (_) { /* not rendered */ }
+      }
+      showCountry(r.code, x, y, false);
+    }
+
+    function hide() {
+      tip.hidden = true;
+      if (hot) {
+        hot = '';
+        paint();
+      }
+    }
+
+    plot.addEventListener('keydown', (e) => {
+      if (!rows.length) return;
+      switch (e.key) {
+        case 'ArrowRight': case 'ArrowDown': idx = Math.min(rows.length - 1, idx + 1); break;
+        case 'ArrowLeft': case 'ArrowUp': idx = Math.max(0, idx - 1); break;
+        case 'Home': idx = 0; break;
+        case 'End': idx = rows.length - 1; break;
+        case 'Escape': hide(); return;
+        case 't': case 'T': fr.tableBtn.click(); return;
+        default: return;
+      }
+      e.preventDefault();
+      showRow(rows[idx]);
+    });
+    plot.addEventListener('focus', () => {
+      if (rows.length) showRow(rows[Math.max(0, Math.min(idx, rows.length - 1))]);
+    });
+    plot.addEventListener('blur', hide);
+
+    function renderLegend() {
+      const keys = breaks.map((b, i) => {
+        const hi = i < breaks.length - 1 ? breaks[i + 1] - 1 : null;
+        const text = hi == null ? fmtInt(b) + '+' : hi === b ? fmtInt(b) : fmtInt(b) + '–' + fmtInt(hi);
+        return h('span', { class: 'map-key' }, h('span', { class: 'map-swatch sw-' + (i + 1), 'aria-hidden': 'true' }), text);
+      });
+      replace(legend, h('span', { class: 'map-legend-title' }, o.legend), keys,
+        h('span', { class: 'map-key' }, h('span', { class: 'map-swatch sw-0', 'aria-hidden': 'true' }), 'None'));
+    }
+
+    /** renderSide lists the top countries beside the map, the others together, and then, once
+     *  the map is loaded, those of the others it has no shape for (Singapore, Hong Kong, Malta and
+     *  other small states at this scale; Unknown): shaded nowhere, they would otherwise be seen
+     *  only in the table view. */
+    function renderSide() {
+      const top = rows.slice(0, 5);
+      const rest = rows.slice(5);
+      const items = top.map((r) => ({ name: countryName(r.code), value: r.value }));
+      if (rest.length) items.push({ name: fmtInt(rest.length) + ' other countr' + (rest.length === 1 ? 'y' : 'ies'), value: rest.reduce((a, r) => a + r.value, 0) });
+      const off = world ? rest.filter((r) => !paths.has(r.code)) : [];
+      const named = off.slice(0, 5);
+      replace(side, h('h3', { class: 'side-head' }, 'Top countries'),
+        items.length ? netBars(items, total, 'Top countries') : emptyNote('None in this period.'),
+        named.length ? h('p', { class: 'small muted map-off' }, 'Not on the map: ',
+          named.map((r, i) => [i ? ', ' : '', countryName(r.code), ' ', fmtInt(r.value)]),
+          off.length > named.length ? ', and ' + fmtInt(off.length - named.length) + ' more in the table view.' : '.') : null);
+    }
+
+    function buildTable() {
+      return netTableView(o.title, table(
+        [{ label: 'Country' }, { label: 'Code' }, { label: o.valueLabel, num: true }, { label: o.extraLabel, num: true }, { label: 'Share', num: true }],
+        rows.map((r) => [countryName(r.code), r.code ? netText(r.code, 8) : '—', fmtInt(r.value), fmtInt(r.extra), netShare(r.value, total)]), { compact: true }));
+    }
+
+    return {
+      el: fr.fig,
+      update(countries) {
+        rows = netList(countries).map((x) => ({ code: typeof x.code === 'string' ? x.code : '', value: o.value(x), extra: o.extra(x) }))
+          .filter((r) => r.value > 0).sort((a, b) => b.value - a.value);
+        total = rows.reduce((a, r) => a + r.value, 0);
+        breaks = mapBreaks(rows.length ? rows[0].value : 1);
+        idx = Math.min(idx, rows.length - 1);
+        renderLegend();
+        renderSide();
+        paint();
+        fr.setTable(buildTable);
+      },
+    };
+  }
+
+  // ------------------------------------------------------------------ network view: connections table
+
+  // The connections table's columns: what each sorts by, and in which direction at first.
+  const NET_CONN_COLS = [
+    { key: 'device', label: 'Device' },
+    { key: 'remote', label: 'Remote address' },
+    { key: 'org', label: 'Organisation' },
+    { key: 'country', label: 'Country' },
+    { key: 'service', label: 'Service' },
+    { key: 'first', label: 'First seen', num: true, desc: true },
+    { key: 'last', label: 'Last seen', num: true, desc: true },
+    { key: 'samples', label: 'Times seen', num: true, desc: true },
+  ];
+
+  /** ipSortKey makes addresses sort by number (IPv4 before IPv6, each in order). */
+  function ipSortKey(v) {
+    const t = String(v == null ? '' : v);
+    const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(t);
+    return m ? '4' + m.slice(1).map((x) => x.padStart(3, '0')).join('.') : '6' + t.toLowerCase();
+  }
+
+  /** netConnTable is the Connections tab's table: each device's remote addresses with their
+   *  reverse DNS name, organisation, country and service, when first and last seen and how many
+   *  times. The search box keeps the rows that contain every word typed; a column heading sorts
+   *  by that column (again: the other way round); the first NET_TABLE_PAGE rows are shown until
+   *  "Show all". The search, the sort and "Show all" stay as they are when new data arrive.
+   *  Returns {el, update(data, endsNow)}. */
+  function netConnTable(ctx) {
+    const search = h('input', { type: 'search', name: 'filter', placeholder: 'Filter by device, address, organisation', autocomplete: 'off', spellcheck: 'false', maxlength: '200', 'data-fk': 'net-conns:search' });
+    const box = h('div', { class: 'net-conns-body' });
+    const foot = h('div', { class: 'card-foot net-conns-foot' });
+    const status = h('span');
+    const more = h('button', { type: 'button', class: 'link-btn', hidden: true, 'data-fk': 'net-conns:more' }, 'Show all');
+    add(foot, [status, ' ', more]);
+    const el = h('section', { class: 'card', 'aria-labelledby': 'net-conns-h' },
+      h('div', { class: 'card-head net-conns-head' },
+        h('div', null, h('h2', { id: 'net-conns-h' }, 'Connections'),
+          h('p', { class: 'chart-sub' }, 'Each device’s remote addresses, most seen first. The names under an address are its reverse DNS.')),
+        h('label', { class: 'net-search' }, h('span', { class: 'sr-only' }, 'Filter the connections'), search)),
+      box, foot);
+    let rows = [];
+    let totalRows = 0;
+    let sort = { key: 'samples', dir: -1 };
+    let all = false;
+    let timer = 0;
+    ctx.cleanup(() => window.clearTimeout(timer));
+    search.addEventListener('input', () => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => render(true), 150);
+    });
+    more.addEventListener('click', () => {
+      all = !all;
+      render(true);
+    });
+
+    /** render shows the rows that match the search, sorted; after the reader's own change
+     *  (said), the new count is announced (a refresh changes it silently). */
+    function render(said) {
+      const terms = search.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+      const match = rows.filter((r) => terms.every((t) => r.hay.includes(t)));
+      const col = NET_CONN_COLS.find((x) => x.key === sort.key) || NET_CONN_COLS[7];
+      match.sort((p, q) => {
+        const a = p.sort[col.key];
+        const b = q.sort[col.key];
+        const c = typeof a === 'number' && typeof b === 'number' ? a - b : String(a).localeCompare(String(b));
+        return c * sort.dir || q.sort.samples - p.sort.samples;
+      });
+      const showN = all ? match.length : Math.min(match.length, NET_TABLE_PAGE);
+      const head = h('tr', null, NET_CONN_COLS.map((x) => {
+        const on = x.key === sort.key;
+        const btn = h('button', { type: 'button', class: 'th-sort', 'data-fk': 'net-conns:sort:' + x.key }, x.label,
+          h('span', { class: 'th-arrow', 'aria-hidden': 'true' }, on ? (sort.dir < 0 ? ' ▼' : ' ▲') : ''));
+        btn.addEventListener('click', () => {
+          sort = on ? { key: x.key, dir: -sort.dir } : { key: x.key, dir: x.desc ? -1 : 1 };
+          render(true);
+        });
+        return h('th', { scope: 'col', class: x.num ? 'num' : null, 'aria-sort': on ? (sort.dir < 0 ? 'descending' : 'ascending') : null }, btn);
+      }));
+      keepFocus(el, () => {
+        replace(box, match.length
+          ? h('div', { class: 'table-scroll' }, h('table', { class: 'tbl net-conns' }, h('thead', null, head),
+            h('tbody', null, match.slice(0, showN).map((r) => r.tr || (r.tr = r.make())))))
+          : emptyNote(rows.length ? 'No connection matches the filter.' : 'No connection in this period.'));
+      });
+      const n = fmtInt(totalRows) + ' connection' + (totalRows === 1 ? '' : 's');
+      const listed = totalRows > rows.length ? ' (the ' + fmtInt(rows.length) + ' most seen are listed)' : '';
+      status.textContent = terms.length
+        ? fmtInt(match.length) + ' of ' + n + ' match' + (match.length > showN ? ', ' + fmtInt(showN) + ' shown' : '') + listed + '.'
+        : (showN < match.length ? 'Showing ' + fmtInt(showN) + ' of ' + n : 'Showing all ' + n) + listed + '.';
+      more.hidden = match.length <= NET_TABLE_PAGE;
+      more.textContent = all ? 'Show the first ' + NET_TABLE_PAGE : 'Show all';
+      if (said) announce(status.textContent);
+    }
+
+    return {
+      el,
+      update(d, endsNow) {
+        const names = new Map(netList(d.devices).map((dv) => [String(dv.key), String(dv.name || dv.ipv4 || dv.key)]));
+        const lastRead = String(d.last || '');
+        rows = netList(d.rows).map((r) => {
+          const dev = names.get(String(r.device)) || String(r.lan || r.device || '?');
+          const pub = !r.kind || r.kind === 'public';
+          const org = r.org ? String(r.org) : pub ? 'Unknown' : IP_KINDS[r.kind] || String(r.kind);
+          const cn = r.country ? countryName(r.country) : pub ? 'Unknown' : '—';
+          const port = portText(r.port, r.proto);
+          const now = endsNow && lastRead && r.last === lastRead;
+          const lastD = toDate(r.last);
+          // The row's elements are made when it is first shown (most of up to 1,000 rows never are).
+          const make = () => h('tr', null,
+            h('td', null, h('span', { class: 'dev', title: r.lan ? 'LAN address ' + escapedText(r.lan) : null }, deviceDot(r.device), h('span', null, netShown(dev, 40)))),
+            h('td', { class: 'net-remote' }, h('span', { class: 'mono' }, netShown(r.remote, 64)), r.ptr ? h('span', { class: 'sub small muted wrap-any' }, netShown(r.ptr, 120)) : null),
+            h('td', null, netShown(org, 60), r.asn ? h('span', { class: 'sub small muted' }, 'AS' + r.asn) : null),
+            h('td', { title: r.country ? escapedText(r.country) : null }, cn),
+            h('td', null, r.service ? netShown(r.service, 40) : h('span', { class: 'muted' }, '—'),
+              port || r.inbound ? h('span', { class: 'sub small muted' }, port, r.inbound ? [port ? ' · ' : '', 'inbound'] : null) : null),
+            h('td', { class: 'num' }, netTimeEl(r.first)),
+            h('td', { class: 'num' }, now && lastD
+              ? h('time', { datetime: lastD.toISOString(), title: 'Open at the newest read of the NAT table, ' + F.full.format(lastD) + ' · UTC: ' + utcText(r.last, lastD) }, 'now')
+              : netTimeEl(r.last)),
+            h('td', { class: 'num', title: Number(r.weight) > Number(r.samples) ? fmtInt(r.weight) + ' sessions over these reads' : null }, fmtInt(r.samples)));
+          const hay = [dev, r.lan, r.remote, r.ptr, org, r.asn ? 'as' + r.asn : '', r.country, cn, r.service, port, r.proto]
+            .filter((x) => x != null && x !== '').join(' ').toLowerCase();
+          return {
+            tr: null, make, hay,
+            sort: {
+              device: dev.toLowerCase(), remote: ipSortKey(r.remote), org: org.toLowerCase(), country: cn.toLowerCase(),
+              service: String(r.service || port || '').toLowerCase(), first: toMs(r.first) || 0, last: toMs(r.last) || 0, samples: Number(r.samples) || 0,
+            },
+          };
+        });
+        totalRows = Math.max(rows.length, Number(d.rows_total) || 0);
+        render(false);
+      },
+    };
+  }
+
+  // ------------------------------------------------------------------ network view: firewall timeline
+
+  /** colPath is a column from y down to base, x..x+w wide, with its top corners rounded (r). */
+  function colPath(x, y, w, base, r) {
+    const rr = Math.max(0, Math.min(r, w / 2, base - y));
+    const f = (v) => v.toFixed(1);
+    return `M${f(x)} ${f(base)}V${f(y + rr)}Q${f(x)} ${f(y)} ${f(x + rr)} ${f(y)}H${f(x + w - rr)}Q${f(x + w)} ${f(y)} ${f(x + w)} ${f(y + rr)}V${f(base)}Z`;
+  }
+
+  /** fwTimeline draws the firewall's drops per hour over the period as stacked columns: inbound
+   *  probes (slot 1), outbound packets from the home network (slot 2) and packets to or from the
+   *  gateway itself (grey), each hour's column on its share of the period; a tooltip on hover and
+   *  from the keyboard, the drops by reason under it, a table view. Built like lineChart. Like
+   *  the page's other figures it stays in the page when new data arrive (update): the plot keeps
+   *  the keyboard focus and the hour last shown (by its start), and shows that hour again without
+   *  a word in its live region, so that the refresh every minute neither moves a keyboard user
+   *  back to the last hour nor announces anything. Returns {el, update(data)}. */
+  function fwTimeline(ctx) {
+    const o = { id: 'net-fw-hours', title: 'Blocked per hour', subtitle: 'Packets the gateway’s firewall dropped, each hour of the period.' };
+    const { fig, tableBtn, plot, tip, live } = chartFrame(o);
+    plot.setAttribute('data-fk', 'net-fw-hours:plot');
+    tableBtn.setAttribute('data-fk', 'net-fw-hours:table');
+    const SER = [
+      { key: 'in', label: 'Inbound probes', cls: 'f1', slot: 1 },
+      { key: 'out', label: 'Outbound packets from the home network', cls: 'f2', slot: 2 },
+      { key: 'local', label: 'To or from the gateway itself', cls: 'fw-local', slot: 0 },
+    ];
+    fig.append(h('ul', { class: 'legend', 'aria-label': 'Series' }, SER.map((x) => h('li', null, h('span', { class: 'static' },
+      s('svg', { class: 'key', viewBox: '0 0 18 10', 'aria-hidden': 'true', focusable: 'false' }, s('rect', { class: x.cls, x: 3, y: 0, width: 12, height: 10, rx: 2 })), x.label)))));
+    const summary = h('p', { class: 'chart-summary', hidden: true }); // the drops by reason
+    const tableWrap = h('div', { hidden: true });
+    add(fig, [plot, summary, live, tableWrap]);
+    const H = 230;
+    let from = null;
+    let to = null;
+    let hours = [];
+    let W = 0;
+    let chart = null; // the plot's <svg> (the tooltip's keys are <svg> too)
+    let g = null;
+    let idx = -1; // the hour shown last, from the keyboard or the pointer: the arrow keys go on from it
+    const words = (x) => F.short.format(new Date(x.t)) + ' – ' + F.hm.format(new Date(x.t + 3600e3));
+
+    function draw() {
+      if (from == null || to == null || to <= from) {
+        if (chart) chart.remove();
+        chart = null;
+        hide();
+        g = null;
+        return;
+      }
+      W = Math.max(260, Math.round(plot.clientWidth));
+      const x0 = 54;
+      const x1 = W - 14;
+      const y0 = H - 26;
+      const y1 = 12;
+      const top = hours.reduce((a, x) => Math.max(a, x.in + x.out + x.local), 0);
+      const nt = niceTicks(0, Math.max(1, top), 4);
+      const hi = nt.hi;
+      const xs = (t) => x0 + ((t - from) / (to - from)) * (x1 - x0);
+      const ys = (v) => y0 - (v / hi) * (y0 - y1);
+      const svg = s('svg', { width: W, height: H, viewBox: `0 0 ${W} ${H}`, 'aria-hidden': 'true', focusable: 'false' });
+      for (const t of nt.ticks) {
+        if (t > hi) continue;
+        const y = Math.round(ys(t)) + 0.5;
+        svg.append(s('line', { class: 'gl', x1: x0, x2: x1, y1: y, y2: y }), s('text', { class: 'tk', x: x0 - 8, y: y + 3.5, 'text-anchor': 'end' }, fmtInt(t)));
+      }
+      svg.append(s('line', { class: 'al', x1: x0, x2: x1, y1: y0 + 0.5, y2: y0 + 0.5 }));
+      for (const t of timeTicks(from, to, x1 - x0)) {
+        const x = Math.round(xs(t.ms)) + 0.5;
+        svg.append(s('line', { class: 'al', x1: x, x2: x, y1: y0, y2: y0 + 4 }), s('text', { class: 'tk', x, y: y0 + 17, 'text-anchor': 'middle' }, t.label));
+      }
+      const cols = [];
+      for (const x of hours) {
+        const a = Math.max(from, x.t);
+        const b = Math.min(to, x.t + 3600e3);
+        if (b <= a) {
+          cols.push(null);
+          continue;
+        }
+        const slot = xs(b) - xs(a);
+        const bw = slot >= 6 ? Math.min(24, slot - 2) : Math.max(0.6, slot * 0.8);
+        const bx = xs(a) + (slot - bw) / 2;
+        cols.push({ x: bx, w: bw, mid: bx + bw / 2 });
+        let base = y0;
+        const segs = SER.map((se) => ({ se, v: x[se.key] })).filter((p) => p.v > 0);
+        segs.forEach((p, i) => {
+          const hpx = (p.v / hi) * (y0 - y1);
+          let yTop = base - hpx;
+          const gap = i > 0 && hpx > 3 ? 2 : 0; // a 2px surface gap between stacked segments
+          const bottom = base - gap;
+          if (yTop > bottom - 0.5) yTop = bottom - 0.5;
+          svg.append(i === segs.length - 1
+            ? s('path', { class: p.se.cls, d: colPath(bx, yTop, bw, bottom, bw >= 6 ? 4 : 0) })
+            : s('rect', { class: p.se.cls, x: bx.toFixed(1), y: yTop.toFixed(1), width: bw.toFixed(1), height: Math.max(0.5, bottom - yTop).toFixed(1) }));
+          base = yTop;
+        });
+      }
+      const outline = s('rect', { class: 'run-hover', visibility: 'hidden', x: 0, y: y1, width: 0, height: y0 - y1, rx: 3 });
+      svg.append(outline);
+      g = { x0, x1, xs, cols, outline, y1, y0 };
+      if (chart) chart.replaceWith(svg); else plot.insertBefore(svg, tip);
+      chart = svg;
+      // The hour shown stays shown, quietly (a resize, new data), and so does the one the focus
+      // chose before the plot could be drawn.
+      if (idx >= 0 && (!tip.hidden || document.activeElement === plot)) showAt(idx, 'quiet');
+    }
+
+    /** showAt shows hour i: its outline and tooltip and, chosen from the keyboard (how 'key'),
+     *  its figures in the live region. Shown from the pointer ('pointer') or again after a
+     *  redraw ('quiet'), nothing is announced. */
+    function showAt(i, how) {
+      if (!g || i < 0 || i >= hours.length || !g.cols[i]) {
+        hide();
+        return;
+      }
+      idx = i;
+      const x = hours[i];
+      const col = g.cols[i];
+      g.outline.setAttribute('x', (col.x - 2).toFixed(1));
+      g.outline.setAttribute('width', (col.w + 4).toFixed(1));
+      g.outline.setAttribute('visibility', 'visible');
+      replace(tip,
+        h('div', { class: 'tip-time' }, words(x)),
+        h('div', { class: 'tip-utc' }, new Date(x.t).toISOString().slice(0, 16).replace('T', ' ') + ' UTC'),
+        SER.map((se) => h('div', { class: 'tip-row' },
+          s('svg', { class: 'key', viewBox: '0 0 18 10', 'aria-hidden': 'true', focusable: 'false' }, s('rect', { class: se.cls, x: 3, y: 0, width: 12, height: 10, rx: 2 })),
+          h('span', { class: 'val' }, fmtInt(x[se.key])), h('span', { class: 'lab' }, se.label))));
+      placeTip(tip, col.mid, W);
+      if (how === 'key') live.textContent = words(x) + ': ' + SER.map((se) => se.label + ' ' + fmtInt(x[se.key])).join(', ');
+    }
+
+    function hide() {
+      tip.hidden = true;
+      if (g) g.outline.setAttribute('visibility', 'hidden');
+    }
+
+    function nearest(px) {
+      let best = -1;
+      let dist = Infinity;
+      if (!g) return best;
+      g.cols.forEach((col, i) => {
+        if (!col) return;
+        const dd = Math.abs(col.mid - px);
+        if (dd < dist) {
+          dist = dd;
+          best = i;
+        }
+      });
+      return best;
+    }
+
+    plot.addEventListener('pointermove', (e) => {
+      if (!g || !hours.length) return;
+      const x = e.clientX - plot.getBoundingClientRect().left;
+      if (x < g.x0 - 10 || x > g.x1 + 10) {
+        hide();
+        return;
+      }
+      showAt(nearest(x), 'pointer');
+    });
+    plot.addEventListener('pointerleave', hide);
+    plot.addEventListener('focus', () => {
+      if (!hours.length) return;
+      if (idx < 0) idx = hours.length - 1; // not drawn yet: draw shows it
+      showAt(idx, 'key');
+    });
+    plot.addEventListener('blur', hide);
+    plot.addEventListener('keydown', (e) => {
+      const n = hours.length;
+      if (!n) return;
+      let i = idx >= 0 ? idx : n - 1;
+      switch (e.key) {
+        case 'ArrowLeft': i = Math.max(0, i - (e.shiftKey ? 24 : 1)); break;
+        case 'ArrowRight': i = Math.min(n - 1, i + (e.shiftKey ? 24 : 1)); break;
+        case 'Home': i = 0; break;
+        case 'End': i = n - 1; break;
+        case 'Escape': hide(); return;
+        case 't': case 'T': tableBtn.click(); return;
+        default: return;
+      }
+      e.preventDefault();
+      showAt(i, 'key');
+    });
+
+    function applyView() {
+      const on = app.tableViews.has(o.id);
+      tableBtn.setAttribute('aria-pressed', String(on));
+      plot.hidden = on;
+      tableWrap.hidden = !on;
+      if (on && !tableWrap.firstChild) {
+        const rows = hours.slice().reverse().map((x) => [h('span', { title: 'UTC: ' + new Date(x.t).toISOString().slice(0, 16).replace('T', ' ') }, words(x)),
+          fmtInt(x.in), fmtInt(x.out), fmtInt(x.local), fmtInt(x.in + x.out + x.local)]);
+        tableWrap.append(chartTableView(o, [{ label: 'Hour (local)' }, { label: 'Inbound', num: true }, { label: 'Outbound', num: true },
+          { label: 'Gateway itself', num: true }, { label: 'Total', num: true }], rows));
+      }
+      if (!on && plot.clientWidth && Math.round(plot.clientWidth) !== W) draw();
+    }
+    tableBtn.addEventListener('click', () => {
+      if (app.tableViews.has(o.id)) app.tableViews.delete(o.id); else app.tableViews.add(o.id);
+      applyView();
+    });
+    const ro = new ResizeObserver(() => {
+      const w = Math.round(plot.clientWidth);
+      if (w && w !== W) draw();
+    });
+    ro.observe(plot);
+    ctx.cleanup(() => ro.disconnect());
+    applyView();
+
+    return {
+      el: fig,
+      update(d) {
+        const shown = idx >= 0 && hours[idx] ? hours[idx].t : null;
+        from = toMs(d.from);
+        to = toMs(d.to);
+        hours = netList(d.hours).map((x) => ({ t: toMs(x.t), in: Number(x.in) || 0, out: Number(x.out) || 0, local: Number(x.local) || 0 }))
+          .filter((x) => x.t != null).sort((a, b) => a.t - b.t);
+        idx = shown == null ? -1 : hours.findIndex((x) => x.t === shown); // -1: no longer in the period
+        if (idx < 0) hide();
+        const reasons = netList(d.reasons).filter((x) => Number(x.count) > 0);
+        replace(summary, reasons.length ? ['By reason: ', reasons.map((x) => h('span', { class: 'badge', title: x.reason ? 'The gateway’s reason: ' + escapedText(x.reason) : null },
+          netText(x.label || x.reason || '?', 72) + ' ' + fmtInt(x.count)))] : null);
+        summary.hidden = !reasons.length;
+        replace(tableWrap); // made again from these hours when it is shown (applyView)
+        W = 0; // drawn again: now if it is shown, else once it is (applyView, the resize observer)
+        applyView();
+      },
+    };
   }
 
   // ------------------------------------------------------------------ evidence view

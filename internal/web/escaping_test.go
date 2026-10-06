@@ -287,8 +287,15 @@ type dashboardView struct {
 	Timers   int            `json:"timers"`   // timers of a second or more waiting (the flow meter's next reading)
 	Live     []string       `json:"live"`     // the view's live regions, "<aria-live>:<class>"
 	// Focus is where the keyboard focus is: "body" (the start of the page, where a browser puts
-	// it when the element that had it is disabled, hidden or removed), or "<tag>:<its text>".
-	Focus string `json:"focus"`
+	// it when the element that had it is disabled, hidden or removed), "input:<type> <value>"
+	// for a radio button or a checkbox, or "<tag>:<its text>".
+	Focus  string   `json:"focus"`
+	Radios []string `json:"radios"` // the values of the radio buttons checked
+	Forms  []string `json:"forms"`  // the forms shown, by their aria-label (else their class)
+	Hash   string   `json:"hash"`   // the URL's hash when the view was captured
+	// Bars holds the names of each list of ranked bars (by its aria-label), in their order,
+	// also behind a table view.
+	Bars map[string][]string `json:"bars"`
 }
 
 // dashboardButton is one button of a rendered view.
@@ -316,6 +323,9 @@ type dashboardReport struct {
 		Path   string `json:"path"`
 		Status int    `json:"status"`
 	} `json:"requests"`
+	// Facts holds what a scenario's steps observed beyond the views, by name (e.g. "timeline",
+	// the harness's timelineSteps).
+	Facts map[string]json.RawMessage `json:"facts"`
 }
 
 // runHarness drives the dashboard served at base in testdata/dashboard_harness.js.
@@ -483,6 +493,7 @@ func TestDashboardRendersHostileDataAsText(t *testing.T) {
 	rep := runDashboard(t, w, "hostile")
 
 	want := []string{"overview", "overview 7d", "incidents", "incident export", "gateway", "syslog", "syslog more", "syslog severity", "syslog search",
+		"network", "network device", "network search", "network tables", "network firewall",
 		"evidence", "records", "records from genesis", "records config_state"}
 	for name := range rep.Views {
 		if strings.HasPrefix(name, "incident ") && name != "incident export" {
@@ -595,15 +606,18 @@ func TestDashboardCertificateAndAccountingViews(t *testing.T) {
 	contains := viewChecker(t, rep)
 
 	// The certificate banner shows both fingerprints, since when and the evidence record from
-	// the monitor's certificate state (Status.gateway_cert): the record is not read for it.
+	// the monitor's certificate state (Status.gateway_cert): the record is not read for it. It
+	// and the access-code banner name every authenticated request the monitor makes, the NAT
+	// table reads of the Network page included (they stop as well).
 	contains("overview",
 		"Gateway TLS certificate changed — authenticated actions paused",
 		"Status pages are still read and recorded",
-		"authenticated actions — checking or changing the gateway’s outage-redirect and Syslog settings — are paused",
+		"authenticated actions — checking or changing the gateway’s outage-redirect and Syslog settings, and reading its NAT table for the connections on the Network page — are paused",
 		"Pinned until now: "+groupFP(demoCertSHA), "Presented now: "+groupFP(demoNewCertSHA),
 		"Since ", "evidence record #"+certSeq,
 		"Trust the new certificate",
 		"No usable gateway access code", "att-monitor set-access-code",
+		"only checking or changing the gateway’s settings (the outage redirect and the Syslog page) and reading its NAT table (the connections on the Network page) do",
 		"Recent time-stamps could not be verified", "do not count as proof of time",
 		"AT&T-attributed time without Internet", "Degraded",
 		"Classified from: gateway snapshot #", "DNS & web check #", "local link #", "window of 6 cycles",

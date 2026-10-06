@@ -347,6 +347,9 @@ type fakeGateway struct {
 	notifTimes []time.Time
 	setCalls   []bool
 	setErr     error
+	// notifHold, when set, is called before Notification and SetNotification answer (without the
+	// fake's lock held): a test makes them wait.
+	notifHold func()
 	// syslog answers Syslog (nil: the page cannot be read, errNoSyslogPage) and setSyslog answers
 	// SetSyslog (nil: refused, errNoSetSyslog); syslogCalls counts the reads (syslogTimes: when)
 	// and setSyslogWants lists what each SetSyslog asked for (setSyslogTimes: when). newSyslogSim
@@ -357,14 +360,68 @@ type fakeGateway struct {
 	setSyslog      func(want model.SyslogTarget) (before, after []byte, err error)
 	setSyslogWants []model.SyslogTarget
 	setSyslogTimes []time.Time
+	// nat answers NATTable and devices answers Devices (nil: the page is not part of the test,
+	// errNoNATPage / errNoDevicesPage); natTimes and devicesTimes record when each was called.
+	// natCtx and devicesCtx, when set, answer in their place, with the request's context.
+	nat          func() (model.NATTable, []byte, error)
+	natTimes     []time.Time
+	devices      func() ([]model.LANDevice, []byte, error)
+	devicesTimes []time.Time
+	natCtx       func(ctx context.Context) (model.NATTable, []byte, error)
+	devicesCtx   func(ctx context.Context) ([]model.LANDevice, []byte, error)
+	// logins is what LoginAttempts returns (the gateway client's login forms posted): a test's
+	// answer raises it as a login of the real client would.
+	logins atomic.Uint64
 }
 
+// LoginAttempts is the login count the monitor compares around a NAT read.
+func (g *fakeGateway) LoginAttempts() uint64 { return g.logins.Load() }
+
 // errNoSyslogPage and errNoSetSyslog are the fake gateway's answers to Syslog and SetSyslog
-// unless a test sets them.
+// unless a test sets them; errNoNATPage and errNoDevicesPage those to NATTable and Devices.
 var (
-	errNoSyslogPage = errors.New("fake gateway: the Syslog page is not part of this test")
-	errNoSetSyslog  = errors.New("fake gateway: setting the Syslog page is not part of this test")
+	errNoSyslogPage  = errors.New("fake gateway: the Syslog page is not part of this test")
+	errNoSetSyslog   = errors.New("fake gateway: setting the Syslog page is not part of this test")
+	errNoNATPage     = errors.New("fake gateway: the NAT table page is not part of this test")
+	errNoDevicesPage = errors.New("fake gateway: the Device List page is not part of this test")
 )
+
+// NATTable is recorded and answered by natCtx or nat (errNoNATPage without either).
+func (g *fakeGateway) NATTable(ctx context.Context) (model.NATTable, []byte, error) {
+	g.mu.Lock()
+	g.natTimes = append(g.natTimes, time.Now())
+	fn, fnCtx := g.nat, g.natCtx
+	g.mu.Unlock()
+	switch {
+	case fnCtx != nil:
+		return fnCtx(ctx)
+	case fn == nil:
+		return model.NATTable{}, nil, errNoNATPage
+	}
+	return fn()
+}
+
+// Devices is recorded and answered by devicesCtx or devices (errNoDevicesPage without either).
+func (g *fakeGateway) Devices(ctx context.Context) ([]model.LANDevice, []byte, error) {
+	g.mu.Lock()
+	g.devicesTimes = append(g.devicesTimes, time.Now())
+	fn, fnCtx := g.devices, g.devicesCtx
+	g.mu.Unlock()
+	switch {
+	case fnCtx != nil:
+		return fnCtx(ctx)
+	case fn == nil:
+		return nil, nil, errNoDevicesPage
+	}
+	return fn()
+}
+
+// networkReads returns when NATTable and Devices were called.
+func (g *fakeGateway) networkReads() (nat, devices []time.Time) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return slices.Clone(g.natTimes), slices.Clone(g.devicesTimes)
+}
 
 func (g *fakeGateway) Snapshot(ctx context.Context, pages []string, trigger string) (model.GatewaySnapshot, map[string][]byte, error) {
 	g.mu.Lock()
@@ -383,7 +440,18 @@ func (g *fakeGateway) Snapshot(ctx context.Context, pages []string, trigger stri
 	return fn(call, pages, trigger)
 }
 
+// holdNotif calls notifHold, when set.
+func (g *fakeGateway) holdNotif() {
+	g.mu.Lock()
+	hold := g.notifHold
+	g.mu.Unlock()
+	if hold != nil {
+		hold()
+	}
+}
+
 func (g *fakeGateway) Notification(ctx context.Context) (bool, []byte, error) {
+	g.holdNotif()
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.notifCalls++
@@ -398,6 +466,7 @@ func (g *fakeGateway) Notification(ctx context.Context) (bool, []byte, error) {
 }
 
 func (g *fakeGateway) SetNotification(ctx context.Context, enabled bool) ([]byte, []byte, error) {
+	g.holdNotif()
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.setCalls = append(g.setCalls, enabled)

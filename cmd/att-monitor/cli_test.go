@@ -72,6 +72,38 @@ func TestIsDateOnly(t *testing.T) {
 	}
 }
 
+// TestConfigProblem: `att-monitor status` explains a service that does not start because of its
+// configuration - config.json read, but not usable - and says nothing of a usable one (also with a
+// byte order mark, or with Network page settings that are replaced), of none at all, or of one
+// this command cannot read.
+func TestConfigProblem(t *testing.T) {
+	for body, want := range map[string]string{
+		`{"version":1}`:                   "",
+		"\xef\xbb\xbf" + `{"version":1}`:  "",
+		`{"connections":{"keep_days":0}}`: "",
+		`{"gateway":{"host":"gateway"}}`:  "gateway.host must be an IP address",
+		`{"version":`:                     "unexpected end of JSON input",
+	} {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if got := configProblem(dir); want == "" && got != "" || want != "" && !strings.Contains(got, want) {
+			t.Errorf("%s: %q, want %q", body, got, want)
+		}
+	}
+	if p := configProblem(t.TempDir()); p != "" {
+		t.Errorf("no config.json: %q", p)
+	}
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "config.json"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if p := configProblem(dir); p != "" {
+		t.Errorf("unreadable config.json: %q", p)
+	}
+}
+
 // TestMongoCommand: usage errors, and a data directory whose configuration disables the MongoDB
 // copy is reported as such (never a connection attempt to some default server).
 func TestMongoCommand(t *testing.T) {

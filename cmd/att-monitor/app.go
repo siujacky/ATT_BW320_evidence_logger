@@ -15,13 +15,16 @@ import (
 
 	"attmonitor/internal/anchor"
 	"attmonitor/internal/config"
+	"attmonitor/internal/connstore"
 	"attmonitor/internal/contracts"
 	"attmonitor/internal/export"
 	"attmonitor/internal/gateway"
+	"attmonitor/internal/ipintel"
 	"attmonitor/internal/ledger"
 	"attmonitor/internal/model"
 	"attmonitor/internal/mongostore"
 	"attmonitor/internal/monitor"
+	"attmonitor/internal/netmap"
 	"attmonitor/internal/probe"
 	"attmonitor/internal/sysinfo"
 	"attmonitor/internal/syslogrx"
@@ -57,6 +60,15 @@ type stack struct {
 	// otherwise (the CLI, or syslog switched off) it is opened read-only and syslogRx is nil.
 	syslog   *syslogstore.Store
 	syslogRx *syslogrx.Receiver
+	// The dashboard's Network page (docs/DESIGN.md §19), in the service and console
+	// modes only (all nil in the CLI, which reads the page through the running service's API):
+	// conns is the connection store the monitor's samplers write (nil when it cannot be opened),
+	// intel the offline IP database (runMonitor runs it), network the view the dashboard asks,
+	// built over both and the syslog store. None of it is evidence: nothing of it reaches the
+	// ledger, the MongoDB copy or an evidence bundle.
+	conns   *connstore.Store
+	intel   *ipintel.DB
+	network *netmap.View
 }
 
 type stackOptions struct {
@@ -78,10 +90,11 @@ func openStack(o stackOptions) (*stack, error) {
 			return nil, fmt.Errorf("no evidence ledger found in %s (is the service using a different --data directory?)", o.dataDir)
 		}
 	}
-	// The syslog store's folder is left to openSyslog: a problem with it must not keep the
-	// evidence collection from starting.
+	// The syslog store's folder is left to openSyslog, and the Network page's folders to the
+	// connection store and the IP database: a problem with them must not keep the evidence
+	// collection from starting.
 	layout := s.paths
-	layout.Syslog = layout.Root
+	layout.Syslog, layout.Connections, layout.Geo = layout.Root, layout.Root, layout.Root
 	if err := layout.MkdirAll(); err != nil {
 		return nil, fmt.Errorf("data directory %s: %w", o.dataDir, err)
 	}
@@ -91,12 +104,8 @@ func openStack(o stackOptions) (*stack, error) {
 		// created or read. Console mode as a normal user must not lock itself out of its keys.
 		keysACLErr = winsvc.SecurePrivateDir(s.paths.Keys)
 	}
-	cfg, err := config.LoadOrCreate(s.paths.Config)
-	if err != nil {
-		return nil, err
-	}
-	s.cfg = cfg
-
+	// The operational log comes before the configuration, so that a config.json the monitor
+	// cannot work with is explained in logs\service.log too, not only in the Windows Event Log.
 	lg, closeLg, err := newLogger(s.paths.Logs, o.mode, o.console, o.extraLog)
 	if err != nil {
 		return nil, err
@@ -104,6 +113,18 @@ func openStack(o stackOptions) (*stack, error) {
 	s.log, s.closeLg = lg, closeLg
 	if keysACLErr != nil {
 		lg.Error("could not secure the keys directory", "dir", s.paths.Keys, "err", keysACLErr)
+	}
+	cfg, err := config.LoadOrCreate(s.paths.Config)
+	if err != nil {
+		lg.Error("config.json cannot be used: it must be corrected first", "file", s.paths.Config, "err", err)
+		s.close()
+		return nil, err
+	}
+	s.cfg = cfg
+	// A setting of the Network page never stops the start: what could not be used as written was
+	// replaced, and is said here (and in the page's status: networkView).
+	for _, w := range cfg.Warnings() {
+		lg.Warn("config.json: a setting of the Network page is not used as written", "setting", w)
 	}
 
 	s.host = sysinfo.Host()
@@ -135,9 +156,15 @@ func openStack(o stackOptions) (*stack, error) {
 		s.importBootstrapOnce()
 	}
 	// After the ledger: its writer lock keeps a second monitor, and so a second writer of the
-	// syslog store, away.
+	// syslog store and of the connection store, away.
 	s.openSyslog(o.mode)
+	if o.mode != "cli" {
+		s.openNetwork()
+	}
 
+	// The login policy outlives the process (loginpolicy.go): a restart, even in a loop, gives no
+	// new allowance of login attempts.
+	policy, saved := openLoginPolicy(s.paths.State, lg.With("component", "gateway"))
 	s.gw = gateway.New(gateway.Options{
 		Host:             cfg.Gateway.Host,
 		Scheme:           cfg.Gateway.Scheme,
@@ -146,6 +173,8 @@ func openStack(o stackOptions) (*stack, error) {
 		AccessCode:       cfg.AccessCode,
 		UserAgent:        userAgent(),
 		Logger:           lg.With("component", "gateway"),
+		LoginPolicy:      saved,
+		OnLoginPolicy:    policy.save,
 	})
 	s.prober = probe.New(probe.Options{
 		Logger:    lg.With("component", "probe"),
@@ -195,6 +224,7 @@ func openStack(o stackOptions) (*stack, error) {
 		MongoStatus: mongoStatus,
 		Syslog:      s.syslogReceiver(),
 		SyslogStore: s.syslogWriter(),
+		Conns:       s.connStore(),
 	})
 	if err != nil {
 		s.close()
@@ -304,6 +334,110 @@ func (s *stack) syslogReceiver() contracts.SyslogReceiver {
 	return s.syslogRx
 }
 
+// syslogChunks is the syslog store for the Network page's firewall view (nil, an untyped nil,
+// when there is none).
+func (s *stack) syslogChunks() contracts.SyslogChunkSource {
+	if s.syslog == nil {
+		return nil
+	}
+	return s.syslog
+}
+
+// openNetwork opens what the dashboard's Network page reads (docs/DESIGN.md §19) and
+// builds its view: the connection store, the offline IP database and the syslog store. Only the
+// service and console modes call it, after the ledger: the connection store has a single writer
+// (it repairs when it opens, then compresses and prunes in the background), and the ledger lock
+// makes it this process. None of it is evidence, and none of it may keep evidence collection from
+// starting: a part that cannot be opened is logged, and the page shows what the others give; a
+// setting of the page that config.json gives out of range, or in a form that cannot be read, was
+// replaced by config.Load (logged by openStack, and shown by the page's status).
+//
+// The connection store is opened also with connections.enabled off: the monitor's samplers then
+// do not run and its status says so, the page still shows what was recorded before, and the
+// monitor still applies the store's retention limits every hour (and deletes the raw page copies)
+// - nothing would otherwise ever delete the oldest samples. The IP database is opened also with
+// geo.enabled off: it then only classifies addresses and names ports, and its status tells the
+// page why organisations and countries are missing.
+// Open reads nothing and downloads nothing; runMonitor runs it.
+func (s *stack) openNetwork() {
+	cc, gc := s.cfg.Connections, s.cfg.Geo
+	clg := s.log.With("component", "connections")
+	st, err := connstore.Open(s.paths.Connections, connstore.Options{KeepDays: cc.KeepDays, KeepMB: cc.KeepMB, Logger: clg})
+	if err != nil {
+		clg.Error("the Network page runs without connection samples: the connection store cannot be opened", "dir", s.paths.Connections, "err", err)
+	} else {
+		s.conns = st
+	}
+	glg := s.log.With("component", "ipintel")
+	db, err := ipintel.Open(s.paths.Geo, ipintel.Options{
+		Enabled:    gc.Enabled,
+		Download:   gc.Download,
+		URLv4:      gc.URLv4,
+		URLv6:      gc.URLv6,
+		Refresh:    gc.Refresh.Duration,
+		ReverseDNS: cc.ReverseDNS,
+		KeepDays:   cc.KeepDays,
+		UserAgent:  userAgent(),
+		Logger:     glg,
+	})
+	if err != nil {
+		glg.Error("the Network page runs without the IP database: organisations and countries are not shown", "dir", s.paths.Geo, "err", err)
+	} else {
+		s.intel = db
+	}
+	s.network = netmap.New(netmap.Options{
+		Conns:  s.connStore(),
+		Intel:  s.ipIntel(),
+		Syslog: s.syslogChunks(),
+		Logger: s.log.With("component", "network"),
+	})
+}
+
+// connStore is the connection store for the monitor and the network view (nil, an untyped nil,
+// when there is none).
+func (s *stack) connStore() contracts.ConnStore {
+	if s.conns == nil {
+		return nil
+	}
+	return s.conns
+}
+
+// ipIntel is the IP database for the network view (nil, an untyped nil, when there is none).
+func (s *stack) ipIntel() contracts.IPIntel {
+	if s.intel == nil {
+		return nil
+	}
+	return s.intel
+}
+
+// networkView is the Network page's view for the dashboard (nil, an untyped nil, in the CLI:
+// the endpoints then answer 404). When the configuration replaced settings of the page
+// (config.Warnings), its status says which (configWarned), so that GET /api/network/status and
+// `att-monitor network` show it.
+func (s *stack) networkView() contracts.NetworkView {
+	if s.network == nil {
+		return nil
+	}
+	if w := s.cfg.Warnings(); len(w) > 0 {
+		return configWarned{NetworkView: s.network, warnings: w}
+	}
+	return s.network
+}
+
+// configWarned is a network view whose status also carries the configuration's warnings about the
+// Network page's settings (model.NetworkStatus.ConfigWarnings).
+type configWarned struct {
+	contracts.NetworkView
+	warnings []string
+}
+
+// NetworkStatus is the view's status with the warnings (a new slice every time).
+func (v configWarned) NetworkStatus() model.NetworkStatus {
+	ns := v.NetworkView.NetworkStatus()
+	ns.ConfigWarnings = slices.Concat(ns.ConfigWarnings, v.warnings)
+	return ns
+}
+
 // importBootstrapOnce imports cfg.BootstrapDir if no bootstrap_import record exists yet. The
 // import belongs right after genesis, so only the first records are searched; a failed import
 // is retried on the next start instead of being lost.
@@ -349,6 +483,14 @@ func (s *stack) importBootstrapOnce() {
 }
 
 func (s *stack) close() {
+	if s.conns != nil {
+		// The monitor has stopped, and with it the samplers that append: Close releases the day
+		// files being appended to (the network view may still read them).
+		if err := s.conns.Close(); err != nil && s.log != nil {
+			s.log.Error("closing the connection store", "err", err)
+		}
+		s.conns = nil
+	}
 	if s.syslog != nil {
 		// The monitor sealed the open chunk when it stopped; Close releases what is left open (a
 		// chunk the ledger could not record is sealed by the next start's Recover).
@@ -387,6 +529,7 @@ func runMonitor(ctx context.Context, o stackOptions, power <-chan string) error 
 		SyslogReader:  s.syslogReader(),
 		SyslogControl: s.mon,
 		LiveTraffic:   s.mon,
+		Network:       s.networkView(),
 		Version:       version,
 		Logger:        s.log.With("component", "web"),
 	})
@@ -429,6 +572,17 @@ func runMonitor(ctx context.Context, o stackOptions, power <-chan string) error 
 			if err := s.mongo.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
 				s.log.Error("MongoDB copy stopped", "err", err)
 			}
+		}()
+	}
+
+	if s.intel != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// The IP database loads, downloads and looks up reverse DNS names in the background
+			// until the stop, then saves its reverse DNS cache. It never stops evidence collection:
+			// it recovers from its own failures (also a panic) and reports them in its status.
+			s.intel.Run(runCtx)
 		}()
 	}
 

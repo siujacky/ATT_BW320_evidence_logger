@@ -47,9 +47,11 @@ type fakeStatus struct {
 	gotFrom   time.Time
 	gotTo     time.Time
 	panicMsg  string
+	calls     atomic.Int64 // Status calls
 }
 
 func (f *fakeStatus) Status() model.Status {
+	f.calls.Add(1)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.panicMsg != "" {

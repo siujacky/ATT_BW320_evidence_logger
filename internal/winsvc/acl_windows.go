@@ -33,7 +33,7 @@ const (
 // folder are accepted too. A layout folder missing here makes the installer refuse the data
 // directory it has just laid out (SecurePrivateDir checks the keys folder's parent).
 var dataDirEntries = []string{
-	"config.json", "keys", "ledger", "blobs", "exports", "quarantine", "state", "logs", "syslog",
+	"config.json", "keys", "ledger", "blobs", "exports", "quarantine", "state", "logs", "syslog", "connections", "geo",
 	"desktop.ini", "thumbs.db",
 }
 
@@ -56,6 +56,50 @@ var dataDirEntries = []string{
 // are refused rather than having the ACL applied to their target; the ACL is applied through
 // a handle to the checked directory, so the path cannot be swapped for a link in between.
 func SecureDataDir(dir string) error { return secureDir(dir, dataDirSDDL, true) }
+
+// CheckDataDir reports, without creating or changing anything, whether SecureDataDir would refuse
+// dir: the location checks on the path as given, as it resolves on disk and - when dir exists - as
+// the directory's canonical path, then that it is a real directory (not a link or other reparse
+// point) holding only entries of an att-monitor data directory. A missing dir passes (SecureDataDir
+// creates it). The installer runs it before it stops the service or replaces the program, so that a
+// data directory it would refuse - a mistyped --data, or one laid out by a newer version whose
+// folders this version does not know - leaves the installed service as it was. It cannot tell
+// whether the ACL may be written: that needs an elevated caller, which the installer checks first.
+func CheckDataDir(dir string) error {
+	if strings.TrimSpace(dir) == "" {
+		return errors.New("winsvc: check directory: empty path")
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return fmt.Errorf("winsvc: check directory %q: %w", dir, err)
+	}
+	critical := criticalDirsFunc()
+	if err := checkNotCritical(abs, critical); err != nil {
+		return err
+	}
+	if err := checkNotCritical(resolvedPath(abs), critical); err != nil {
+		return err
+	}
+	fi, err := os.Lstat(abs)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return nil
+	case err != nil:
+		return fmt.Errorf("winsvc: %w", err)
+	case fi.Mode()&(fs.ModeSymlink|fs.ModeIrregular) != 0:
+		return fmt.Errorf("winsvc: %s is a link or reparse point; refusing to change its ACL", abs)
+	case !fi.IsDir():
+		return fmt.Errorf("winsvc: %s is not a directory", abs)
+	}
+	final, err := canonicalPath(abs)
+	if err != nil {
+		final = abs // no DOS path (e.g. a volume without a drive letter): checked above
+	}
+	if err := checkNotCritical(final, critical); err != nil {
+		return err
+	}
+	return checkDataDirEntries(final)
+}
 
 // SecurePrivateDir is SecureDataDir without the Users entry: only SYSTEM and Administrators
 // can open the folder. It is meant for folders holding secrets that are protected with

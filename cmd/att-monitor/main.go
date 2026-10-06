@@ -36,6 +36,11 @@ Usage:
                                                the gateway's syslog messages kept on this PC, oldest first
   att-monitor syslog retention [--keep-mb N] [--keep-days D] [--yes] [--data DIR]
                                                how much syslog is kept (100 MiB unless changed)
+  att-monitor network [--range 1h|24h|7d|30d | --from TIME --to TIME] [--device KEY] [--firewall]
+                      [--limit N] [--json] [--data DIR]
+                                               the dashboard's Network page in short (through the service): which
+                                               device talked to which site, or with --firewall what the gateway's
+                                               firewall dropped (not evidence)
   att-monitor verify [--data DIR] [--json]     verify the whole evidence ledger
   att-monitor verify-bundle FILE.zip [--json]  verify an exported evidence bundle
   att-monitor export --from TIME --to TIME [--incident ID] [--prepared-by NAME] [--notes TEXT] [--out DIR] [--data DIR]
@@ -102,6 +107,8 @@ func run(args []string) error {
 		return cmdGateway(rest)
 	case "syslog":
 		return cmdSyslog(rest)
+	case "network":
+		return cmdNetwork(rest)
 	case "verify":
 		return cmdVerify(rest)
 	case "verify-bundle":

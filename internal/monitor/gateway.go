@@ -80,8 +80,8 @@ func (m *Monitor) pagesFor(trigger string, at time.Time) []string {
 // then records the gateway events it reveals. target is the incident whose close procedure
 // asked for it (nil for routine polls). It returns nil when nothing was recorded.
 func (m *Monitor) takeSnapshot(ctx context.Context, trigger string, target *incState) *snapObs {
-	m.gwMu.Lock()
-	defer m.gwMu.Unlock()
+	m.lockGateway(gwUseSnapshot)
+	defer m.unlockGateway()
 	if ctx.Err() != nil {
 		return nil
 	}
@@ -363,10 +363,43 @@ func (m *Monitor) restartBootsLocked() []time.Time {
 	return out
 }
 
+// What the monitor uses the gateway for while it holds the gateway lock (lockGateway), in the
+// words of the reason a flow-meter read skipped meanwhile gives: "the monitor was <use>"
+// (errLiveBusy). The snapshots and the settings are recorded in the ledger; the Network page's
+// reads never are, so their words do not speak of the evidence.
+const (
+	gwUseSnapshot  = "taking a snapshot of the gateway for its evidence"
+	gwUseNotif     = "checking the gateway's outage-redirect setting"
+	gwUseSetNotif  = "changing the gateway's outage-redirect setting"
+	gwUseSyslog    = "checking the gateway's Syslog setting"
+	gwUseSetSyslog = "changing the gateway's Syslog setting"
+	gwUseNAT       = "reading the gateway's NAT table for the Network page"
+	gwUseDevices   = "reading the gateway's Device List for the Network page"
+)
+
+// lockGateway takes the gateway lock (gwMu: one request to the gateway at a time) for use - one of
+// the gwUse words - and names that use (Monitor.gwUse) until unlockGateway releases the lock.
+// Every holder of the lock takes it here except the flow meter, which never waits for it: a
+// flow-meter read skipped because the lock is held says what holds it (errLiveBusy), which may be
+// a snapshot for the evidence, a settings check or a read for the Network page - a NAT read holds
+// the lock for up to natTimeout, a login included.
+func (m *Monitor) lockGateway(use string) {
+	m.gwMu.Lock()
+	m.gwUse.Store(&use)
+}
+
+// unlockGateway releases the gateway lock that lockGateway took. The use is cleared before the
+// lock is released, so that it never clears the use of the next holder.
+func (m *Monitor) unlockGateway() {
+	m.gwUse.Store(nil)
+	m.gwMu.Unlock()
+}
+
 // withGatewayAuth runs an authenticated gateway operation holding the gateway lock (one
-// gateway session at a time; released even if the gateway client panics). While it runs,
-// the certificate observer knows that a TLS handshake belongs to a login: a changed
-// certificate is then refused, so the login hash never reaches an unconfirmed host.
+// gateway session at a time; released even if the gateway client panics), taken for use
+// (lockGateway: what the operation is). While it runs, the certificate observer knows that a
+// TLS handshake belongs to a login: a changed certificate is then refused, so the login hash
+// never reaches an unconfirmed host.
 //
 // While a changed gateway certificate waits for the operator's confirmation the operation is
 // refused (errCertPending) and f does not run, whatever its caller checked before: a status
@@ -377,9 +410,9 @@ func (m *Monitor) restartBootsLocked() []time.Time {
 // certificate by then; and the flag is raised in the same cfgMu critical section as the
 // pending certificate is read, in which the observer reads the flag: a certificate accepted
 // for a status read is pending by the check, and one met later is refused.
-func (m *Monitor) withGatewayAuth(f func()) error {
-	m.gwMu.Lock()
-	defer m.gwMu.Unlock()
+func (m *Monitor) withGatewayAuth(use string, f func()) error {
+	m.lockGateway(use)
+	defer m.unlockGateway()
 	m.cfgMu.Lock()
 	m.gwAuth.Store(true)
 	pending := m.cfg.Gateway.PendingCertSHA256
@@ -552,6 +585,16 @@ func (m *Monitor) observeCert(previous, observed string) bool {
 // never trusted in its place: such a mismatch changes nothing and matches contracts.ErrBusy,
 // naming both fingerprints. "" trusts whatever is pending (the CLI without the service, older
 // clients).
+//
+// The pin moves before its config_change is written, and moves back when that record fails: in
+// between, no authenticated request may start, or the login could go to the new certificate
+// before the ledger says it was trusted - or when it never will, once the move is undone.
+// withGatewayAuth cannot tell (nothing is pending any more), so TrustCert keeps the requests out
+// with locks, both held until the change is recorded or undone: notifMu keeps out the settings
+// check and the operator's changes of a gateway setting, certMu - held exclusively - the NAT
+// sampler's reads (connections.go), which hold it shared and never wait for it. A NAT read in
+// progress is waited for: the pin never moves under it. TrustCert never takes the gateway lock,
+// which such a read may hold or wait for.
 func (m *Monitor) TrustCert(ctx context.Context, actor, expectedSHA256 string) (model.ConfigChange, error) {
 	actor, err := label("actor", actor)
 	if err != nil {
@@ -561,8 +604,10 @@ func (m *Monitor) TrustCert(ctx context.Context, actor, expectedSHA256 string) (
 		actor = "operator"
 	}
 	expected := normalizeFingerprint(expectedSHA256)
-	m.notifMu.Lock() // no authenticated operation may start half-way through the change
+	m.notifMu.Lock() // no settings check or operator change may run half-way through the change
 	defer m.notifMu.Unlock()
+	m.certMu.Lock() // nor may a NAT read (which does not take notifMu)
+	defer m.certMu.Unlock()
 	m.cfgMu.Lock()
 	pinned, pending := m.cfg.Gateway.PinnedCertSHA256, m.cfg.Gateway.PendingCertSHA256
 	if pending == "" {
@@ -632,7 +677,10 @@ func (m *Monitor) enforceNotificationOff() bool {
 // often than notifMinInterval). When this computer's address toward the gateway changes
 // (kickAddressChange) the check runs again within minutes: once notifMinInterval has passed
 // since this run's latest check - after a failed one, once its back-off (notifRetryAfter) has -
-// and never before the startup check, which reads the current settings anyway.
+// and never before the startup check, which reads the current settings anyway. The first NAT read
+// for the Network page waits for the startup check (startupCheckDone), whose login session it then
+// reuses; a check whose login the gateway rejected stops the NAT reads as their own rejection would
+// (natStopAfterRejection).
 func (m *Monitor) notificationLoop(ctx context.Context) {
 	next := time.Now().Add(m.notificationStartDelay())
 	var (
@@ -660,6 +708,7 @@ func (m *Monitor) notificationLoop(ctx context.Context) {
 		interval := max(m.set.notifInterval, m.notifMinInterval)
 		if !m.hasAccessCode() {
 			next, recheck = time.Now().Add(interval), false
+			m.startupCheckDone() // nothing to check: the NAT reads need not wait for it
 			continue
 		}
 		why := ""
@@ -674,6 +723,10 @@ func (m *Monitor) notificationLoop(ctx context.Context) {
 		}
 		// Persist the check time now: a restart (even after a crash) must honour the floor.
 		m.writeCache()
+		if errors.Is(err, contracts.ErrGatewayAuth) {
+			m.natStopAfterRejection(err) // the NAT reads would only use up the login attempts left
+		}
+		m.startupCheckDone()
 		last, lastErr = time.Now(), err
 		if err != nil {
 			interval = m.notifRetryAfter(err) // retry later, but never sooner than the floor
@@ -706,6 +759,12 @@ func (m *Monitor) notifRetryAfter(err error) time.Duration {
 // evidence that the outage redirect stayed as recorded (at most one per 24 h).
 const notifConfirmEvery = 24 * time.Hour
 
+// startupCheckDone notes that this run's startup settings check has been made, or that there was
+// nothing to check (startupChecked); the later checks change nothing.
+func (m *Monitor) startupCheckDone() {
+	m.startupCheckedOnce.Do(func() { close(m.startupChecked) })
+}
+
 // notificationStartDelay keeps the floor between authenticated gateway requests across
 // restarts: the startup check waits until notifMinInterval has passed since the last check
 // known from the ledger or the state cache (at most notifMinInterval, whatever the clock says).
@@ -734,8 +793,10 @@ func (m *Monitor) checkNotification(ctx context.Context) error { return m.checkS
 // Syslog page, or a failed attempt to set it, waits for the next check (Status.Syslog and
 // SYSLOG_SETTING_FAILED say why), so that it never adds logins. why (may be "") says what asked
 // for the check. It holds notifMu so that an operator's SetGatewayNotification or
-// SetGatewaySyslog cannot interleave with the read-then-enforce sequence. While a changed
-// gateway certificate waits for confirmation - also one a status read met after the check
+// SetGatewaySyslog cannot interleave with the read-then-enforce sequence (nor TrustCert). A NAT
+// read for the Network page does not take notifMu - it changes no setting - so the check waits
+// for one in progress at the gateway lock, and one may run between the check's requests. While a
+// changed gateway certificate waits for confirmation - also one a status read met after the check
 // began, which pauses the authenticated requests that follow (withGatewayAuth) - the settings
 // are not checked further.
 func (m *Monitor) checkSettings(ctx context.Context, why string) error {
@@ -785,7 +846,7 @@ func (m *Monitor) readNotification(ctx context.Context) (read bool, err error) {
 		enabled bool
 		raw     []byte
 	)
-	if aerr := m.withGatewayAuth(func() {
+	if aerr := m.withGatewayAuth(gwUseNotif, func() {
 		nctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer cancel()
 		enabled, raw, err = m.gw.Notification(nctx)
@@ -875,7 +936,7 @@ func (m *Monitor) setNotification(ctx context.Context, enabled bool, actor strin
 		before, after []byte
 		err           error
 	)
-	if aerr := m.withGatewayAuth(func() {
+	if aerr := m.withGatewayAuth(gwUseSetNotif, func() {
 		sctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer cancel()
 		before, after, err = m.gw.SetNotification(sctx, enabled)

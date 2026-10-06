@@ -14,7 +14,8 @@ package web
 // /demo/noaccess and /demo/anchoruntrusted show those conditions, /demo/syslog?state=... the
 // gateway syslog card's other states, /demo/syslogfail?on=gateway|record a failing change of
 // the gateway's Syslog setting, /demo/syslogflood a flood of datagrams of control
-// characters, /demo/live?state=... the flow meter's, /demo/quit stops
+// characters, /demo/live?state=... the flow meter's, /demo/network?state=... the Network page's
+// (demonet_test.go), /demo/quit stops
 // the server (see TestDemoServer for the others). ATTMON_WEB_DEMO_STATE=outage starts in outage mode;
 // ATTMON_WEB_DEMO_HOSTILE=1 appends "<img src=x onerror=alert(1)>" to every remote-controlled
 // string (gateway values, DNS answers, TSA names, notes, ...) to check that all of it is
@@ -240,6 +241,9 @@ type demoWorld struct {
 	// (a big download: the gateway's 32-bit counter may have wrapped), "error" (the newest read
 	// of the counters failed), "first" (one reading so far: no rate yet) or "unavailable".
 	liveState string
+	// netState is the Network page's state (demonet_test.go): "" (the household's traffic) or
+	// one of off, paused, noaccess, nosamples, noipdb, nosyslog, nodrops, unavailable.
+	netState string
 }
 
 // demoChunk is a chunk of the demo's syslog store: the messages in the order they were
@@ -426,6 +430,7 @@ var hostileKeep = map[string]bool{
 	"gen_time": true, "checked_at": true, "first_ts": true, "last_ts": true, "genesis_ts": true, "head_ts": true,
 	"last_anchor_time": true, "from": true, "to": true, "boot_time_estimate": true, "mod_time": true, "boot_time": true,
 	"rx": true, "last_at": true, "gateway_at": true, "day": true, "oldest": true, "newest": true,
+	"nat_at": true, "nat_next": true, "devices_at": true, "interval": true, "devices_interval": true, // the monitor's own times
 
 	"state": true, "cause": true, "causes": true, "attribution": true, "type": true, "kind": true, "role": true,
 	"code": true, "severity": true, "rules": true, "from_state": true, "to_state": true, "from_cause": true,
@@ -2778,6 +2783,7 @@ func (w *demoWorld) Status() model.Status {
 	if f := w.syslogSetFail; f != nil { // the monitor's wording (internal/monitor syslogFailWords)
 		st.Conditions = append(st.Conditions, f.cond)
 	}
+	st.Connections = w.connSamplersLocked(now)
 	return hostileCopy(w.hostile, st)
 }
 
@@ -3320,12 +3326,12 @@ func newDemoServer(t *testing.T, w *demoWorld, logger *slog.Logger) *Server {
 	return newDemoServerOn(t, w, demoHost, logger)
 }
 
-// newDemoServerOn serves w as the monitor, its ledger, syslog store and flow meter, for the
-// dashboard on listen.
+// newDemoServerOn serves w as the monitor, its ledger, syslog store, flow meter and Network
+// page, for the dashboard on listen.
 func newDemoServerOn(t *testing.T, w *demoWorld, listen string, logger *slog.Logger) *Server {
 	t.Helper()
 	srv, err := New(Options{Listen: listen, Status: w, Actions: w, Reader: w, Verifier: w, Exporter: w,
-		SyslogReader: w, SyslogControl: w, LiveTraffic: w, Version: "demo", Logger: logger})
+		SyslogReader: w, SyslogControl: w, LiveTraffic: w, Network: w, Version: "demo", Logger: logger})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3894,6 +3900,8 @@ func TestDemoWorldEndpoints(t *testing.T) {
 	}
 	ok(demoGet(t, h, "POST", "/api/syslog/retention", `{"keep_mb":0}`), 400)
 
+	checkDemoNetwork(t, w, h, ok, strict)
+
 	strict(ok(demoGet(t, h, "POST", "/api/verify", ""), 200), &rep)
 	if !rep.OK {
 		t.Fatalf("ledger does not verify after actions: %+v", rep.Failures)
@@ -4083,6 +4091,14 @@ func TestDemoServer(t *testing.T) {
 	mux.HandleFunc("/demo/live", func(rw http.ResponseWriter, r *http.Request) {
 		w.mu.Lock()
 		w.liveState = r.URL.Query().Get("state")
+		w.mu.Unlock()
+		fmt.Fprintln(rw, "ok")
+	})
+	// /demo/network?state=off|paused|noaccess|nosamples|natnote|busy|noipdb|nosyslog|nodrops|unavailable shows
+	// the Network page in that state (no state: the household's traffic).
+	mux.HandleFunc("/demo/network", func(rw http.ResponseWriter, r *http.Request) {
+		w.mu.Lock()
+		w.netState = r.URL.Query().Get("state")
 		w.mu.Unlock()
 		fmt.Fprintln(rw, "ok")
 	})

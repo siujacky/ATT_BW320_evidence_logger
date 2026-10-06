@@ -13,8 +13,10 @@
  * it through the dialog on the overview), "overview" (the overview and the Syslog page only),
  * "syslog" (the flow meter's polling while the overview is shown, hidden and left, then the
  * Syslog page's retention form), "gwsyslog" (the control of the gateway's Syslog setting on the
- * Syslog page and the overview) and "gwsyslogon" / "gwsyslogoff" (one change of that setting on
- * the Syslog page); any other name visits every view.
+ * Syslog page and the overview), "gwsyslogon" / "gwsyslogoff" (one change of that setting on
+ * the Syslog page), "network" (the Network page only, used as networkSteps does) and
+ * "networktabs" (its two tabs as they first show); any other name visits every view, the Network
+ * page included.
  *
  * Timers of a second or more (the flow meter's polling) do not run by themselves: the harness
  * fires them (fireLongTimers), so that a test sees exactly which requests a poll makes.
@@ -40,6 +42,7 @@ const errors = [];
 const requests = [];
 const dialogs = [];
 const views = {};
+const facts = {}; // what a scenario's steps observed beyond the views (e.g. timelineSteps)
 
 process.on('unhandledRejection', (e) => errors.push('unhandled rejection: ' + ((e && e.stack) || e)));
 process.on('uncaughtException', (e) => errors.push('uncaught exception: ' + ((e && e.stack) || e)));
@@ -297,6 +300,22 @@ for (const p of ['hidden', 'disabled', 'open', 'required']) {
   });
 }
 
+// checked: checking a radio button unchecks the other radio buttons of its group (the same name,
+// in the same tree), as in a browser, so that a test sees which one a period control claims.
+Object.defineProperty(FakeElement.prototype, 'checked', {
+  get() { return !!this.isChecked; },
+  set(v) {
+    this.isChecked = !!v;
+    if (!v || this.localName !== 'input' || this.getAttribute('type') !== 'radio' || !this.getAttribute('name')) return;
+    const name = this.getAttribute('name');
+    let root = this;
+    while (root.parentNode) root = root.parentNode;
+    walkElements(root, (e) => {
+      if (e !== this && e.localName === 'input' && e.getAttribute('type') === 'radio' && e.getAttribute('name') === name) e.isChecked = false;
+    });
+  },
+});
+
 class FakeDocument extends FakeNode {
   constructor() {
     super(9);
@@ -432,7 +451,7 @@ function el(tag, attrs, ...kids) {
 }
 
 document.head.append(el('meta', { name: 'att-monitor-version', content: 'harness' }));
-const navItems = ['overview', 'incidents', 'gateway', 'syslog', 'evidence', 'records'].map((r) => {
+const navItems = ['overview', 'incidents', 'gateway', 'syslog', 'network', 'evidence', 'records'].map((r) => {
   const a = el('a', { href: r === 'overview' ? '#/' : '#/' + r }, r);
   a.dataset.route = r;
   return el('li', null, a);
@@ -531,7 +550,7 @@ const ALLOWED_TAGS = new Set([
   'a', 'button', 'caption', 'code', 'datalist', 'dd', 'details', 'dialog', 'div', 'dl', 'dt', 'figcaption',
   'figure', 'form', 'h1', 'h2', 'h3', 'h4', 'input', 'label', 'li', 'ol', 'option', 'p', 'pre', 'section',
   'select', 'span', 'strong', 'summary', 'table', 'tbody', 'td', 'textarea', 'th', 'thead', 'time', 'tr', 'ul',
-  'svg', 'g', 'path', 'circle', 'line', 'rect', 'text',
+  'svg', 'g', 'path', 'circle', 'line', 'rect', 'text', 'tspan',
 ]);
 const URL_ATTRS = new Set(['href', 'src', 'action', 'formaction', 'xlink:href', 'srcset', 'poster', 'ping', 'background', 'cite', 'data', 'codebase', 'manifest']);
 const JS_ERROR = /TypeError|ReferenceError|SyntaxError|RangeError|is not a function|is not defined|is not iterable|Cannot read prop|Cannot set prop|undefined is not|null is not/;
@@ -562,11 +581,14 @@ function shownEl(e) {
   return true;
 }
 
-/** focusOf describes the element with the keyboard focus: "body" (the start of the page), or
- *  "<tag>:<its text>". */
+/** focusOf describes the element with the keyboard focus: "body" (the start of the page),
+ *  "input:<type> <value>" for a radio button or a checkbox, or "<tag>:<its text>". */
 function focusOf() {
   const e = document.activeElement;
-  return e === document.body ? 'body' : e.localName + ':' + e.textContent.trim().slice(0, 300);
+  if (e === document.body) return 'body';
+  const type = e.localName === 'input' ? e.getAttribute('type') || 'text' : '';
+  if (type === 'radio' || type === 'checkbox') return 'input:' + type + ' ' + (e.getAttribute('value') || '');
+  return e.localName + ':' + e.textContent.trim().slice(0, 300);
 }
 
 /** chipOf describes a status chip as "<tone>:<label>" (e.g. "critical:NXDOMAIN"). */
@@ -615,6 +637,15 @@ function capture(name) {
     timers: longTimers.size,
     // The live regions the view's text is in (none for the flow meter's numbers).
     live: view().querySelectorAll('[aria-live]').map((e) => e.getAttribute('aria-live') + ':' + (e.className || e.localName)),
+    // The radio buttons checked (their values), the forms shown (their labels) and the URL's
+    // hash: which period a period control claims, and which one the page is on.
+    radios: view().querySelectorAll('input').filter((e) => e.getAttribute('type') === 'radio' && e.checked).map((e) => e.getAttribute('value') || ''),
+    forms: view().querySelectorAll('form').filter(shownEl).map((f) => f.getAttribute('aria-label') || f.className),
+    hash: location.hash,
+    // The names of each list of ranked bars (by its aria-label), in their order: shown or not
+    // (behind a table view), the labels a reader gets.
+    bars: Object.fromEntries(view().querySelectorAll('ol.bars').map((ol) => [ol.getAttribute('aria-label') || '',
+      ol.querySelectorAll('.bar-name').map((e) => e.textContent)])),
   };
 }
 
@@ -809,6 +840,169 @@ async function gwSyslogScenario() {
   capture('overview stopped');
 }
 
+function key(el, k, shiftKey) {
+  if (el) el.dispatchEvent(new FakeEvent('keydown', { key: k, shiftKey: !!shiftKey }));
+}
+
+function radio(value) {
+  const r = view().querySelector('input[value="' + value + '"]');
+  if (!r) {
+    errors.push('no radio button ' + value);
+    return;
+  }
+  r.checked = true;
+  r.dispatchEvent(new FakeEvent('change'));
+}
+
+/** timelineSteps reads the Firewall tab's "Blocked per hour" from the keyboard across the page's
+ *  refresh every minute: focused (the last hour), five hours back, the refresh, one more hour
+ *  back. At each step it notes (facts.timeline) the hour shown (the tooltip's UTC line), the
+ *  text of the chart's live region and how many times it was written, and whether the chart
+ *  has the keyboard focus; the plot and its live region are looked up again at each step. */
+async function timelineSteps() {
+  const plotOf = () => view().querySelector('[data-fk="net-fw-hours:plot"]');
+  const liveOf = (p) => {
+    const fig = p && p.closest('figure');
+    return fig ? fig.querySelector('[aria-live]') : null;
+  };
+  const plot = plotOf();
+  const live = liveOf(plot);
+  if (!plot || !live) {
+    errors.push('the firewall timeline has no plot or no live region');
+    return;
+  }
+  let writes = 0;
+  const text = Object.getOwnPropertyDescriptor(FakeNode.prototype, 'textContent');
+  Object.defineProperty(live, 'textContent', {
+    configurable: true,
+    get() { return text.get.call(this); },
+    set(v) {
+      writes++;
+      text.set.call(this, v);
+    },
+  });
+  const steps = [];
+  const note = (step) => {
+    const p = plotOf();
+    const tip = p && p.querySelector('.tip');
+    const utc = tip && !tip.hidden ? tip.querySelector('.tip-utc') : null;
+    const l = liveOf(p);
+    steps.push({ step, utc: utc ? utc.textContent : '', live: l ? l.textContent : '', writes, focused: !!p && document.activeElement === p, same: p === plot });
+  };
+  plot.focus();
+  note('focus');
+  for (let i = 0; i < 5; i++) key(document.activeElement, 'ArrowLeft');
+  note('back 5');
+  await refresh();
+  note('refresh');
+  key(document.activeElement, 'ArrowLeft');
+  note('back 1');
+  key(document.activeElement, 'Escape');
+  const p = plotOf();
+  if (p) p.blur();
+  facts.timeline = steps;
+}
+
+/** networkSteps visits the Network page as a keyboard user: the Connections tab (the flow
+ *  diagram's nodes - moved through with the arrow keys, a device shown alone with Enter, then
+ *  every device again -, the world map read from the keyboard, the table's search, sort and
+ *  "Show all", every Table view, a custom period - its form opened, cancelled, opened again and
+ *  applied, then refused), then the Firewall tab (its timeline across a refresh, timelineSteps). */
+async function networkSteps() {
+  await visit('#/network?range=24h');
+  capture('network');
+  const first = view().querySelector('g.sk-node');
+  if (!first) {
+    errors.push('the flow diagram has no node');
+  } else {
+    first.focus();
+    for (const k of ['ArrowDown', 'ArrowDown', 'ArrowUp', 'End', 'Home', 'ArrowRight', 'ArrowDown', 'ArrowRight', 'ArrowLeft', 'ArrowLeft', 'Escape']) {
+      key(document.activeElement, k);
+    }
+    capture('network keys');
+    const dev = view().querySelectorAll('g.sk-node').find((g) => g.getAttribute('role') === 'button' && g.getAttribute('aria-pressed') === 'false');
+    if (dev) {
+      dev.focus();
+      key(dev, 'Enter');
+      await settle();
+      capture('network device');
+      const all = button('Show every device');
+      if (all) {
+        all.focus();
+        all.click();
+        await settle();
+      } else {
+        errors.push('no "Show every device" after a device was chosen');
+      }
+      capture('network every device');
+    }
+  }
+  const map = view().querySelector('.map-plot');
+  if (map) {
+    map.focus();
+    for (const k of ['ArrowRight', 'ArrowRight', 'End', 'ArrowLeft', 'Home']) key(map, k);
+    map.blur();
+  }
+  const box = view().querySelector('input[type="search"]');
+  if (box) {
+    box.value = 'google';
+    box.dispatchEvent(new FakeEvent('input'));
+    await tick(300);
+    capture('network search');
+    box.value = '';
+    box.dispatchEvent(new FakeEvent('input'));
+    await tick(300);
+  }
+  for (const label of ['Remote address', 'Device', 'Last seen']) {
+    const b = view().querySelectorAll('button.th-sort').find((x) => x.textContent.startsWith(label));
+    if (!b) {
+      errors.push('no sort button ' + label);
+      continue;
+    }
+    b.focus();
+    b.click();
+    await tick(20);
+  }
+  capture('network sorted');
+  if (button('Show all')) {
+    await press('Show all');
+    capture('network all rows');
+  }
+  for (const b of view().querySelectorAll('figure button')) if (b.textContent === 'Table') b.click();
+  await settle();
+  capture('network tables');
+  for (const b of view().querySelectorAll('figure button')) if (b.textContent === 'Table') b.click();
+  radio('custom');
+  await settle();
+  capture('network custom open');
+  if (await press('Cancel')) capture('network custom cancelled');
+  radio('custom');
+  await settle();
+  const form = view().querySelector('form.net-custom');
+  if (form) {
+    const [from, to] = form.querySelectorAll('input');
+    const pad = (n) => String(n).padStart(2, '0');
+    const local = (d) => d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+    from.value = local(new Date(Date.now() - 3 * 86400e3));
+    to.value = local(new Date(Date.now() - 2 * 86400e3));
+    await submit(form);
+    capture('network custom');
+    from.value = to.value;
+    await submit(form);
+    capture('network custom refused');
+  } else {
+    errors.push('no custom period form');
+  }
+  await visit('#/network/firewall?range=7d');
+  await timelineSteps();
+  exerciseCharts();
+  await settle();
+  capture('network firewall');
+  radio('1h');
+  await settle();
+  capture('network firewall 1h');
+}
+
 async function run() {
   const res = await fetch(new URL('/static/app.js', base));
   const code = await res.text();
@@ -826,6 +1020,17 @@ async function run() {
   }
   if (scenario === 'syslog') {
     await syslogScenario();
+    return;
+  }
+  if (scenario === 'network') {
+    await networkSteps();
+    return;
+  }
+  if (scenario === 'networktabs') { // both tabs of the Network page as they first show
+    await visit('#/network?range=24h');
+    capture('network');
+    await visit('#/network/firewall?range=24h');
+    capture('network firewall');
     return;
   }
   if (scenario === 'gwsyslog') {
@@ -913,6 +1118,17 @@ async function run() {
     capture('syslog search');
   }
 
+  // The Network page: used in full with hostile data, else its two tabs as they first show
+  // (TestDashboardNetworkPage uses it in full with the demo's own data).
+  if (scenario === 'hostile') {
+    await networkSteps();
+  } else {
+    await visit('#/network?range=24h');
+    capture('network');
+    await visit('#/network/firewall?range=24h');
+    capture('network firewall');
+  }
+
   await visit('#/evidence');
   await press('Verify the whole ledger now');
   await openAllDetails();
@@ -938,6 +1154,6 @@ async function run() {
 run()
   .catch((e) => errors.push('harness: ' + ((e && e.stack) || e)))
   .finally(() => {
-    process.stdout.write(JSON.stringify({ views, dialogs, violations, errors, requests }) + '\n');
+    process.stdout.write(JSON.stringify({ views, dialogs, violations, errors, requests, facts }) + '\n');
     process.exit(0);
   });

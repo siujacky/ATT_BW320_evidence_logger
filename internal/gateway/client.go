@@ -30,8 +30,11 @@ const (
 	DefaultHost      = "192.168.1.254"
 	DefaultTimeout   = 20 * time.Second // lanstatistics takes ~9 s on firmware 6.34.7
 	DefaultUserAgent = "att-monitor/dev"
-	// MaxBodyBytes caps every response body (bytes beyond it are not read).
+	// MaxBodyBytes caps every response body (bytes beyond it are not read) but the NAT table's.
 	MaxBodyBytes = 4 << 20
+	// NATMaxBodyBytes caps the NAT table page, whose size grows with the connections the gateway
+	// translates (a few hundred bytes of markup each, up to the gateway's limit of about 8,000).
+	NATMaxBodyBytes = 16 << 20
 )
 
 var _ contracts.Gateway = (*Client)(nil)
@@ -48,6 +51,13 @@ type Options struct {
 	Location         *time.Location // gateway clock zone (default time.Local)
 	Logger           *slog.Logger
 	HTTPClient       *http.Client // tests only; nil -> built-in client with pinning
+	// LoginPolicy restores the login policy's state that an earlier process saved through
+	// OnLoginPolicy (docs/DESIGN.md §2: a service restarting in a loop gets no new allowance of
+	// login attempts with every start). OnLoginPolicy, when set, is called with that state after
+	// every change of it - a login attempt begins, is rejected or works, the session pool is found
+	// full - so that it can be saved; the calls are serialized, without the client's locks held.
+	LoginPolicy   LoginPolicy
+	OnLoginPolicy func(LoginPolicy)
 }
 
 // Client implements contracts.Gateway for the AT&T BGW320. It is safe for concurrent use;
@@ -62,6 +72,7 @@ type Client struct {
 	loc        *time.Location
 	log        *slog.Logger
 	maxBody    int64
+	natMaxBody int64 // the NAT table page's cap (bodyCap)
 
 	base       *http.Client // template: transport (pinning) + no redirects
 	snapClient *http.Client // unauthenticated status pages (persistent cookie jar)
@@ -72,6 +83,12 @@ type Client struct {
 	pin      string
 	observer contracts.CertObserver
 	auth     authState // login policy and session (see auth.go)
+
+	// onPolicy is Options.OnLoginPolicy; policyMu serializes its calls (policyChanged).
+	// loginPosts counts the login forms posted (LoginAttempts).
+	onPolicy   func(LoginPolicy)
+	policyMu   sync.Mutex
+	loginPosts atomic.Uint64
 
 	authSem          chan struct{} // serializes authenticated operations
 	handshakeBackoff time.Duration // base delay between login handshake GETs
@@ -89,7 +106,9 @@ func New(opts Options) *Client {
 		loc:              opts.Location,
 		log:              opts.Logger,
 		maxBody:          MaxBodyBytes,
+		natMaxBody:       NATMaxBodyBytes,
 		pin:              normalizePin(opts.PinnedCertSHA256),
+		onPolicy:         opts.OnLoginPolicy,
 		authSem:          make(chan struct{}, 1),
 		handshakeBackoff: 250 * time.Millisecond,
 	}
@@ -114,6 +133,7 @@ func New(opts Options) *Client {
 	if c.log == nil {
 		c.log = slog.New(slog.DiscardHandler)
 	}
+	c.restorePolicy(opts.LoginPolicy, c.now())
 	if c.pin != "" && !isHexDigest(c.pin) {
 		c.log.Warn("configured gateway certificate pin is not a SHA-256 fingerprint; it cannot match, so every certificate goes to the pin policy",
 			"pin", c.pin)
@@ -446,10 +466,15 @@ func validPage(p string) bool {
 	return true
 }
 
-// do performs one request with the per-request timeout and body cap. form, when not empty,
-// is sent as an application/x-www-form-urlencoded POST body. Nothing about the request body
-// is ever logged or put into errors.
+// do performs one request with the per-request timeout and body cap (maxBody). form, when not
+// empty, is sent as an application/x-www-form-urlencoded POST body. Nothing about the request
+// body is ever logged or put into errors.
 func (c *Client) do(ctx context.Context, hc *http.Client, method, rawURL, form, referer string) exchange {
+	return c.doLimit(ctx, hc, method, rawURL, form, referer, c.maxBody)
+}
+
+// doLimit is do with its own body cap: at most maxBody bytes of the body are read.
+func (c *Client) doLimit(ctx context.Context, hc *http.Client, method, rawURL, form, referer string, maxBody int64) exchange {
 	var ex exchange
 	rec := &certRecorder{}
 	var connected atomic.Bool
@@ -501,12 +526,12 @@ func (c *Client) do(ctx context.Context, hc *http.Client, method, rawURL, form, 
 	if ex.cert == "" && resp.TLS != nil && len(resp.TLS.PeerCertificates) > 0 {
 		ex.cert = certHash(resp.TLS.PeerCertificates[0].Raw) // custom Options.HTTPClient
 	}
-	b, rerr := io.ReadAll(io.LimitReader(resp.Body, c.maxBody+1))
+	b, rerr := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 	switch {
-	case int64(len(b)) > c.maxBody:
-		b = b[:c.maxBody]
+	case int64(len(b)) > maxBody:
+		b = b[:maxBody]
 		ex.truncated = true
-		ex.err = fmt.Errorf("response body exceeds %d bytes (truncated)", c.maxBody)
+		ex.err = fmt.Errorf("response body exceeds %d bytes (truncated)", maxBody)
 	case rerr != nil:
 		ex.err = fmt.Errorf("reading response body: %w", rerr)
 	}
