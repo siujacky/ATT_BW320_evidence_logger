@@ -1663,6 +1663,11 @@
    *  every record with its exact signed bytes; the signed ledger stays the source of truth. */
   function mongoCell(m) {
     const upTo = m.has_data ? ` · copied up to #${fmtInt(m.last_seq)}` : '';
+    if (!m.connected && !m.has_data) {
+      // Not reached since the service started: most PCs have no MongoDB server, and the copy is optional.
+      return [chip('none', 'no server', m.last_error || 'No MongoDB server answered'), ' no MongoDB server answered at ',
+        m.uri || 'this PC', ' (the copy is optional; evidence recording is not affected)'];
+    }
     if (!m.connected) {
       return [chip('warning', 'not connected', m.last_error || 'MongoDB is not reachable'), ' ', m.uri || '', upTo,
         ' · evidence recording is not affected'];
