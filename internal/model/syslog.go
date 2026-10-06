@@ -2,8 +2,18 @@ package model
 
 // Syslog: the gateway's own log messages, received on this computer (docs/syslog-snmp-traffic.md).
 
-// TypeSyslog is a ledger record holding a batch of syslog messages received from the gateway.
+// TypeSyslog / SyslogBatch: DEPRECATED (the first phase-1 design kept the messages in the
+// ledger, which can never delete anything). Messages now live in the syslog store, within a size
+// limit, and the ledger holds a syslog_chunk record per sealed chunk; removed once unused.
 const TypeSyslog = "syslog"
+
+// Ledger records of the syslog store (docs/syslog-snmp-traffic.md §3.2).
+const (
+	// TypeSyslogChunk: a chunk of received messages was sealed; it states the chunk's SHA-256.
+	TypeSyslogChunk = "syslog_chunk"
+	// TypeSyslogPrune: chunks were deleted by the retention limit (syslog.keep_mb/keep_days).
+	TypeSyslogPrune = "syslog_prune"
+)
 
 // GwEvSyslogSetting is the gateway_event of a check (or change) of the gateway's Syslog page.
 const GwEvSyslogSetting = "syslog_setting"
@@ -43,7 +53,7 @@ type SyslogMessage struct {
 	Msg      string `json:"msg,omitempty"` // the message part
 }
 
-// SyslogBatch is the payload of a syslog record: the messages received from From to To.
+// SyslogBatch (DEPRECATED, see TypeSyslog) held the messages received from From to To.
 type SyslogBatch struct {
 	From     string          `json:"from"`
 	To       string          `json:"to"`
@@ -77,6 +87,8 @@ type SyslogStatus struct {
 	// (not read yet or the page was not understood), "error" (the last check failed).
 	State   string `json:"state,omitempty"`
 	Problem string `json:"problem,omitempty"`
+	// Store is the syslog store's volume and retention limits (nil without a store).
+	Store *SyslogUsage `json:"store,omitempty"`
 }
 
 // TrafficPoint is one bucket of the traffic chart. WAN rates come from the gateway's own counters
@@ -107,10 +119,87 @@ type TrafficDay struct {
 	Complete bool  `json:"complete"`
 }
 
-// SyslogEntry is one message of GET /api/syslog with the ledger record that holds it.
+// SyslogEntry is one message of GET /api/syslog: the chunk of the syslog store that holds it and
+// that chunk's syslog_chunk record (Seq 0 while the chunk is still open, or when unknown).
 type SyslogEntry struct {
-	Seq uint64 `json:"seq"`
+	Chunk string `json:"chunk,omitempty"`
+	Seq   uint64 `json:"seq,omitempty"`
 	SyslogMessage
+}
+
+// SyslogChunk is the payload of a syslog_chunk record: a sealed chunk file of the syslog store.
+// The file is gzip; SHA256 and Bytes are those of its uncompressed content, which is one
+// SyslogMessage JSON object per line, each line ending in a line feed (0x0A), in receive order.
+type SyslogChunk struct {
+	Name     string `json:"name"` // file name in the syslog store
+	From     string `json:"from"` // receive time of the first message (RFC 3339 UTC)
+	To       string `json:"to"`   // receive time of the last message
+	Messages int    `json:"messages"`
+	Dropped  int    `json:"dropped,omitempty"`  // counted while the chunk was open; not stored
+	Rejected int    `json:"rejected,omitempty"` // datagrams from senders not allowed; not stored
+	Bytes    int64  `json:"bytes"`
+	SHA256   string `json:"sha256"`
+	GzBytes  int64  `json:"gz_bytes"` // size of the stored gzip file
+	Reason   string `json:"reason"`   // why it was sealed: "size", "age", "stop" or "recovered"
+}
+
+// SyslogChunkRef names a chunk in a syslog_prune record.
+type SyslogChunkRef struct {
+	Name     string `json:"name"`
+	SHA256   string `json:"sha256"`
+	From     string `json:"from"`
+	To       string `json:"to"`
+	Messages int    `json:"messages"`
+	GzBytes  int64  `json:"gz_bytes"`
+}
+
+// SyslogPrune is the payload of a syslog_prune record: chunks deleted to stay within the
+// retention limits. Their SHA-256 stay in their syslog_chunk records.
+type SyslogPrune struct {
+	Reason     string           `json:"reason"` // e.g. "keep_mb 100" or "keep_days 30"
+	KeepMB     int              `json:"keep_mb"`
+	KeepDays   int              `json:"keep_days,omitempty"`
+	Deleted    []SyslogChunkRef `json:"deleted"`
+	KeptBytes  int64            `json:"kept_bytes"`
+	KeptChunks int              `json:"kept_chunks"`
+}
+
+// SyslogUsage is the syslog store's volume and its limits.
+type SyslogUsage struct {
+	Bytes        int64  `json:"bytes"`  // sealed chunks (gzip size) plus the open chunk
+	Chunks       int    `json:"chunks"` // sealed chunks kept
+	Messages     int64  `json:"messages"`
+	OpenMessages int    `json:"open_messages"`
+	Oldest       string `json:"oldest,omitempty"` // receive time of the oldest message kept
+	Newest       string `json:"newest,omitempty"`
+	KeepMB       int    `json:"keep_mb"`
+	KeepDays     int    `json:"keep_days,omitempty"`
+}
+
+// LiveTraffic is the flow meter: the newest traffic rates from on-demand reads of the gateway's
+// WAN counters (at most every few seconds, only while the dashboard asks) and of this computer's
+// interface counters. It is a display, not evidence: nothing of it is recorded (the gateway
+// snapshots every minute are the evidence).
+type LiveTraffic struct {
+	At        string   `json:"at,omitempty"`
+	IntervalS float64  `json:"interval_s,omitempty"` // between the two reads the rates come from
+	WANRx     *float64 `json:"wan_rx_mbps,omitempty"`
+	WANTx     *float64 `json:"wan_tx_mbps,omitempty"`
+	AtLeast   bool     `json:"at_least,omitempty"` // a 32-bit byte counter may have wrapped
+	PCRx      *float64 `json:"pc_rx_mbps,omitempty"`
+	PCTx      *float64 `json:"pc_tx_mbps,omitempty"`
+	// History is the flow meter's recent readings (about the last 15 minutes), oldest first.
+	History []LivePoint `json:"history,omitempty"`
+	Err     string      `json:"error,omitempty"` // why the newest read failed
+}
+
+// LivePoint is one reading of the flow meter.
+type LivePoint struct {
+	T     string   `json:"t"`
+	WANRx *float64 `json:"wan_rx_mbps,omitempty"`
+	WANTx *float64 `json:"wan_tx_mbps,omitempty"`
+	PCRx  *float64 `json:"pc_rx_mbps,omitempty"`
+	PCTx  *float64 `json:"pc_tx_mbps,omitempty"`
 }
 
 // SyslogList is returned by GET /api/syslog: the messages of the recorded syslog batches in

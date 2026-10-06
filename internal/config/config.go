@@ -157,6 +157,12 @@ type SyslogConfig struct {
 	// batch); MaxPerMinute caps the messages recorded per minute (the rest are counted).
 	FlushInterval Duration `json:"flush_interval"`
 	MaxPerMinute  int      `json:"max_per_minute"`
+	// KeepMB limits the syslog store: the oldest chunks are deleted once the stored messages
+	// take more than this many MiB (default 100). KeepDays, when above 0, also deletes chunks
+	// older than that many days. Each deletion is recorded in the ledger (syslog_prune), and the
+	// SHA-256 of every chunk stays in its syslog_chunk record.
+	KeepMB   int `json:"keep_mb"`
+	KeepDays int `json:"keep_days"`
 }
 
 // Config is the complete configuration.
@@ -266,6 +272,7 @@ func Default() *Config {
 			Port:          514,
 			FlushInterval: D(30 * time.Second),
 			MaxPerMinute:  2000,
+			KeepMB:        100,
 		},
 		HeartbeatInterval: D(15 * time.Minute),
 	}
@@ -465,8 +472,21 @@ func validateSyslog(s SyslogConfig) []string {
 	if s.MaxPerMinute < 1 {
 		errs = append(errs, "syslog.max_per_minute must be >= 1")
 	}
+	if s.KeepMB < MinSyslogKeepMB || s.KeepMB > MaxSyslogKeepMB {
+		errs = append(errs, fmt.Sprintf("syslog.keep_mb must be %d-%d", MinSyslogKeepMB, MaxSyslogKeepMB))
+	}
+	if s.KeepDays < 0 || s.KeepDays > MaxSyslogKeepDays {
+		errs = append(errs, fmt.Sprintf("syslog.keep_days must be 0 (no age limit) to %d", MaxSyslogKeepDays))
+	}
 	return errs
 }
+
+// Limits of the syslog retention settings.
+const (
+	MinSyslogKeepMB   = 1
+	MaxSyslogKeepMB   = 1 << 20 // 1 TiB
+	MaxSyslogKeepDays = 3650
+)
 
 // validMongoDatabase applies MongoDB's database name rules on Windows.
 func validMongoDatabase(name string) bool {
@@ -599,6 +619,9 @@ func ParsePasswordFile(path string) (host, code string, err error) {
 // Paths is the data-directory layout (docs/DESIGN.md §5).
 type Paths struct {
 	Root, Config, Keys, Ledger, Blobs, Exports, Quarantine, State, Logs string
+	// Syslog holds the syslog store's chunk files (kept within syslog.keep_mb, unlike the
+	// ledger and the blobs, which are never deleted).
+	Syslog string
 }
 
 // PathsFor returns the layout rooted at dataDir.
@@ -613,12 +636,13 @@ func PathsFor(dataDir string) Paths {
 		Quarantine: filepath.Join(dataDir, "quarantine"),
 		State:      filepath.Join(dataDir, "state"),
 		Logs:       filepath.Join(dataDir, "logs"),
+		Syslog:     filepath.Join(dataDir, "syslog"),
 	}
 }
 
 // MkdirAll creates every directory of the layout.
 func (p Paths) MkdirAll() error {
-	for _, d := range []string{p.Root, p.Keys, p.Ledger, p.Blobs, p.Exports, p.Quarantine, p.State, p.Logs} {
+	for _, d := range []string{p.Root, p.Keys, p.Ledger, p.Blobs, p.Exports, p.Quarantine, p.State, p.Logs, p.Syslog} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return err
 		}

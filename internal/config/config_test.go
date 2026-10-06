@@ -99,7 +99,8 @@ func TestMongoConfig(t *testing.T) {
 // defaults; bad values are refused only while the receiver is enabled.
 func TestSyslogConfig(t *testing.T) {
 	d := Default().Syslog
-	if !d.Enabled || d.Listen != ":514" || d.Port != 514 || d.FlushInterval.Duration != 30*time.Second || d.MaxPerMinute != 2000 || len(d.Allow) != 0 {
+	if !d.Enabled || d.Listen != ":514" || d.Port != 514 || d.FlushInterval.Duration != 30*time.Second || d.MaxPerMinute != 2000 || len(d.Allow) != 0 ||
+		d.KeepMB != 100 || d.KeepDays != 0 {
 		t.Fatalf("defaults %+v", d)
 	}
 	path := filepath.Join(t.TempDir(), "config.json")
@@ -117,6 +118,9 @@ func TestSyslogConfig(t *testing.T) {
 		"allow":        func(s *SyslogConfig) { s.Allow = []string{"not-an-ip"} },
 		"flush":        func(s *SyslogConfig) { s.FlushInterval = D(0) },
 		"maxperminute": func(s *SyslogConfig) { s.MaxPerMinute = 0 },
+		"keepmb0":      func(s *SyslogConfig) { s.KeepMB = 0 },
+		"keepmbhuge":   func(s *SyslogConfig) { s.KeepMB = MaxSyslogKeepMB + 1 },
+		"keepdays":     func(s *SyslogConfig) { s.KeepDays = -1 },
 	} {
 		c := Default()
 		mut(&c.Syslog)

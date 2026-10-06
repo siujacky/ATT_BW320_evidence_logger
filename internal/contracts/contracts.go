@@ -237,6 +237,54 @@ type SyslogReceiver interface {
 	Listening() (addr string, err error)
 }
 
+// SyslogReader reads the syslog store (the dashboard, exports and the MongoDB copy).
+type SyslogReader interface {
+	// Query returns the messages received in [from, to) for which match returns true (nil:
+	// all), newest first, at most limit, and whether more matched. Entry.Chunk names the chunk;
+	// Entry.Seq is left 0 (callers that need it map chunk names to syslog_chunk records).
+	Query(ctx context.Context, from, to time.Time, match func(*model.SyslogMessage) bool, limit int) (entries []model.SyslogEntry, truncated bool, err error)
+	// Usage reports the stored volume and the retention limits.
+	Usage() model.SyslogUsage
+	// OpenChunk opens the exact stored bytes (gzip) of a sealed chunk; ErrNotFound when the
+	// chunk does not exist (pruned, or never sealed).
+	OpenChunk(name string) (io.ReadCloser, error)
+}
+
+// SyslogStore keeps the gateway's syslog messages in chunk files within a size limit, and
+// optionally an age limit (implemented by syslogstore.Store). It never writes the ledger: the
+// monitor records a syslog_chunk record for every chunk it returns as sealed and a syslog_prune
+// record for every deletion it returns.
+type SyslogStore interface {
+	SyslogReader
+	// Recover seals the chunk a previous run left open (reason "recovered"); call it once,
+	// before the first Append.
+	Recover(now time.Time) ([]model.SyslogChunk, error)
+	// Append adds messages (oldest first) and the dropped/rejected counts to the open chunk,
+	// sealing it whenever it reaches the chunk size limit; it returns the chunks it sealed.
+	Append(msgs []model.SyslogMessage, dropped, rejected int, now time.Time) ([]model.SyslogChunk, error)
+	// Seal seals the open chunk when it is older than the chunk age limit, or - with force -
+	// whenever it holds anything (reason "stop" at shutdown). nil when nothing was sealed.
+	Seal(now time.Time, reason string, force bool) (*model.SyslogChunk, error)
+	// Prune deletes the oldest sealed chunks beyond the retention limits and returns them.
+	Prune(now time.Time) ([]model.SyslogChunkRef, error)
+	// SetRetention changes the limits (keepMB >= 1; keepDays 0 = no age limit).
+	SetRetention(keepMB, keepDays int)
+}
+
+// SyslogControl changes how much syslog is kept (implemented by monitor.Monitor): it saves
+// syslog.keep_mb/keep_days, records a config_change, applies them at once (pruning what no longer
+// fits, recorded as syslog_prune) and returns the change.
+type SyslogControl interface {
+	SetSyslogRetention(ctx context.Context, keepMB, keepDays int, actor string) (model.ConfigChange, error)
+}
+
+// LiveTrafficSource gives the dashboard's flow meter (implemented by monitor.Monitor): each call
+// may read the gateway's WAN counters (unauthenticated, at most every few seconds, shared by all
+// callers) and returns the newest rates and the recent history. Nothing of it is recorded.
+type LiveTrafficSource interface {
+	LiveTraffic(ctx context.Context) (model.LiveTraffic, error)
+}
+
 // ------------------------------------------------------------------ export
 
 // ExportRequest asks for an evidence bundle.

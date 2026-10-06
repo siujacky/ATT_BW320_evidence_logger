@@ -65,8 +65,12 @@ type Options struct {
 	// without holding the monitor's lock and must not block).
 	MongoStatus func() model.MongoStatus
 	// Syslog receives the gateway's syslog messages (nil: no receiver). The monitor runs it,
-	// sets its allowed senders and writes what it receives to the ledger (Config.Syslog).
+	// sets its allowed senders and passes what it receives to SyslogStore (Config.Syslog).
 	Syslog contracts.SyslogReceiver
+	// SyslogStore keeps the received messages within syslog.keep_mb (nil: messages are not
+	// kept). The monitor records a syslog_chunk record for every sealed chunk and a
+	// syslog_prune record for every deletion.
+	SyslogStore contracts.SyslogStore
 }
 
 // Compile-time interface conformance.
