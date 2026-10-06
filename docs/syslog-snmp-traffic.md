@@ -176,14 +176,14 @@ setting: only one should enforce (README).
 |---|---|---|
 | 2.1 | Sanitize the captured `syslog.ha` into a fixture; test the reader and `SetSyslog` against it; adjust (the fields are disabled while Syslog is off: the Update round, then the Save from the transformed page) | done |
 | 2.2 | Enforcement in the daily check, `gateway syslog on/off` (CLI, API, dashboard), `gateway.enforce_syslog` default on, `syslog_level` | done |
-| 2.3 | Review, fixes, full tests; deploy (UAC): the gateway is set (event + config_change with before/after pages), messages arrive, are kept, counted against the limit, copied to MongoDB | |
+| 2.3 | Review, fixes, full tests; deploy (UAC): the gateway is set (event + config_change with before/after pages), messages arrive, are kept, counted against the limit, copied to MongoDB | done 2026-10-06: the deployed service set the owner's gateway (ledger #10677 read, #10678 change with both pages, #10679 config_change "verified": on, 192.168.1.71:514, Notice); the first messages (firewall drops, `FIREWALL… action=DROP`) arrived 6 s later; ledger and MongoDB copy verified |
 
 ### Phase 3 — reports and release
 
 | # | Task |
 |---|---|
 | 3.1 | Ticket PDF and evidence report: the gateway's own syslog lines around each outage, traffic before each outage |
-| 3.2 | README, DESIGN, PACKAGES; push; release v1.2.0 with the setup program |
+| 3.2 | README, DESIGN, PACKAGES; push; release v1.2.0 with the setup program | done |
 
 ## 5. Out of scope
 
