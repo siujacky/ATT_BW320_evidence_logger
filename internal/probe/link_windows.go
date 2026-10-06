@@ -55,6 +55,7 @@ func convertAdapters(first *windows.IpAdapterAddresses) []adapterInfo {
 			Friendly:    windows.UTF16PtrToString(aa.FriendlyName),
 			Description: windows.UTF16PtrToString(aa.Description),
 			IfIndex:     aa.IfIndex,
+			Luid:        aa.Luid,
 			IfType:      aa.IfType,
 			OperStatus:  aa.OperStatus,
 			TxSpeed:     aa.TransmitLinkSpeed,
@@ -88,6 +89,22 @@ func bestInterface(dst netip.Addr) (uint32, error) {
 		return 0, os.NewSyscallError("GetBestInterfaceEx", err)
 	}
 	return idx, nil
+}
+
+// interfaceCounters returns the 64-bit octet counters of an interface - received and sent
+// (InOctets/OutOctets: unicast, multicast and broadcast, without errors) - with GetIfEntry2Ex
+// at MibIfEntryNormal (the statistics at the top of the interface's filter stack, no
+// administrator rights needed). The interface is the one with the NET_LUID, or with the index
+// when luid is 0.
+func interfaceCounters(luid uint64, index uint32) (rx, tx uint64, err error) {
+	if luid == 0 && index == 0 {
+		return 0, 0, errors.New("GetIfEntry2Ex: no interface given")
+	}
+	row := windows.MibIfRow2{InterfaceLuid: luid, InterfaceIndex: index}
+	if err := windows.GetIfEntry2Ex(windows.MibIfEntryNormal, &row); err != nil {
+		return 0, 0, os.NewSyscallError("GetIfEntry2Ex", err)
+	}
+	return row.InOctets, row.OutOctets, nil
 }
 
 // runNetshWLAN runs "%SystemRoot%\System32\netsh.exe wlan show interfaces" (absolute path:

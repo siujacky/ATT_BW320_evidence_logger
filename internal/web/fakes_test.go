@@ -236,14 +236,16 @@ func boolString(b bool) string {
 // ----------------------------------------------------------------------------- LedgerReader
 
 type fakeReader struct {
-	mu        sync.Mutex
-	envs      []model.Envelope
-	bodies    []model.Body
-	blobs     map[string][]byte
-	scanErr   error
-	recordErr map[uint64]error
-	blobErr   error
-	callbacks atomic.Int64 // records handed to Scan callbacks
+	mu          sync.Mutex
+	envs        []model.Envelope
+	bodies      []model.Body
+	blobs       map[string][]byte
+	scanErr     error
+	scanTimeErr error
+	recordErr   map[uint64]error
+	blobErr     error
+	callbacks   atomic.Int64   // records handed to Scan and ScanTime callbacks
+	timeScans   [][2]time.Time // the periods asked of ScanTime, in order
 }
 
 func (r *fakeReader) snapshot() ([]model.Envelope, []model.Body) {
@@ -276,12 +278,20 @@ func (r *fakeReader) Scan(fromSeq uint64, fn func(model.Envelope, model.Body) er
 }
 
 func (r *fakeReader) ScanTime(from, to time.Time, fn func(model.Envelope, model.Body) error) error {
+	r.mu.Lock()
+	r.timeScans = append(r.timeScans, [2]time.Time{from, to})
+	scanErr := r.scanTimeErr
+	r.mu.Unlock()
+	if scanErr != nil {
+		return scanErr
+	}
 	envs, bodies := r.snapshot()
 	for i := range envs {
 		ts, err := time.Parse(time.RFC3339Nano, bodies[i].TS)
 		if err != nil || ts.Before(from) || !ts.Before(to) {
 			continue
 		}
+		r.callbacks.Add(1)
 		if err := fn(envs[i], bodies[i]); err != nil {
 			if errors.Is(err, contracts.ErrStop) {
 				return nil

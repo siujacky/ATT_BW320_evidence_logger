@@ -21,3 +21,5 @@ func listAdapters() ([]adapterInfo, error) { return nil, errUnsupported }
 func bestInterface(netip.Addr) (uint32, error) { return 0, errUnsupported }
 
 func runNetshWLAN(context.Context) ([]byte, error) { return nil, errUnsupported }
+
+func interfaceCounters(uint64, uint32) (uint64, uint64, error) { return 0, 0, errUnsupported }

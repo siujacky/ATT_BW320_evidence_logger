@@ -52,6 +52,18 @@ func TestStatusEndpoint(t *testing.T) {
 	if body := hs.get("/api/status").Body.String(); !strings.Contains(body, `"gateway_cert":{"pinned":"`+testPinnedCert+`"}`) {
 		t.Errorf("gateway_cert without a pending certificate: %s", body)
 	}
+	// The syslog receiver and the gateway's Syslog setting (static/app.js cardSyslog).
+	hs.status.status.Syslog = &model.SyslogStatus{Enabled: true, Listening: true, Listen: "0.0.0.0:514", Received: 3, Recorded: 3,
+		LastAt: "2026-10-05T03:19:58.5Z", Last: "<30>Oct  5 03:19:58 BGW320 dhcpd: DHCPACK", State: "off",
+		Gateway: &model.SyslogSetting{Enabled: false, Levels: []string{"Error", "Informational"}}, GatewayAt: "2026-10-05T03:00:00Z", GatewaySeq: 12}
+	rec = hs.get("/api/status")
+	if got := decode[model.Status](t, rec).Syslog; got == nil || !jsonEqual(*got, *hs.status.status.Syslog) {
+		t.Errorf("syslog status not passed through: %+v", got)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, `"syslog":{"enabled":true,"listening":true,"listen":"0.0.0.0:514","received":3,"recorded":3,"dropped":0,"rejected":0,"last_at":`) ||
+		!strings.Contains(body, `"gateway":{"enabled":false,"levels":["Error","Informational"]},"gateway_at":"2026-10-05T03:00:00Z","gateway_seq":12,"enforce":false,"state":"off"}`) {
+		t.Errorf("syslog status not encoded as the dashboard reads it: %s", body)
+	}
 
 	none := newHarness(t)
 	none.srv.status = nil
@@ -79,6 +91,23 @@ func TestSeriesEndpoint(t *testing.T) {
 	}
 	if s := decode[model.Series](t, hs.get("/api/series?range=6h")); len(s.Points) != 1 || *s.RxLowAlarmX10 != -295 {
 		t.Errorf("6h series not passed through: %+v", s)
+	}
+	// Traffic (docs/syslog-snmp-traffic.md §3.3): the dashboard's Traffic chart and daily totals.
+	mbps := func(v float64) *float64 { return &v }
+	ser := hs.status.series["6h"]
+	ser.Traffic = []model.TrafficPoint{{T: "2026-10-04T21:20:00Z", WANRx: mbps(32.8), WANTx: mbps(5), WANRxPeak: mbps(612.5), AtLeast: true, PCRx: mbps(3.25)}}
+	ser.TrafficDays = []model.TrafficDay{{Day: "2026-10-04", RxBytes: 41_000_000_000, TxBytes: 6_000_000_000, CoveredS: 86000}}
+	ser.HeavyTrafficMbps = 80
+	hs.status.series["6h"] = ser
+	rec := hs.get("/api/series?range=6h")
+	if s := decode[model.Series](t, rec); len(s.Traffic) != 1 || *s.Traffic[0].WANRxPeak != 612.5 || s.Traffic[0].WANTxPeak != nil || len(s.TrafficDays) != 1 || s.HeavyTrafficMbps != 80 {
+		t.Errorf("traffic not passed through: %+v", s)
+	}
+	for _, want := range []string{`"wan_rx_mbps":32.8`, `"wan_rx_peak_mbps":612.5`, `"at_least":true`, `"pc_rx_mbps":3.25`,
+		`"traffic_days":[{"day":"2026-10-04","rx_bytes":41000000000,"tx_bytes":6000000000,"covered_s":86000,"complete":false}]`, `"heavy_traffic_mbps":80`} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Errorf("series JSON lacks %s: %s", want, rec.Body.String())
+		}
 	}
 	if s := decode[model.Series](t, hs.get("/api/series")); s.Range != DefaultSeriesRange {
 		t.Errorf("default range = %q", s.Range)
@@ -1020,6 +1049,7 @@ func TestJSONShapes(t *testing.T) {
 	decode[[]model.Incident](t, hs.get("/api/incidents"))
 	decode[IncidentDetail](t, hs.get("/api/incidents/INC-20261005-030000Z"))
 	decode[[]RecordView](t, hs.get("/api/records?limit=2"))
+	decode[model.SyslogList](t, hs.get("/api/syslog"))
 	decode[model.VerifyReport](t, hs.post("/api/verify", ""))
 	decode[contracts.ExportInfo](t, hs.post("/api/exports", `{"incident_id":"INC-1"}`))
 	decode[[]contracts.ExportInfo](t, hs.get("/api/exports"))

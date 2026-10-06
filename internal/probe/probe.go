@@ -2,7 +2,8 @@
 // ICMP echo and traceroute through the Windows ICMP helper API (iphlpapi IcmpSendEcho: no
 // administrator rights, no raw sockets, no cgo), TCP connects, DNS A queries with hijack
 // detection, HTTP(S) checks that never follow redirects, SNTP clock offsets, and a
-// description of the local link (adapter and Wi-Fi details) used to reach the gateway.
+// description of the local link (adapter, Wi-Fi details, traffic counters) used to reach the
+// gateway.
 //
 // Every measurement returns a populated result value rather than an error: a failed
 // measurement is evidence too. Results follow these conventions:
@@ -109,6 +110,9 @@ type Prober struct {
 	adapters func() ([]adapterInfo, error)
 	bestIf   func(dst netip.Addr) (uint32, error)
 	runNetsh func(ctx context.Context) ([]byte, error)
+	// ifCounters reads an interface's octet counters (received, sent) by NET_LUID, or by
+	// interface index when the LUID is 0.
+	ifCounters func(luid uint64, index uint32) (rx, tx uint64, err error)
 
 	icmpInFlight atomic.Int64 // IcmpSendEcho calls not yet returned (see maxICMPInFlight)
 
@@ -124,13 +128,14 @@ var _ contracts.Prober = (*Prober)(nil)
 // New returns a Prober.
 func New(opts Options) *Prober {
 	p := &Prober{
-		log:       opts.Logger,
-		userAgent: strings.TrimSpace(opts.UserAgent),
-		gatewayIP: strings.TrimSpace(opts.GatewayIP),
-		echo:      sendEcho,
-		adapters:  listAdapters,
-		bestIf:    bestInterface,
-		runNetsh:  runNetshWLAN,
+		log:        opts.Logger,
+		userAgent:  strings.TrimSpace(opts.UserAgent),
+		gatewayIP:  strings.TrimSpace(opts.GatewayIP),
+		echo:       sendEcho,
+		adapters:   listAdapters,
+		bestIf:     bestInterface,
+		runNetsh:   runNetshWLAN,
+		ifCounters: interfaceCounters,
 	}
 	if p.log == nil {
 		p.log = slog.New(slog.DiscardHandler)

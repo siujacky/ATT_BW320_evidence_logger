@@ -10,7 +10,8 @@ package web
 // /demo/vpn starts a live VPN period (rules 2026.10-4 LOCAL_ROUTE), /demo/stale shows a monitor
 // that records no cycle, /demo/dnsretry a lost AT&T resolver query and its retry, /demo/clock
 // the CLOCK_OFFSET condition, /demo/cert makes the gateway present a changed certificate,
-// /demo/noaccess and /demo/anchoruntrusted show those conditions, /demo/quit stops the server
+// /demo/noaccess and /demo/anchoruntrusted show those conditions, /demo/syslog?state=... the
+// gateway syslog card's other states, /demo/quit stops the server
 // (see TestDemoServer for the others). ATTMON_WEB_DEMO_STATE=outage starts in outage mode;
 // ATTMON_WEB_DEMO_HOSTILE=1 appends "<img src=x onerror=alert(1)>" to every remote-controlled
 // string (gateway values, DNS answers, TSA names, notes, ...) to check that all of it is
@@ -198,6 +199,18 @@ type demoWorld struct {
 	// hostile, when set, is appended to every remote-controlled string the world produces
 	// (records, status, incidents, verification, exports): see hostilize.
 	hostile string
+
+	// The gateway's syslog (docs/syslog-snmp-traffic.md §3.2): the receiver's count since the
+	// service started (syslogSince), the newest message, the latest gateway_event syslog_setting,
+	// and the state shown (syslogState: "" = the gateway sends here; see syslogStatusLocked).
+	syslogSince    time.Time
+	syslogReceived int64
+	syslogLast     *model.SyslogMessage
+	syslogCheck    model.Ref
+	syslogState    string
+
+	// burstFrom/burstTo: a big download whose WAN rates are "at least" (traffic, §3.3).
+	burstFrom, burstTo time.Time
 }
 
 type demoSegment struct {
@@ -231,6 +244,8 @@ func newDemoWorldWith(now time.Time, hostile string) *demoWorld {
 	// The AT&T resolver fails in five consecutive checks (an incident: rules 2026.10-4 need the
 	// same failure in two consecutive checks) and, a few minutes ago, loses one query only.
 	w.ispDNSFrom, w.ispDNSTo, w.ispRetryAt = t0.Add(-27*m), t0.Add(-22*m), t0.Add(-5*m)
+	// Two days ago a big download filled the line for 20 minutes (no incident at the time).
+	w.burstFrom, w.burstTo = t0.Add(-2*24*h-5*h), t0.Add(-2*24*h-4*h-40*m)
 	w.events = []*demoEvent{
 		{name: "latency", from: t0.Add(-5*24*h - 3*h), to: t0.Add(-5*24*h - 2*h - 20*m), state: model.StateDegraded, cause: model.CauseHighLatency, attribution: model.AttrProvider, incident: true,
 			summary: "Internet round-trip times above 150 ms for 40 min while the AT&T gateway answered in 2 ms with no loss.",
@@ -314,6 +329,7 @@ func (w *demoWorld) loadBlobs() {
 	w.page["sysinfo.down"] = w.putBlob(siDown)
 	w.page["events.before"] = w.putBlob(demoFile("testdata", "gateway", "events_checked.html"))
 	w.page["events.after"] = w.putBlob(demoFile("testdata", "gateway", "events_unchecked.html"))
+	w.page["syslog"] = w.putBlob([]byte(demoSyslogPage))
 
 	w.tsr = []string{w.putBlob(demoFile("testdata", "tsa", "digicert.tsr")), w.putBlob(demoFile("testdata", "tsa", "freetsa.tsr"))}
 	w.netsh = w.putBlob([]byte(strings.ReplaceAll(`
@@ -361,6 +377,7 @@ var hostileKeep = map[string]bool{
 	"recovered_at": true, "gateway_restarts": true, "started": true, "created": true, "fetched_at": true,
 	"gen_time": true, "checked_at": true, "first_ts": true, "last_ts": true, "genesis_ts": true, "head_ts": true,
 	"last_anchor_time": true, "from": true, "to": true, "boot_time_estimate": true, "mod_time": true, "boot_time": true,
+	"rx": true, "last_at": true, "gateway_at": true, "day": true,
 
 	"state": true, "cause": true, "causes": true, "attribution": true, "type": true, "kind": true, "role": true,
 	"code": true, "severity": true, "rules": true, "from_state": true, "to_state": true, "from_cause": true,
@@ -1266,6 +1283,47 @@ func (w *demoWorld) buildLedger() {
 	add(restart.Add(95*time.Second), 0, func(ts time.Time) {
 		w.appendLocked(ts, model.TypeMonitorStart, model.MonitorStart{Software: soft, Host: host, ConfigSHA256: demoConfigSHA, Mode: "service", PrevHead: w.headLocked(), GapSeconds: 95, PrevStopped: true})
 	})
+	// The gateway's syslog (docs/syslog-snmp-traffic.md §3.2) as the monitor records it: a batch
+	// of everyday messages every 2 hours on the older days, every 4 minutes over the last day and
+	// every 3 minutes over the last half hour; the incidents add their own (addEventRecords).
+	// Nothing reaches this computer while it sleeps or its link is down, or while the gateway
+	// restarts. The receiver counts from the service's last start.
+	w.syslogSince = restart.Add(95 * time.Second)
+	for t := g.Add(30 * time.Minute).Truncate(time.Minute); t.Before(end); {
+		if !w.syslogQuietAt(t) {
+			add(t.Add(42*time.Second), 8, func(ts time.Time) {
+				rejected := 0
+				if noise(ts, 89) > 0.93 {
+					rejected = 1 // a datagram from another device on the home network
+				}
+				msgs := routineSyslog(ts)
+				if w.wanDownAt(ts) { // nothing arrives from the Internet, nothing reaches the ACS or the time server
+					msgs = slices.DeleteFunc(msgs, func(m model.SyslogMessage) bool { return m.App == "kernel" || m.App == "cwmpd" || m.App == "ntpd" })
+				}
+				w.appendSyslogLocked(ts, rejected, msgs...)
+			})
+		}
+		switch age := w.created.Sub(t); {
+		case age > 26*time.Hour:
+			t = t.Add(2 * time.Hour)
+		case age > 35*time.Minute:
+			t = t.Add(4 * time.Minute)
+		default:
+			t = t.Add(3 * time.Minute)
+		}
+	}
+	add(w.created.Add(-47*time.Minute), 8, func(ts time.Time) { w.appendSyslogLocked(ts, 0, oddSyslog(ts)...) })
+	// The daily check of the gateway's Syslog page (read-only in this version), from each start.
+	for t := g.Add(3 * time.Minute); t.Before(restart); t = t.Add(24 * time.Hour) {
+		if !inGap(t) {
+			add(t, 8, func(ts time.Time) { w.syslogCheckLocked(ts) })
+		}
+	}
+	for t := w.syslogSince.Add(3 * time.Minute); t.Before(end); t = t.Add(24 * time.Hour) {
+		if !inGap(t) {
+			add(t, 8, func(ts time.Time) { w.syslogCheckLocked(ts) })
+		}
+	}
 	for _, e := range w.events {
 		e := e
 		if e.gap {
@@ -1437,6 +1495,10 @@ func (w *demoWorld) addEventRecords(e *demoEvent, add func(time.Time, int, func(
 			w.appendLocked(ts.Add(500*time.Millisecond), model.TypeStateChange, model.StateChange{FromState: e.state, FromCause: e.cause, ToState: model.StateOnline, At: ts.UTC().Format(time.RFC3339Nano), Cycle: w.cycle})
 		})
 		return
+	}
+	// The gateway's own messages about the event, as this computer received them.
+	for _, b := range eventSyslog(e) {
+		add(b.at, 8, func(ts time.Time) { w.appendSyslogLocked(ts, 0, eventMessages(b.kind, ts)...) })
 	}
 	fiber := e.cause == model.CauseFiberLinkDown || e.cause == model.CauseWANDown
 	outage := e.state == model.StateISPOutage
@@ -1625,6 +1687,372 @@ func firstBlob(snap model.GatewaySnapshot) string {
 	return ""
 }
 
+// ----------------------------------------------------------------------------- syslog
+
+// demoSyslogHost is the name the gateway writes into its messages.
+const demoSyslogHost = "BGW320-505"
+
+// demoSyslogLevels are the Log Level options of the gateway's Syslog page.
+var demoSyslogLevels = []string{"Emergency", "Alert", "Critical", "Error", "Warning", "Notice", "Informational", "Debug"}
+
+// demoSyslogPage stands in for the gateway's Syslog page (Diagnostics › Syslog, syslog.ha) as a
+// settings check stores it: synthetic, since phase 1 has not captured the real page yet.
+const demoSyslogPage = `<!DOCTYPE html><html><head><title>Diagnostics - Syslog</title></head><body>
+<h1>Syslog</h1><p>(demo page: a stand-in for the gateway's syslog.ha)</p>
+<form method="post" action="/cgi-bin/syslog.ha"><input type="hidden" name="nonce" value="0000000000000000">
+<table>
+<tr><th><label for="enable">Syslog</label></th><td><select id="enable" name="enable"><option value="on" selected>On</option><option value="off">Off</option></select></td></tr>
+<tr><th><label for="server">Server IP Address</label></th><td><input type="text" id="server" name="server" value="192.168.1.71"></td></tr>
+<tr><th><label for="port">Server Port</label></th><td><input type="text" id="port" name="port" value="514"></td></tr>
+<tr><th><label for="level">Log Level</label></th><td><select id="level" name="level"><option>Emergency</option><option>Alert</option><option>Critical</option><option>Error</option><option>Warning</option><option>Notice</option><option selected>Informational</option><option>Debug</option></select></td></tr>
+</table><input type="submit" name="Save" value="Save"></form></body></html>
+`
+
+// demoSyslog is a message as the receiver records it: the datagram the gateway sent (RFC 3164,
+// or RFC 5424 when rfc5424), received at rx, with its parsed header. The gateway's clock runs
+// 1.2 s ahead of this computer's (as in the demo snapshots).
+func demoSyslog(rx time.Time, fac, sev int, app, text string, rfc5424 bool) model.SyslogMessage {
+	pri := fac*8 + sev
+	m := model.SyslogMessage{RX: rx.UTC().Format(time.RFC3339Nano), Src: demoGateway + ":514", PRI: &pri, Facility: &fac, Severity: &sev,
+		Host: demoSyslogHost, App: app, Msg: text}
+	sent := rx.Add(1200 * time.Millisecond)
+	if rfc5424 {
+		m.Format, m.TS = "rfc5424", sent.UTC().Format("2006-01-02T15:04:05.000Z07:00")
+		m.Raw = fmt.Sprintf("<%d>1 %s %s %s - - - %s", pri, m.TS, demoSyslogHost, app, text)
+	} else {
+		m.Format, m.TS = "rfc3164", sent.Local().Format(time.Stamp)
+		m.Raw = fmt.Sprintf("<%d>%s %s %s: %s", pri, m.TS, demoSyslogHost, app, text)
+	}
+	return m
+}
+
+// appendSyslogLocked records a batch of messages received before ts (oldest first), as the
+// monitor does, rejected counting the datagrams of other senders.
+func (w *demoWorld) appendSyslogLocked(ts time.Time, rejected int, msgs ...model.SyslogMessage) {
+	if len(msgs) == 0 {
+		return
+	}
+	w.appendLocked(ts, model.TypeSyslog, model.SyslogBatch{From: msgs[0].RX, To: ts.UTC().Format(time.RFC3339Nano),
+		Received: len(msgs), Rejected: rejected, Messages: msgs})
+	if !ts.Before(w.syslogSince) {
+		w.syslogReceived += int64(len(msgs))
+	}
+	last := msgs[len(msgs)-1]
+	w.syslogLast = &last
+}
+
+// syslogQuietAt reports whether no syslog message reaches this computer at t: the monitor is
+// not running, this computer's link is down, or the gateway is restarting.
+func (w *demoWorld) syslogQuietAt(t time.Time) bool {
+	for _, e := range w.allEventsLocked() {
+		if e.covers(t) && (e.gap || e.cause == model.CauseLocalLinkDown || (!e.boot.IsZero() && t.Before(e.boot.Add(30*time.Second)))) {
+			return true
+		}
+	}
+	return false
+}
+
+// wanDownAt reports whether the AT&T line is down at t (fiber or broadband connection).
+func (w *demoWorld) wanDownAt(t time.Time) bool {
+	for _, e := range w.allEventsLocked() {
+		if e.covers(t) && (e.cause == model.CauseFiberLinkDown || e.cause == model.CauseWANDown) {
+			return true
+		}
+	}
+	return false
+}
+
+// routineSyslog is a batch of the gateway's everyday messages written at ts, 1 to 3 of them
+// (picked by noise, so every run has the same): firewall drops, DHCP leases, the TR-069 inform,
+// time synchronisation, DNS queries (debug) and refused port mappings.
+func routineSyslog(ts time.Time) []model.SyslogMessage {
+	n := 1 + int(noise(ts, 90)*3)
+	out := make([]model.SyslogMessage, 0, n)
+	for j := 0; j < n; j++ {
+		rx := ts.Add(-time.Duration(28-7*j)*time.Second - time.Duration(noise(ts, 91+j)*5000)*time.Millisecond)
+		x := int(noise(ts, 95+j) * 1000)
+		var m model.SyslogMessage
+		switch x % 7 {
+		case 0, 1: // firewall drops are the most frequent
+			m = demoSyslog(rx, 16, 6, "kernel", fmt.Sprintf("[FW] Policy dropped: IN=wan0 SRC=198.51.100.%d DST=%s PROTO=TCP SPT=%d DPT=%d SYN",
+				2+x%250, demoWANIP, 40000+x*17%20000, []int{23, 22, 445, 3389}[x%4]), false)
+		case 2:
+			m = demoSyslog(rx, 3, 6, "dhcpd", fmt.Sprintf("DHCPACK on 192.168.1.%d to 02:00:00:00:00:%02x via br0", 64+x%40, x%256), false)
+		case 3:
+			m = demoSyslog(rx, 1, 6, "cwmpd", "Periodic Inform to the ACS completed (HTTP 204)", true)
+		case 4:
+			m = demoSyslog(rx, 3, 5, "ntpd", fmt.Sprintf("time synchronized with 192.0.2.123, offset %+.3f s", (noise(ts, 99)-0.5)/50), false)
+		case 5:
+			m = demoSyslog(rx, 3, 7, "dnsmasq", fmt.Sprintf("query[A] www.google.com from 192.168.1.%d", 64+x%40), false)
+		default:
+			m = demoSyslog(rx, 3, 4, "upnpd", fmt.Sprintf("refused a port mapping request from 192.168.1.%d: external port %d in use", 64+x%40, 3074+x%5), false)
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// oddSyslog is a batch whose messages test how the dashboard shows what a sender controls:
+// bytes that are not UTF-8 (kept as base64), a datagram without a PRI, an escape sequence, a
+// DHCP host name with a right-to-left override, several lines and a very long line.
+func oddSyslog(ts time.Time) []model.SyslogMessage {
+	rx := func(i int) time.Time { return ts.Add(-time.Duration(25-4*i) * time.Second) }
+	bad := strings.Repeat(string(rune(0xFFFD)), 2)
+	notUTF8 := demoSyslog(rx(0), 3, 6, "wifid", "probe request from 02:00:00:00:00:99 for SSID "+bad+"HOME-5G", false)
+	notUTF8.RawB64 = base64.StdEncoding.EncodeToString([]byte(strings.Replace(notUTF8.Raw, bad, "\xff\xfe", 1)))
+	notUTF8.Raw = ""
+	noPRI := model.SyslogMessage{RX: rx(1).UTC().Format(time.RFC3339Nano), Src: demoGateway + ":514", Raw: demoSyslogHost + " watchdog: heartbeat ok", Format: "unknown"}
+	rlo, pdf := string(rune(0x202E)), string(rune(0x202C)) // right-to-left override, pop directional formatting
+	return []model.SyslogMessage{
+		notUTF8,
+		noPRI,
+		demoSyslog(rx(2), 16, 3, "wanmgr", "\x1b[1;31mWAN link flap\x1b[0m detected on wan0", false),
+		demoSyslog(rx(3), 3, 6, "dhcpd", "DHCPACK on 192.168.1.80 to 02:00:00:00:00:80 ("+rlo+"gpj.exe"+pdf+") via br0", false),
+		demoSyslog(rx(4), 1, 4, "cwmpd", "Inform to the ACS failed:\nHTTP 503 Service Unavailable\nretry in 60 s", true),
+		demoSyslog(rx(5), 16, 6, "kernel", "[FW] Policy dropped: IN=wan0 OUT= MAC=00:00:5e:00:53:01:00:00:5e:00:53:fe:08:00 SRC=198.51.100.77 DST="+demoWANIP+
+			" LEN=60 TOS=0x00 PREC=0x00 TTL=50 ID=54321 DF PROTO=TCP SPT=44532 DPT=23 WINDOW=64240 RES=0x00 SYN URGP=0 OPT (020405B40402080A3C5D1A2B0000000001030307) payload="+
+			strings.Repeat("QUFBQUFBQUFBQUFB", 12), false),
+	}
+}
+
+// demoSyslogAt is a batch of the gateway's messages about an event, recorded at at.
+type demoSyslogAt struct {
+	at   time.Time
+	kind string // eventMessages
+}
+
+// eventSyslog lists the gateway's messages about an event: the outage's start and end, the boot
+// after a restart, the reconnection of this computer's Wi-Fi (what the gateway logged while it
+// was disconnected never arrived), forward error correction during packet loss, the forwarder
+// during the AT&T DNS failure. High latency and VPN periods leave no trace in the gateway's log.
+func eventSyslog(e *demoEvent) []demoSyslogAt {
+	sec := time.Second
+	switch {
+	case !e.boot.IsZero():
+		return []demoSyslogAt{{e.boot.Add(45 * sec), "boot"}, {e.to.Add(25 * sec), "wan-up"}}
+	case e.cause == model.CauseFiberLinkDown:
+		return []demoSyslogAt{{e.from.Add(25 * sec), "fiber-down"}, {e.to.Add(25 * sec), "fiber-up"}}
+	case e.cause == model.CauseWANDown:
+		return []demoSyslogAt{{e.from.Add(25 * sec), "wan-down"}, {e.to.Add(25 * sec), "wan-up"}}
+	case e.cause == model.CauseLocalLinkDown:
+		return []demoSyslogAt{{e.to.Add(25 * sec), "wifi-up"}}
+	case e.cause == model.CausePacketLoss:
+		return []demoSyslogAt{{e.from.Add(40 * sec), "fec"}}
+	case e.cause == model.CauseISPDNSFailure:
+		return []demoSyslogAt{{e.from.Add(20 * sec), "dns"}}
+	}
+	return nil
+}
+
+// eventMessages is the gateway's batch of messages of the given kind (eventSyslog), received in
+// the 20 seconds before ts.
+func eventMessages(kind string, ts time.Time) []model.SyslogMessage {
+	rx := func(i int) time.Time { return ts.Add(-time.Duration(20-5*i) * time.Second) }
+	switch kind {
+	case "fiber-down":
+		return []model.SyslogMessage{
+			demoSyslog(rx(0), 16, 2, "ponlinkd", "PON link state O5 -> O1 (loss of signal)", false),
+			demoSyslog(rx(1), 16, 1, "optmon", "Rx optical power below the low alarm threshold (no light received)", false),
+			demoSyslog(rx(2), 16, 3, "wanmgr", "Broadband connection down (PON link lost)", false)}
+	case "fiber-up":
+		return []model.SyslogMessage{
+			demoSyslog(rx(0), 16, 5, "ponlinkd", "PON link state O1 -> O5 (operation)", false),
+			demoSyslog(rx(1), 16, 5, "wanmgr", "Broadband connection up, IPv4 "+demoWANIP, false)}
+	case "wan-down":
+		return []model.SyslogMessage{
+			demoSyslog(rx(0), 16, 3, "wanmgr", "Broadband connection down (no DHCP offer from the AT&T network)", false),
+			demoSyslog(rx(1), 16, 4, "dhcpc", "DHCPDISCOVER on wan0: no answer after 4 attempts", false)}
+	case "wan-up":
+		return []model.SyslogMessage{demoSyslog(rx(0), 16, 5, "wanmgr", "Broadband connection up, IPv4 "+demoWANIP, false)}
+	case "boot":
+		return []model.SyslogMessage{
+			demoSyslog(rx(0), 5, 6, "syslogd", "syslogd started", false),
+			demoSyslog(rx(1), 0, 5, "kernel", "Booting firmware 6.34.7", false),
+			demoSyslog(rx(2), 16, 4, "wanmgr", "Broadband connection not up yet (PON ranging)", false)}
+	case "wifi-up":
+		return []model.SyslogMessage{
+			demoSyslog(rx(0), 3, 6, "wifid", "wl1: STA 02:00:00:00:00:71 associated (5 GHz, RSSI -52 dBm)", false),
+			demoSyslog(rx(1), 3, 6, "dhcpd", "DHCPACK on 192.168.1.71 to 02:00:00:00:00:71 (DESKTOP-DEMO) via br0", false)}
+	case "fec":
+		return []model.SyslogMessage{demoSyslog(rx(0), 16, 4, "ponlinkd", "FEC: 1532 corrected and 12 uncorrectable codewords in the last 60 s", false)}
+	case "dns":
+		return []model.SyslogMessage{demoSyslog(rx(0), 3, 4, "dnsmasq", "nameserver "+demoISPDNS+" did not answer: trying 68.94.157.9", false)}
+	}
+	return nil
+}
+
+// syslogCheckLocked records a check of the gateway's Syslog page (read-only in this version):
+// a gateway_event syslog_setting with the setting read and the page.
+func (w *demoWorld) syslogCheckLocked(ts time.Time) {
+	w.syslogCheck = w.appendLocked(ts, model.TypeGatewayEvent, model.GatewayEvent{Kind: model.GwEvSyslogSetting,
+		After:  "on: 192.168.1.71:514, level Informational",
+		Detail: "read-only check of the gateway's Diagnostics › Syslog page; this version does not change the setting"}, w.page["syslog"])
+}
+
+// syslogStatusLocked is Status.Syslog: the receiver listening, its counters since the service
+// started, the newest message and the gateway's Syslog setting as last read. /demo/syslog shows
+// the other states the dashboard words (syslogState).
+func (w *demoWorld) syslogStatusLocked() *model.SyslogStatus {
+	if w.syslogState == "none" {
+		return nil
+	}
+	sl := &model.SyslogStatus{Enabled: true, Listening: true, Listen: "0.0.0.0:514", Received: w.syslogReceived, Recorded: w.syslogReceived,
+		Rejected: 7, State: "ok", GatewayAt: w.syslogCheck.TS, GatewaySeq: w.syslogCheck.Seq,
+		Gateway: &model.SyslogSetting{Enabled: true, Server: "192.168.1.71", Port: 514, Level: "Informational", Levels: demoSyslogLevels}}
+	if m := w.syslogLast; m != nil {
+		sl.LastAt, sl.Last = m.RX, m.Raw
+		if sl.Last == "" {
+			sl.Last = m.Msg
+		}
+	}
+	switch w.syslogState {
+	case "off":
+		sl.State, sl.Gateway = "off", &model.SyslogSetting{Levels: demoSyslogLevels}
+	case "elsewhere":
+		sl.State, sl.Gateway = "elsewhere", &model.SyslogSetting{Enabled: true, Server: "192.168.1.20", Port: 1514, Level: "Debug", Levels: demoSyslogLevels}
+	case "error":
+		sl.State, sl.Problem = "error", "gateway: login throttled: a login was attempted less than a minute ago"
+	case "unknown":
+		sl.State, sl.Gateway, sl.GatewayAt, sl.GatewaySeq = "unknown", nil, "", 0
+		sl.Problem = "the daily settings check has not read the gateway's Syslog page yet"
+	case "enforce": // as from phase 2
+		sl.Enforce, sl.Target = true, &model.SyslogTarget{Enabled: true, Server: "192.168.1.71", Port: 514, Level: "Informational"}
+	case "nolisten":
+		sl.Listening, sl.ListenErr = false, "listen udp 0.0.0.0:514: bind: Only one usage of each socket address (protocol/network address/port) is normally permitted."
+	case "disabled":
+		sl.Enabled, sl.Listening = false, false
+	}
+	return sl
+}
+
+// ----------------------------------------------------------------------------- traffic
+
+// demoTraffic is the simulated traffic of one minute, in Mb/s: the gateway's WAN counters and
+// this computer's. A rate is known only when its counters could be read before and after.
+type demoTraffic struct {
+	wan, atLeast bool // WAN rates known; "at least" (the 32-bit byte counter may have wrapped)
+	rx, tx       float64
+	pc           bool // this computer's rates known
+	pcRx, pcTx   float64
+}
+
+// trafficMinute simulates the traffic of the minute that starts at t: little at night, busy in
+// the evening, with some streaming peaks; none on the WAN while the AT&T line is down; unknown
+// while the monitor was not running, while this computer could not reach the gateway and across
+// the gateway's restart (its counters start again).
+func (w *demoWorld) trafficMinute(t time.Time) demoTraffic {
+	calm, dns := false, false
+	for _, e := range w.allEventsLocked() {
+		if !e.covers(t) {
+			continue
+		}
+		switch {
+		case e.gap:
+			return demoTraffic{}
+		case e.cause == model.CauseLocalLinkDown:
+			return demoTraffic{pc: true}
+		case !e.boot.IsZero():
+			return demoTraffic{pc: true, pcRx: 0.02, pcTx: 0.01}
+		case e.cause == model.CauseFiberLinkDown || e.cause == model.CauseWANDown:
+			return demoTraffic{wan: true, pc: true, pcRx: 0.03, pcTx: 0.01}
+		case e.state == model.StateDegraded && e.attribution == model.AttrProvider:
+			// The classifier blamed AT&T, so the household's traffic was below 80 Mb/s.
+			calm, dns = true, e.cause == model.CauseISPDNSFailure
+		}
+	}
+	hour := float64(t.Local().Hour()) + float64(t.Local().Minute())/60
+	base := 3 + 22*(1+math.Sin(2*math.Pi*(hour-15)/24))
+	tr := demoTraffic{wan: true, pc: true, rx: base * (0.55 + 0.9*noise(t, 70))}
+	switch {
+	case dns: // what the verdicts of the AT&T DNS incident state
+		tr.rx = 32.8 + noise(t, 71) - 0.5
+	case !t.Before(w.burstFrom) && t.Before(w.burstTo):
+		tr.rx, tr.atLeast = 620+320*noise(t, 72), noise(t, 76) > 0.35
+	case !calm && noise(t, 71) > 0.97:
+		tr.rx += 60 + 180*noise(t, 72) // streaming, a game download
+	case calm:
+		tr.rx = min(tr.rx, 60)
+	}
+	tr.tx = tr.rx*0.12 + 0.4 + 0.6*noise(t, 73)
+	if dns {
+		tr.tx = 5 + 0.2*noise(t, 73) - 0.1
+	}
+	tr.pcRx = tr.rx*(0.2+0.3*noise(t, 77)) + 0.05
+	tr.pcTx = tr.tx*0.4 + 0.02
+	return tr
+}
+
+// trafficLocked aggregates the simulated traffic into the n buckets of step from first, as the
+// monitor does (Series.Traffic): per bucket the mean of the known minutes, the highest of them,
+// and whether any WAN rate is "at least".
+func (w *demoWorld) trafficLocked(first time.Time, step time.Duration, n int, now time.Time) []model.TrafficPoint {
+	rate := func(v float64) *float64 {
+		v = math.Round(v*1000) / 1000
+		return &v
+	}
+	out := make([]model.TrafficPoint, n)
+	for i := range out {
+		a := first.Add(time.Duration(i) * step)
+		p := model.TrafficPoint{T: a.UTC().Format(time.RFC3339)}
+		var wanN, pcN int
+		var rx, tx, rxPeak, txPeak, pcRx, pcTx float64
+		for t := a.Truncate(time.Minute); t.Before(a.Add(step)); t = t.Add(time.Minute) {
+			if t.Before(w.genesis) || t.After(now) {
+				continue
+			}
+			tr := w.trafficMinute(t)
+			if tr.wan {
+				wanN++
+				rx, tx = rx+tr.rx, tx+tr.tx
+				rxPeak, txPeak = max(rxPeak, tr.rx), max(txPeak, tr.tx)
+				p.AtLeast = p.AtLeast || tr.atLeast
+			}
+			if tr.pc {
+				pcN++
+				pcRx, pcTx = pcRx+tr.pcRx, pcTx+tr.pcTx
+			}
+		}
+		if wanN > 0 {
+			p.WANRx, p.WANTx = rate(rx/float64(wanN)), rate(tx/float64(wanN))
+			p.WANRxPeak, p.WANTxPeak = rate(rxPeak), rate(txPeak)
+		}
+		if pcN > 0 {
+			p.PCRx, p.PCTx = rate(pcRx/float64(pcN)), rate(pcTx/float64(pcN))
+		}
+		out[i] = p
+	}
+	return out
+}
+
+// trafficDaysLocked sums the simulated WAN volume per local day from the day of first to today,
+// as the monitor does (Series.TrafficDays): exactly known minutes only ("at least" ones are not
+// exact), complete when every minute of the day until now was.
+func (w *demoWorld) trafficDaysLocked(first, now time.Time) []model.TrafficDay {
+	y, mo, d := first.Local().Date()
+	var out []model.TrafficDay
+	for i := 0; ; i++ {
+		start := time.Date(y, mo, d+i, 0, 0, 0, 0, time.Local)
+		if start.After(now) {
+			break
+		}
+		end := time.Date(y, mo, d+i+1, 0, 0, 0, 0, time.Local)
+		day := model.TrafficDay{Day: start.Format(time.DateOnly), Complete: true}
+		var rx, tx float64
+		for t := start; t.Before(end) && t.Before(now); t = t.Add(time.Minute) {
+			tr := w.trafficMinute(t)
+			if t.Before(w.genesis) || !tr.wan || tr.atLeast {
+				day.Complete = false
+				continue
+			}
+			rx, tx = rx+tr.rx*60e6/8, tx+tr.tx*60e6/8
+			day.CoveredS += 60
+		}
+		day.RxBytes, day.TxBytes = int64(rx), int64(tx)
+		out = append(out, day)
+	}
+	return out
+}
+
 // ----------------------------------------------------------------------------- live outage
 
 // setOutage switches the demo between a healthy line and a live AT&T fiber outage.
@@ -1694,6 +2122,7 @@ func (w *demoWorld) setLive(kind string) {
 		inc.Evidence = append(inc.Evidence, model.EvidenceRef{Seq: r.Seq, Type: model.TypeGatewaySnapshot, Blob: snap.Pages[0].SHA256, Note: "gateway reports Broadband Connection: Down"})
 		r = w.appendLocked(start.Add(32*time.Second), model.TypeGatewayEvent, model.GatewayEvent{Kind: model.GwEvPONState, Before: "OPERATION (O5)", After: "INITIAL (O1)", Evidence: []uint64{r.Seq}})
 		inc.Evidence = append(inc.Evidence, model.EvidenceRef{Seq: r.Seq, Type: model.TypeGatewayEvent, Note: "pon_state O5 → O1"})
+		w.appendSyslogLocked(start.Add(33*time.Second), 0, eventMessages("fiber-down", start.Add(33*time.Second))...)
 	}
 	r = w.appendLocked(start.Add(40*time.Second), model.TypeTraceroute, traceroute("8.8.8.8", "incident_open", e.incidentID, false))
 	inc.Evidence = append(inc.Evidence, model.EvidenceRef{Seq: r.Seq, Type: model.TypeTraceroute, Note: "traceroute 8.8.8.8"})
@@ -1705,6 +2134,9 @@ func (w *demoWorld) endLiveLocked(now time.Time) {
 	e.to = now
 	w.events = append(w.events, e)
 	w.live, w.liveInc = nil, nil
+	if e.cause == model.CauseFiberLinkDown {
+		w.appendSyslogLocked(now, 0, eventMessages("fiber-up", now)...)
+	}
 	w.appendLocked(now, model.TypeStateChange, model.StateChange{FromState: e.state, FromCause: e.cause, ToState: model.StateOnline, At: now.UTC().Format(time.RFC3339Nano), Cycle: w.cycle})
 	inc.Open = false
 	inc.Closed = now.UTC().Format(time.RFC3339Nano)
@@ -1842,6 +2274,7 @@ func (w *demoWorld) Status() model.Status {
 	if w.hostile != "" { // a condition code the dashboard does not know
 		st.Conditions = append(st.Conditions, model.Condition{Code: "UNKNOWN_FLAG " + w.hostile, Severity: "warning", Message: "unknown condition"})
 	}
+	st.Syslog = w.syslogStatusLocked()
 	return hostileCopy(w.hostile, st)
 }
 
@@ -1976,6 +2409,9 @@ func (w *demoWorld) Series(rangeName string) (model.Series, error) {
 		s.Points = append(s.Points, w.bucketLocked(b, b.Add(r.step)))
 	}
 	s.Optical = w.opticalLocked(from, now, r.optical)
+	s.Traffic = w.trafficLocked(from, r.step, len(s.Points), now)
+	s.TrafficDays = w.trafficDaysLocked(from, now)
+	s.HeavyTrafficMbps = 80
 	return hostileCopy(w.hostile, s), nil
 }
 
@@ -2587,6 +3023,102 @@ func TestDemoWorldEndpoints(t *testing.T) {
 		isRecord("traffic to", in.TrafficToSeq, model.TypeGatewaySnapshot)
 	}
 
+	// Syslog (docs/syslog-snmp-traffic.md §3.2): the receiver's status and the latest check of the
+	// gateway's setting; the messages newest first; the window of an incident (± 5 min, as the
+	// incident page asks) holds the gateway's own account of it, or nothing.
+	if sl := st.Syslog; sl == nil || !sl.Listening || sl.State != "ok" || sl.Received == 0 || sl.Gateway == nil || !sl.Gateway.Enabled || sl.LastAt == "" {
+		t.Errorf("syslog status: %+v", st.Syslog)
+	} else {
+		isRecord("syslog setting check", sl.GatewaySeq, model.TypeGatewayEvent)
+	}
+	var sl model.SyslogList
+	strict(ok(demoGet(t, h, "GET", "/api/syslog", ""), 200), &sl)
+	if len(sl.Messages) != DefaultSyslogLimit || !sl.Truncated {
+		t.Errorf("syslog: %d messages, truncated %v", len(sl.Messages), sl.Truncated)
+	}
+	var prevRX time.Time
+	for i, m := range sl.Messages {
+		rx, err := time.Parse(time.RFC3339Nano, m.RX)
+		if err != nil || (i > 0 && rx.After(prevRX)) {
+			t.Fatalf("syslog message %d received %q, after %v: not newest first", i, m.RX, prevRX)
+		}
+		prevRX = rx
+	}
+	isRecord("syslog batch", sl.Messages[0].Seq, model.TypeSyslog)
+	window := func(inc model.Incident, extra string) model.SyslogList {
+		t.Helper()
+		opened, err1 := time.Parse(time.RFC3339Nano, inc.Opened)
+		closed, err2 := time.Parse(time.RFC3339Nano, inc.Closed)
+		if err1 != nil || err2 != nil {
+			t.Fatalf("incident %s: opened %q closed %q", inc.ID, inc.Opened, inc.Closed)
+		}
+		q := "from=" + opened.Add(-5*time.Minute).UTC().Format(time.RFC3339Nano) + "&to=" + closed.Add(5*time.Minute).UTC().Format(time.RFC3339Nano) + extra
+		var list model.SyslogList
+		strict(ok(demoGet(t, h, "GET", "/api/syslog?"+q, ""), 200), &list)
+		return list
+	}
+	msgs := func(list model.SyslogList) []string {
+		var out []string
+		for _, m := range list.Messages {
+			out = append(out, m.App+": "+m.Msg)
+		}
+		return out
+	}
+	byCause := map[string]model.Incident{}
+	for _, inc := range incs {
+		byCause[inc.Cause] = inc
+	}
+	fiberLog := msgs(window(byCause[model.CauseFiberLinkDown], ""))
+	for _, want := range []string{"ponlinkd: PON link state O5 -> O1 (loss of signal)", "ponlinkd: PON link state O1 -> O5 (operation)"} {
+		if !slices.Contains(fiberLog, want) {
+			t.Errorf("the fiber outage's syslog lacks %q: %q", want, fiberLog)
+		}
+	}
+	if crit := msgs(window(byCause[model.CauseFiberLinkDown], "&severity=crit")); len(crit) != 2 {
+		t.Errorf("the fiber outage's critical messages: %q", crit)
+	}
+	if quiet := window(byCause[model.CauseHighLatency], ""); len(quiet.Messages) != 0 {
+		t.Errorf("the high-latency incident's window holds messages: %q", msgs(quiet))
+	}
+
+	// Traffic (docs/syslog-snmp-traffic.md §3.3): a point per bucket; unknown where nothing could
+	// be read; the big download "at least"; the days with complete and partial totals.
+	for _, rng := range SeriesRanges {
+		var s model.Series
+		strict(ok(demoGet(t, h, "GET", "/api/series?range="+rng, ""), 200), &s)
+		if len(s.Traffic) != len(s.Points) || s.HeavyTrafficMbps != 80 || len(s.TrafficDays) == 0 {
+			t.Errorf("%s: %d traffic points for %d buckets, heavy-traffic line %v, %d days", rng, len(s.Traffic), len(s.Points), s.HeavyTrafficMbps, len(s.TrafficDays))
+		}
+	}
+	var known, unknown, atLeast int
+	for _, p := range s7.Traffic {
+		switch {
+		case p.WANRx == nil:
+			unknown++
+		case p.AtLeast:
+			atLeast++
+		default:
+			known++
+			if *p.WANRxPeak < *p.WANRx || p.PCRx == nil {
+				t.Errorf("traffic point %+v", p)
+			}
+		}
+	}
+	complete, partial := 0, 0
+	for _, d := range s7.TrafficDays {
+		if _, err := time.Parse(time.DateOnly, d.Day); err != nil || d.RxBytes <= 0 || d.CoveredS <= 0 {
+			t.Errorf("traffic day %+v", d)
+		}
+		if d.Complete {
+			complete++
+		} else {
+			partial++
+		}
+	}
+	if known == 0 || unknown == 0 || atLeast == 0 || complete == 0 || partial == 0 {
+		t.Errorf("7d traffic: %d known, %d unknown, %d at least; days %d complete, %d partial", known, unknown, atLeast, complete, partial)
+	}
+
 	// Gateway certificate (docs/DESIGN.md §2): nothing pending is a 404; a changed certificate
 	// shows the condition, citing its cert_changed record, and the certificate state the
 	// dashboard draws from (Status.GatewayCert), and pauses authenticated actions; a
@@ -2817,6 +3349,14 @@ func TestDemoServer(t *testing.T) {
 		default:
 			w.liveDNSRetry = "answered"
 		}
+		w.mu.Unlock()
+		fmt.Fprintln(rw, "ok")
+	})
+	// /demo/syslog?state=off|elsewhere|error|unknown|enforce|nolisten|disabled|none shows the
+	// gateway syslog card in that state (no state: the gateway sends here).
+	mux.HandleFunc("/demo/syslog", func(rw http.ResponseWriter, r *http.Request) {
+		w.mu.Lock()
+		w.syslogState = r.URL.Query().Get("state")
 		w.mu.Unlock()
 		fmt.Fprintln(rw, "ok")
 	})

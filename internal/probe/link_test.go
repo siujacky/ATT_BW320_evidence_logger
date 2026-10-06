@@ -116,7 +116,7 @@ func TestLinkFromAdapter(t *testing.T) {
 	}
 }
 
-// fakeLink installs adapter, route and netsh seams on a Prober.
+// fakeLink installs adapter, route, netsh and interface-counter seams on a Prober.
 type fakeLink struct {
 	adapters   []adapterInfo
 	adaptErr   error
@@ -124,6 +124,10 @@ type fakeLink struct {
 	netshOut   []byte
 	netshErr   error
 	netshCalls atomic.Int32
+	// counters answers the interface-counter reads (nil: every read fails, so the link carries
+	// no counters); ctrCalls counts the reads.
+	counters func(luid uint64, index uint32) (rx, tx uint64, err error)
+	ctrCalls atomic.Int32
 }
 
 func (f *fakeLink) install(p *Prober) {
@@ -137,6 +141,13 @@ func (f *fakeLink) install(p *Prober) {
 	p.runNetsh = func(context.Context) ([]byte, error) {
 		f.netshCalls.Add(1)
 		return f.netshOut, f.netshErr
+	}
+	p.ifCounters = func(luid uint64, index uint32) (uint64, uint64, error) {
+		f.ctrCalls.Add(1)
+		if f.counters == nil {
+			return 0, 0, errors.New("GetIfEntry2Ex: The system cannot find the file specified.")
+		}
+		return f.counters(luid, index)
 	}
 }
 
@@ -277,5 +288,103 @@ func TestLocalLinkRemembersOnlyOnLinkAdapters(t *testing.T) {
 	f.adapters, f.best = []adapterInfo{adEthOnLAN, adHyperV}, 7
 	if _, _, err := p.LocalLink(context.Background(), "192.168.1.254"); err != nil || p.lastAdapter != "{ETH2-GUID}" {
 		t.Fatalf("on-link match not remembered: %q %v", p.lastAdapter, err)
+	}
+}
+
+// TestLocalLinkCounters: every reading carries the octet counters of the adapter it describes
+// (by NET_LUID, else by interface index), read before netsh; counters that cannot be read stay
+// nil and change nothing else in the reading.
+func TestLocalLinkCounters(t *testing.T) {
+	eth := adEthOnLAN
+	eth.Luid = 0x6008001000000
+	wifi := adWiFi
+	wifi.Luid = 0x47008000000000
+	var order []string
+	byLuid := func(luid uint64, index uint32) (uint64, uint64, error) {
+		order = append(order, "counters")
+		switch luid {
+		case eth.Luid:
+			return 9_000_000_000_000, 1_234, nil
+		case wifi.Luid:
+			return 32_529_277_092, 32_435_574_470, nil
+		}
+		return 0, 0, errors.New("GetIfEntry2Ex: The system cannot find the file specified.")
+	}
+
+	f := &fakeLink{adapters: []adapterInfo{adHyperV, wifi, eth}, best: 7, counters: byLuid}
+	p := New(Options{})
+	f.install(p)
+	link, _, err := p.LocalLink(context.Background(), "192.168.1.254")
+	if err != nil || link.Interface != "Ethernet" || link.RxBytes == nil || link.TxBytes == nil ||
+		*link.RxBytes != 9_000_000_000_000 || *link.TxBytes != 1_234 || link.Err != "" {
+		t.Fatalf("ethernet: %+v %v", link, err)
+	}
+	want := model.LocalLink{Interface: "Ethernet", Type: "ethernet", State: "connected", LocalIP: "192.168.1.80",
+		GatewayIP: "192.168.1.254", LinkMbps: 1000}
+	got := link
+	got.RxBytes, got.TxBytes = nil, nil
+	if got != want {
+		t.Fatalf("the counters change nothing else: %+v", got)
+	}
+
+	// Wi-Fi: the counters are read before netsh runs (the reading's time is when it starts).
+	f = &fakeLink{adapters: []adapterInfo{wifi}, best: 15, netshOut: readFixture(t, "netsh_two_interfaces.txt"), counters: byLuid}
+	p = New(Options{})
+	f.install(p)
+	p.runNetsh = func(context.Context) ([]byte, error) {
+		order = append(order, "netsh")
+		return f.netshOut, nil
+	}
+	order = nil
+	link, _, err = p.LocalLink(context.Background(), "192.168.1.254")
+	if err != nil || link.SSID != "ATTexample" || link.RxBytes == nil || *link.RxBytes != 32_529_277_092 || *link.TxBytes != 32_435_574_470 {
+		t.Fatalf("wifi: %+v %v", link, err)
+	}
+	if strings.Join(order, ",") != "counters,netsh" {
+		t.Fatalf("order %v", order)
+	}
+
+	// No LUID known: the interface index identifies the adapter.
+	f = &fakeLink{adapters: []adapterInfo{adEthOnLAN}, best: 7, counters: func(luid uint64, index uint32) (uint64, uint64, error) {
+		if luid != 0 || index != 7 {
+			return 0, 0, errors.New("wrong interface")
+		}
+		return 5, 6, nil
+	}}
+	p = New(Options{})
+	f.install(p)
+	if link, _, _ = p.LocalLink(context.Background(), "192.168.1.254"); link.RxBytes == nil || *link.RxBytes != 5 || *link.TxBytes != 6 {
+		t.Fatalf("by index: %+v", link)
+	}
+
+	// The adapter lost its address (selected as the previous one): its counters still count.
+	f = &fakeLink{adapters: []adapterInfo{eth}, best: 7, counters: byLuid}
+	p = New(Options{})
+	f.install(p)
+	if _, _, err := p.LocalLink(context.Background(), "192.168.1.254"); err != nil {
+		t.Fatal(err)
+	}
+	down := eth
+	down.OperStatus, down.IPv4, down.Gateways = operDown, nil, nil
+	f.adapters, f.best = []adapterInfo{down}, 0
+	if link, _, _ = p.LocalLink(context.Background(), "192.168.1.254"); link.State != "disconnected" || link.RxBytes == nil {
+		t.Fatalf("previous adapter: %+v", link)
+	}
+
+	// Unreadable counters: nil, and no error in the reading.
+	f = &fakeLink{adapters: []adapterInfo{adEthOnLAN}, best: 7}
+	p = New(Options{})
+	f.install(p)
+	link, _, err = p.LocalLink(context.Background(), "192.168.1.254")
+	if err != nil || link.RxBytes != nil || link.TxBytes != nil || link.Err != "" || f.ctrCalls.Load() != 1 {
+		t.Fatalf("unreadable: %+v %v (%d reads)", link, err, f.ctrCalls.Load())
+	}
+
+	// No adapter identified: nothing to read.
+	f = &fakeLink{adapters: []adapterInfo{adLoop}, counters: byLuid}
+	p = New(Options{})
+	f.install(p)
+	if link, _, err = p.LocalLink(context.Background(), "192.168.1.254"); err == nil || link.RxBytes != nil || f.ctrCalls.Load() != 0 {
+		t.Fatalf("no adapter: %+v %v (%d reads)", link, err, f.ctrCalls.Load())
 	}
 }

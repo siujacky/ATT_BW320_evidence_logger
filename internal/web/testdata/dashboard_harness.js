@@ -8,9 +8,10 @@
  *
  *   node dashboard_harness.js <base URL> <scenario>        (marker in $HARNESS_MARKER)
  *
- * Scenarios: "hostile" (every remote string carries the marker) and "cert" (a changed gateway
+ * Scenarios: "hostile" (every remote string carries the marker), "cert" (a changed gateway
  * certificate is waiting for confirmation; the harness looks at the Gateway page, then confirms
- * it through the dialog on the overview).
+ * it through the dialog on the overview) and "overview" (the overview and the Syslog page only);
+ * any other name visits every view.
  *
  * The fake DOM has no HTML parser: assigning innerHTML/outerHTML, insertAdjacentHTML and
  * document.write are recorded as violations. After every step the whole document is checked:
@@ -344,7 +345,7 @@ function el(tag, attrs, ...kids) {
 }
 
 document.head.append(el('meta', { name: 'att-monitor-version', content: 'harness' }));
-const navItems = ['overview', 'incidents', 'gateway', 'evidence', 'records'].map((r) => {
+const navItems = ['overview', 'incidents', 'gateway', 'syslog', 'evidence', 'records'].map((r) => {
   const a = el('a', { href: r === 'overview' ? '#/' : '#/' + r }, r);
   a.dataset.route = r;
   return el('li', null, a);
@@ -473,6 +474,13 @@ function capture(name) {
     // Every table row with the status chips it shows, so that a test can tell a red chip
     // from a green one (the text alone cannot).
     rows: view().querySelectorAll('tr').map((tr) => ({ text: tr.textContent, chips: tr.querySelectorAll('.chip').map(chipOf) })),
+    // Chart marks that carry meaning without text: peak marks, "at least" chevrons, reference
+    // lines.
+    marks: {
+      peak: view().querySelectorAll('line.pk').length,
+      atleast: view().querySelectorAll('path.atleast').length,
+      ref: view().querySelectorAll('line.thr-ref').length,
+    },
   };
 }
 
@@ -566,6 +574,25 @@ async function run() {
   exerciseCharts();
   await settle();
   capture('overview');
+  if (scenario === 'overview') { // the status cards only (and the Syslog page's)
+    await visit('#/syslog');
+    capture('syslog');
+    return;
+  }
+  // The charts over 7 days (the range is remembered: back to 24 hours afterwards).
+  const week = view().querySelector('input[value="7d"]');
+  if (week) {
+    week.checked = true;
+    week.dispatchEvent(new FakeEvent('change'));
+    await settle();
+    exerciseCharts(); // the table views were on: back to the plots
+    await settle();
+    capture('overview 7d');
+    const day = view().querySelector('input[value="24h"]');
+    day.checked = true;
+    day.dispatchEvent(new FakeEvent('change'));
+    await settle();
+  }
 
   if (scenario === 'cert') {
     await visit('#/gateway');
@@ -596,6 +623,34 @@ async function run() {
   await visit('#/gateway');
   await openAllDetails();
   capture('gateway');
+
+  // The gateway's syslog: the newest messages, more of them, then the filters (the search box
+  // is debounced).
+  await visit('#/syslog');
+  await openAllDetails();
+  capture('syslog');
+  const more = button('Load more');
+  if (more && !more.hidden) {
+    more.click();
+    await settle();
+    await openAllDetails();
+    capture('syslog more');
+  }
+  const sev = view().querySelector('select');
+  if (sev) {
+    sev.value = 'err';
+    sev.dispatchEvent(new FakeEvent('change'));
+    await settle();
+    capture('syslog severity');
+    sev.value = '';
+    const box = view().querySelector('input[type="search"]');
+    box.value = 'PON';
+    box.dispatchEvent(new FakeEvent('input'));
+    await tick(500);
+    await settle();
+    await openAllDetails();
+    capture('syslog search');
+  }
 
   await visit('#/evidence');
   await press('Verify the whole ledger now');

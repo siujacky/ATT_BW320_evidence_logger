@@ -148,6 +148,8 @@ type rebuildState struct {
 	lastClock       *clockRef
 	points          *pointStore
 	records         int
+	// The limits of the traffic history: the monitor's gap limit and pcSpanLimit.
+	gap, pcSpan time.Duration
 }
 
 func (rb *rebuildState) fromCache(c *stateCache) {
@@ -299,7 +301,9 @@ func (rb *rebuildState) apply(body model.Body) {
 	}
 }
 
-// collectPoint adds a recent sample or snapshot to the chart/statistics history.
+// collectPoint adds a recent sample, snapshot or local link to the chart/statistics history.
+// Records come in ledger order, so the cycles a traffic interval spans are known when it is
+// added (its gap check).
 func (rb *rebuildState) collectPoint(body model.Body) {
 	switch body.Type {
 	case model.TypeSample:
@@ -316,20 +320,63 @@ func (rb *rebuildState) collectPoint(body model.Body) {
 		rb.points.addSample(start, &s)
 	case model.TypeGatewaySnapshot:
 		var d struct {
+			// Only what the traffic history needs besides the derived facts (wanTrafficOf).
+			Pages []struct {
+				Page      string `json:"page"`
+				FetchedAt string `json:"fetched_at"`
+			} `json:"pages"`
+			System *struct {
+				UptimeSec int64 `json:"uptime_s"`
+			} `json:"system"`
+			Broadband *struct {
+				Counters map[string]int64 `json:"counters"`
+			} `json:"broadband"`
 			Derived model.GatewayDerived `json:"derived"`
 		}
 		if json.Unmarshal(body.Data, &d) != nil || !d.Derived.Reachable {
 			return
 		}
+		ts, ok := parseTS(body.TS)
+		if !ok {
+			return
+		}
+		rb.points.addOptical(ts, d.Derived)
+		if d.Broadband == nil || len(d.Broadband.Counters) == 0 {
+			return
+		}
+		s := &model.GatewaySnapshot{Broadband: &model.BroadbandStatus{Counters: d.Broadband.Counters}, Derived: d.Derived}
+		if d.System != nil {
+			s.System = &model.SystemInfo{UptimeSec: d.System.UptimeSec}
+		}
+		at := ts // as loadSnapshot: the earliest request time, closer to the observation
+		for _, p := range d.Pages {
+			s.Pages = append(s.Pages, model.PageCapture{Page: p.Page, FetchedAt: p.FetchedAt})
+			if t, ok := parseTS(p.FetchedAt); ok && t.Before(at) {
+				at = t
+			}
+		}
+		rb.points.addWAN(&snapObs{Seq: body.Seq, At: at, Snap: s}, rb.gap)
+	case model.TypeLocalLink:
+		// This computer's counters as recorded (every LocalLinkRecordEvery): the record's time
+		// stands for the reading's (see the traffic history in traffic.go).
+		var l struct {
+			Interface string  `json:"interface"`
+			RxBytes   *uint64 `json:"rx_bytes"`
+			TxBytes   *uint64 `json:"tx_bytes"`
+		}
+		if json.Unmarshal(body.Data, &l) != nil || l.RxBytes == nil || l.TxBytes == nil {
+			return
+		}
 		if ts, ok := parseTS(body.TS); ok {
-			rb.points.addOptical(ts, d.Derived)
+			rb.points.addPC(ts, &model.LocalLink{Interface: l.Interface, RxBytes: l.RxBytes, TxBytes: l.TxBytes}, rb.pcSpan, rb.gap)
 		}
 	}
 }
 
 // rebuild restores incidents, custody facts, the latest snapshots, anchor and notification
-// state, and 7 days of samples from the ledger (docs/PACKAGES.md "internal/monitor").
-// Failures are logged: the monitor still starts, with whatever could be read.
+// state, and 7 days of samples, optical readings and traffic from the ledger
+// (docs/PACKAGES.md "internal/monitor"). Failures are logged: the monitor still starts, with
+// whatever could be read.
 func (m *Monitor) rebuild(now time.Time) {
 	if m.reader == nil {
 		m.log.Warn("no ledger reader: monitor state not rebuilt")
@@ -337,6 +384,7 @@ func (m *Monitor) rebuild(now time.Time) {
 	}
 	t0 := time.Now()
 	rb := &rebuildState{runID: m.runID, incidents: map[string]model.Incident{}, points: newPointStore(), alarms: map[string]alarmMark{}}
+	rb.gap, rb.pcSpan = gapLimit(m.set.fast), pcSpanLimit(m.set.linkInterval, m.set.linkRecordEvery)
 	cutoff := now.Add(-seriesKeep)
 	cache, cached := m.loadCache()
 	from := uint64(0)

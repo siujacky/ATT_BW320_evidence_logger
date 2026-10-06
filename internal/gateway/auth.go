@@ -24,7 +24,7 @@ const (
 	sessionsFullCooldown = 5 * time.Minute  // no login while the gateway's session pool is full
 	sessionReuse         = 5 * time.Minute  // an authenticated session is reused this long after its last use
 	handshakeRetries     = 5                // extra GETs while the login page has no nonce yet
-	protectedPage        = "events"         // page used to start (and verify) a login
+	notificationPage     = "events"         // Diagnostics > Event Notifications (bbevent)
 )
 
 // Authentication errors. All errors returned by the authenticated operations are free of
@@ -194,13 +194,14 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// eventsPage returns the authenticated events.ha page, reusing a recent session when the
-// gateway still honours it, otherwise logging in.
-func (c *Client) eventsPage(ctx context.Context) (*authSession, []byte, error) {
+// authPage returns an authenticated page (e.g. "events", "syslog"), reusing a recent session
+// when the gateway still honours it, otherwise logging in with that page as the protected
+// page (so a login costs no extra request for the page itself).
+func (c *Client) authPage(ctx context.Context, page string) (*authSession, []byte, error) {
 	if s := c.reusableSession(); s != nil {
-		ex := c.do(ctx, s.hc, http.MethodGet, c.pageURL(protectedPage), "", "")
+		ex := c.do(ctx, s.hc, http.MethodGet, c.pageURL(page), "", "")
 		if !ex.responded {
-			return nil, nil, fmt.Errorf("gateway: GET %s: %w", protectedPage, ex.err)
+			return nil, nil, fmt.Errorf("gateway: GET %s: %w", page, ex.err)
 		}
 		p := scan(ex.body)
 		if p.sessionsFull() {
@@ -210,23 +211,23 @@ func (c *Client) eventsPage(ctx context.Context) (*authSession, []byte, error) {
 			c.touch(s)
 			return s, ex.body, nil
 		}
-		c.log.Debug("gateway session no longer valid; logging in again", "status", ex.status, "login_page", p.isLogin())
+		c.log.Debug("gateway session no longer valid; logging in again", "page", page, "status", ex.status, "login_page", p.isLogin())
 		c.dropSession()
 	}
-	return c.login(ctx)
+	return c.login(ctx, page)
 }
 
 // login performs the BGW320 login (docs/DESIGN.md §2) in a fresh cookie session and returns
-// the session plus the protected page fetched to verify it.
+// the session plus the protected page (e.g. "events") fetched to verify it.
 //
-//  1. GET /cgi-bin/events.ha: the first answer is a login page without nonce (cookie
-//     handshake); GET again (up to 5 retries, small backoff) until the login page carries
-//     <input name="nonce">.
+//  1. GET the protected page (e.g. /cgi-bin/events.ha): the first answer is a login page
+//     without nonce (cookie handshake); GET again (up to 5 retries, small backoff) until the
+//     login page carries <input name="nonce">.
 //  2. POST /cgi-bin/login.ha with nonce, password = "*" x len(code), hashpassword =
 //     lowercase hex MD5(code + nonce), Continue=Continue, and a Referer header.
 //  3. Success = a 302 that does not point back to login.ha (or a non-login 200) AND the next
 //     GET of the protected page is not a login page.
-func (c *Client) login(ctx context.Context) (*authSession, []byte, error) {
+func (c *Client) login(ctx context.Context, protectedPage string) (*authSession, []byte, error) {
 	now := c.now()
 	if err := c.loginAllowed(now); err != nil {
 		return nil, nil, err
@@ -381,6 +382,81 @@ func formEscape(s string) string {
 	return strings.ReplaceAll(e, "~", "%7E")
 }
 
+// ---------------------------------------------------------------- posting a settings form
+
+// postForm posts a settings form (body, application/x-www-form-urlencoded) to page in session
+// s, with the page itself as Referer, and classifies the answer. err is set when the POST
+// cannot have changed anything worth reading back (no connection was made), when the session
+// pool is full and when the session has expired (ErrLoginRequired). Otherwise problem is ""
+// when the gateway answered with a page (200) or a redirect, and says why the outcome is
+// unknown when there was no answer or an error status: the gateway may still have applied
+// the form, so the caller reads the setting back either way - the result and the "after"
+// evidence must say what the gateway now reports, not merely that the POST went wrong.
+func (c *Client) postForm(ctx context.Context, s *authSession, page, body string) (ex exchange, problem string, err error) {
+	pageURL := c.pageURL(page)
+	ex = c.do(ctx, s.hc, http.MethodPost, pageURL, body, pageURL)
+	switch {
+	case !ex.responded && !ex.connected:
+		// No connection was made, so the gateway cannot have received the form.
+		return ex, "", fmt.Errorf("gateway: POST %s.ha: %w", page, ex.err)
+	case !ex.responded:
+		return ex, "no answer to the POST: " + ex.err.Error(), nil
+	}
+	p := scan(ex.body)
+	switch {
+	case p.sessionsFull():
+		return ex, "", c.noteSessionsFull()
+	case ex.status == http.StatusOK && p.isLogin(), isLoginRedirect(ex):
+		c.dropSession()
+		return ex, "", fmt.Errorf("gateway: POST %s.ha: %w (session expired)", page, ErrLoginRequired)
+	case ex.status != http.StatusOK && (ex.status < 300 || ex.status >= 400):
+		return ex, "the POST was answered with HTTP " + statusText(ex.status), nil
+	}
+	return ex, "", nil
+}
+
+// readBack reads page again in session s after postForm; problem is the POST's unknown
+// outcome, which errors repeat. after is the body read, returned with the error too when
+// there is one (nil when no answer arrived). Parsing the page is up to the caller.
+func (c *Client) readBack(ctx context.Context, s *authSession, page, problem string) (after []byte, err error) {
+	ex := c.do(ctx, s.hc, http.MethodGet, c.pageURL(page), "", "")
+	prefix := "gateway: "
+	if problem != "" {
+		prefix = fmt.Sprintf("gateway: POST %s.ha: %s; ", page, problem)
+	}
+	switch {
+	case !ex.responded:
+		return nil, fmt.Errorf("%sverifying GET %s.ha: %w", prefix, page, ex.err)
+	case ex.err != nil:
+		return ex.body, fmt.Errorf("%sverifying GET %s.ha: %w", prefix, page, ex.err)
+	case isLoginRedirect(ex):
+		c.dropSession()
+		return ex.body, fmt.Errorf("gateway: verifying GET %s.ha: %w (session expired)", page, ErrLoginRequired)
+	}
+	return ex.body, nil
+}
+
+// getPage GETs page in session s (when a POST was answered with a redirect to it).
+func (c *Client) getPage(ctx context.Context, s *authSession, page string) ([]byte, error) {
+	ex := c.do(ctx, s.hc, http.MethodGet, c.pageURL(page), "", "")
+	if !ex.responded {
+		return nil, fmt.Errorf("gateway: GET %s.ha: %w", page, ex.err)
+	}
+	p := scan(ex.body)
+	switch {
+	case p.sessionsFull():
+		return nil, c.noteSessionsFull()
+	case p.isLogin(), isLoginRedirect(ex):
+		c.dropSession()
+		return nil, fmt.Errorf("gateway: GET %s.ha: %w (session expired)", page, ErrLoginRequired)
+	case ex.status != http.StatusOK:
+		return nil, fmt.Errorf("gateway: GET %s.ha: unexpected HTTP status %s", page, statusText(ex.status))
+	case ex.err != nil:
+		return nil, fmt.Errorf("gateway: GET %s.ha: %w", page, ex.err)
+	}
+	return ex.body, nil
+}
+
 // ---------------------------------------------------------------- notification setting
 
 // Notification reads the "Broadband Status Notification" (bbevent) setting from events.ha.
@@ -391,7 +467,7 @@ func (c *Client) Notification(ctx context.Context) (enabled bool, raw []byte, er
 		return false, nil, err
 	}
 	defer c.release()
-	_, body, err := c.eventsPage(ctx)
+	_, body, err := c.authPage(ctx, notificationPage)
 	if err != nil {
 		return false, nil, err
 	}
@@ -417,7 +493,7 @@ func (c *Client) SetNotification(ctx context.Context, enabled bool) (before, aft
 		return nil, nil, err
 	}
 	defer c.release()
-	s, before, err := c.eventsPage(ctx)
+	s, before, err := c.authPage(ctx, notificationPage)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -439,54 +515,18 @@ func (c *Client) SetNotification(ctx context.Context, enabled bool) (before, aft
 		fields = append(fields, "bbevent", "on") // an unchecked checkbox is simply omitted
 	}
 	fields = append(fields, "Save", "Save")
-	pageURL := c.pageURL(protectedPage)
-	ex := c.do(ctx, s.hc, http.MethodPost, pageURL, encodeForm(fields...), pageURL)
-
-	// When the POST may have reached the gateway but its outcome is unknown (no answer, or an
-	// error status), the setting is read back anyway: the result and the "after" evidence must
-	// say what the gateway now reports, not merely that the POST went wrong.
-	var postProblem string
-	switch {
-	case !ex.responded && !ex.connected:
-		// No connection was made, so the gateway cannot have received the form.
-		return before, nil, fmt.Errorf("gateway: POST events.ha: %w", ex.err)
-	case !ex.responded:
-		postProblem = "no answer to the POST: " + ex.err.Error()
-	default:
-		pp := scan(ex.body)
-		switch {
-		case pp.sessionsFull():
-			return before, nil, c.noteSessionsFull()
-		case ex.status == http.StatusOK && pp.isLogin(), isLoginRedirect(ex):
-			c.dropSession()
-			return before, nil, fmt.Errorf("gateway: POST events.ha: %w (session expired)", ErrLoginRequired)
-		case ex.status != http.StatusOK && (ex.status < 300 || ex.status >= 400):
-			postProblem = "the POST was answered with HTTP " + statusText(ex.status)
-		}
+	ex, postProblem, err := c.postForm(ctx, s, notificationPage, encodeForm(fields...))
+	if err != nil {
+		return before, nil, err
 	}
 	if postProblem == "" {
 		c.log.Info("gateway notification setting posted", "enabled", enabled, "status", ex.status, "location", ex.location)
 	} else {
 		c.log.Warn("gateway notification POST outcome unknown; reading the setting back", "enabled", enabled, "detail", postProblem)
 	}
-
-	ex = c.do(ctx, s.hc, http.MethodGet, pageURL, "", "")
-	if !ex.responded {
-		if postProblem != "" {
-			return before, nil, fmt.Errorf("gateway: POST events.ha: %s; verifying GET events.ha: %w", postProblem, ex.err)
-		}
-		return before, nil, fmt.Errorf("gateway: verifying GET events.ha: %w", ex.err)
-	}
-	after = ex.body
-	if ex.err != nil {
-		if postProblem != "" {
-			return before, after, fmt.Errorf("gateway: POST events.ha: %s; verifying GET events.ha: %w", postProblem, ex.err)
-		}
-		return before, after, fmt.Errorf("gateway: verifying GET events.ha: %w", ex.err)
-	}
-	if isLoginRedirect(ex) {
-		c.dropSession()
-		return before, after, fmt.Errorf("gateway: verifying GET events.ha: %w (session expired)", ErrLoginRequired)
+	after, err = c.readBack(ctx, s, notificationPage, postProblem)
+	if err != nil {
+		return before, after, err
 	}
 	got, err := parseNotification(scan(after))
 	if err != nil {

@@ -1,0 +1,145 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html lang="en" xml:lang="en" xmlns="http://www.w3.org/1999/xhtml" >
+    <head>
+<!-- SYNTHETIC FIXTURE, not a capture: the Syslog page (syslog.ha) as modelled on the BGW320
+     markup of events.ha and broadbandconfig.ha. Phase 2 replaces it with the real page
+     (see testdata/gateway/README.md). -->
+        <title>Syslog</title>
+        <meta http-equiv="Content-Type" content="text/html; charset=windows-1252" />
+        <meta http-equiv="Content-Style-Type" content="text/css" />
+        <meta http-equiv="Content-Script-Type" content="type" />
+        <link rel="icon" type="image/ico" href="/favicon.ico" />
+        <link rel="stylesheet" type="text/css" href="/baseINID.css" />
+        <link rel="stylesheet" type="text/css" href="/INID.css" />
+<script type="text/css"><!--
+<style id="antiClickjack" type="text/css">body{display:none;}</style>
+//-->
+</script>
+    <script language="javascript" type="text/javascript"><!--
+if (self == top) {
+    var antiClickjack = document.getElementById("antiClickjack");
+    antiClickjack.parentNode.removeChild(antiClickjack);
+} else {
+    top.location = self.location;
+}
+//-->
+</script>
+    </head>
+           <body>
+  <div id="wrapper">
+    <div id="whole-page">
+      <div id="main-content">
+        <div id="header">
+          <div id="tab-container">
+            <div id="logo-div">
+	      <img id="main-logo" src="/images/att_logo.png" alt="" style="height:42px;" />
+            </div>
+            <div style="clear: both;"></div>
+<div id="skip"><a href="#content-sub">Skip to Main Content</a></div>
+            <div id="top-navigation">
+              <div id="top-navigation-buttons">
+<a class="topnav" href="/cgi-bin/home.ha"><span>Device</span></a>
+<a class="topnav" href="/cgi-bin/broadbandstatistics.ha"><span>Broadband</span></a>
+<a class="topnav" href="/cgi-bin/lanstatistics.ha"><span>
+Home Network
+</span></a>
+
+<a class="topnav" href="/cgi-bin/voice.ha"><span>Voice</span></a>
+<a class="topnav" href="/cgi-bin/firewall.ha"><span>Firewall</span></a>
+<a class="topnav topnavselected" href="/cgi-bin/diag.ha"><span>Diagnostics</span></a>
+              <div style="clear: both;"></div>
+            </div>
+          </div>
+          <div id="secondary-nav">
+            <div id="secondary-nav-buttons">
+<a class="secondary-link" href="/cgi-bin/diag.ha">Troubleshoot</a>
+<a class="secondary-link" href="/cgi-bin/speed.ha">Speed Test</a>
+<a class="secondary-link" href="/cgi-bin/logs.ha">Logs</a>
+<a class="secondary-link" href="/cgi-bin/update.ha">Update</a>
+<a class="secondary-link" href="/cgi-bin/reset.ha">Resets</a>
+<a class="secondary-link sec-selected" href="/cgi-bin/syslog.ha">Syslog</a>
+<a class="secondary-link" href="/cgi-bin/events.ha">Event Notifications</a>
+<a class="secondary-link" href="/cgi-bin/nattable.ha">NAT Table</a>
+                  </div></div></div>
+                <div style="clear: both;"></div>
+              </div>
+        <div style="clear: both;"></div>
+      <div id="mid-section">
+          <div id="content-padding"><!-- CONTENT -->
+            <div id="content"
+><div id="content-sub">
+                <div class="first-section-header">
+                 <h1>Syslog</h1></div>
+                 <div class="section-content">
+<form method="post" action="/cgi-bin/syslog.ha">
+<input type="hidden" name="nonce" value="a1acf6f161d693e1140c6222da59104011d74649c5fd78ff54ee74c699aed614" />
+                     <table class="table50" cellpadding="2" summary="This table allows configuration of the remote syslog server.">
+                   <tr>
+                     <td class="nojavamsg" colspan="12" >
+                     <noscript>
+                       You have disabled JavaScript(TM) in your browser. When you change an item that has an Update button to the right of it, make your change, then click the Update button. This will transform the page according to the change you have made and you may then proceed.
+                     </noscript>
+                     </td>
+                  </tr>
+                    <tr>
+                      <th scope="row">Syslog</th>
+                      <td><input type="radio" id="remlog_on" name="remlog" value="enable" />&nbsp;<label for="remlog_on">Enable</label>
+                          <input type="radio" id="remlog_off" name="remlog" value="disable" checked="checked" />&nbsp;<label for="remlog_off">Disable</label></td>
+                    </tr>
+                    <tr>
+                      <th scope="row">Server IP Address:</th>
+                      <td><input type="text" name="remlog_ip" size="15" maxlength="15" value="" /></td>
+                    </tr>
+                    <tr>
+                      <th scope="row">Server Port:</th>
+                      <td><input type="text" name="remlog_port" size="5" maxlength="5" value="514" /></td>
+                    </tr>
+                    <tr>
+                      <th scope="row">Log Level:</th>
+                      <td><select name="remlog_sev">
+<option value="emerg">Emergency</option>
+<option value="alert">Alert</option>
+<option value="crit">Critical</option>
+<option value="err">Error</option>
+<option value="warning" selected="selected">Warning</option>
+<option value="notice">Notice</option>
+<option value="info">Informational</option>
+<option value="debug">Debug</option>
+</select></td>
+                    </tr>
+                       </table>
+                       <br /><br />
+                       <div>
+                           <input type="submit" name="Save" class="cssbtn smallbtn btnspacer" value="Save" />
+                           <input type="submit" name="Cancel" class="cssbtn smallbtn" value="Cancel" />
+                       </div>
+                      </form>
+                 </div>
+                </div>
+              </div>
+            </div>
+ <!-- isWANUP -->
+            <div id="help">
+              <div id="help-sub">
+              <h2>Help</h2><br />
+<p>The device can send its log messages to a syslog server on the home network.</p>
+<strong>Syslog:</strong> Turns sending log messages to the syslog server on or off.<br /><br />
+<strong>Server IP Address:</strong> The address of the syslog server.<br /><br />
+<strong>Server Port:</strong> The UDP port of the syslog server, usually 514.<br /><br />
+<strong>Log Level:</strong> Messages of this severity and more severe ones are sent.<br /><br />
+              </div> <!-- help-sub -->
+            </div> <!-- help -->
+            <div style="clear: both;"></div>
+          </div>
+        </div>
+        <div style="clear: both;"></div>
+      </div>
+      <div id="footer">
+      <div><br>
+   <span class="inner">&copy; 2016-2025 AT&T Intellectual Property. All rights reserved. AT&T and Globe logo are registered trademarks of AT&T Intellectual Property.</span>
+   <span class="sitemap"><a href="/cgi-bin/sitemap.ha">Site Map</a></span></br></div>
+   <div><span class="inner">&copy; 2016 ARRIS Enterprises LLC. All rights reserved. ARRIS is a registered trademark of ARRIS Enterprises LLC.</span></div>
+   </div>
+      </div>
+</body>
+</html>

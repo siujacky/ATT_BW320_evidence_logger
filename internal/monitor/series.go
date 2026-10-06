@@ -90,12 +90,18 @@ type opticalObs struct {
 	rxLowWarn  bool
 }
 
-// pointStore keeps recent samples and optical readings for charts and statistics.
+// pointStore keeps recent samples, optical readings and traffic for charts and statistics.
 type pointStore struct {
 	names []string
 	index map[string]uint16
 	pts   []cyclePoint
 	opt   []opticalObs
+	// Traffic history (traffic.go): the intervals between consecutive readings of the gateway's
+	// WAN counters and of this computer's, and the latest reading of each (the start of the next
+	// interval).
+	wan, pc []trafficIv
+	lastWAN *snapObs
+	lastPC  *pcReading
 }
 
 func newPointStore() *pointStore { return &pointStore{index: map[string]uint16{}} }
@@ -170,6 +176,7 @@ func (ps *pointStore) prune(cutoff time.Time) {
 		j++
 	}
 	ps.opt = dropFront(ps.opt, j)
+	ps.wan, ps.pc = pruneTraffic(ps.wan, c), pruneTraffic(ps.pc, c)
 }
 
 // dropFront removes the first n elements without copying (usually one per cycle). The dropped
@@ -183,7 +190,8 @@ func dropFront[T any](s []T, n int) []T {
 	return s[n:]
 }
 
-// buildSeries aggregates the stored history into chart buckets.
+// buildSeries aggregates the stored history into chart buckets (traffic: trafficPoints,
+// trafficDays).
 func (ps *pointStore) buildSeries(rangeName string, now time.Time, probes []model.ProbeSpec, latest *model.GatewaySnapshot) (model.Series, error) {
 	r, ok := seriesRanges[rangeName]
 	if !ok {
@@ -289,6 +297,11 @@ func (ps *pointStore) buildSeries(rangeName string, now time.Time, probes []mode
 		}
 		s.Optical = append(s.Optical, op)
 	}
+
+	// Traffic: the same buckets, and the WAN volume per day of this computer's time zone.
+	s.Traffic = ps.trafficPoints(first, r.step, n)
+	s.TrafficDays = ps.trafficDays(first, now, time.Local)
+	s.HeavyTrafficMbps = heavyTrafficMbps
 	if latest != nil {
 		s.RxLowAlarmX10 = latest.Derived.RxLowAlarmX10
 		s.RxLowWarnX10 = latest.Derived.RxLowWarnX10

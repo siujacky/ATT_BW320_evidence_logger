@@ -281,7 +281,8 @@ type dashboardView struct {
 		Text     string `json:"text"`
 		Disabled bool   `json:"disabled"`
 	} `json:"buttons"`
-	Rows []dashboardRow `json:"rows"`
+	Rows  []dashboardRow `json:"rows"`
+	Marks map[string]int `json:"marks"` // chart marks by kind: "peak", "atleast", "ref"
 }
 
 // dashboardRow is one table row of a rendered view.
@@ -403,7 +404,8 @@ func TestDashboardRendersHostileDataAsText(t *testing.T) {
 	w.mu.Unlock()
 	rep := runDashboard(t, w, "hostile")
 
-	want := []string{"overview", "incidents", "incident export", "gateway", "evidence", "records", "records from genesis", "records config_state"}
+	want := []string{"overview", "overview 7d", "incidents", "incident export", "gateway", "syslog", "syslog more", "syslog severity", "syslog search",
+		"evidence", "records", "records from genesis", "records config_state"}
 	for name := range rep.Views {
 		if strings.HasPrefix(name, "incident ") && name != "incident export" {
 			want = append(want, name)

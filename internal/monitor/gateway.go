@@ -238,6 +238,7 @@ func (m *Monitor) applySnapshotLocked(cur *snapObs, stored map[string]bool, targ
 		}
 		if b := cur.Snap.Broadband; b != nil && len(b.Counters) > 0 {
 			m.st.prevCtr, m.st.lastCtr = m.st.lastCtr, cur
+			m.trafficSnapshotLocked(cur)
 		}
 	}
 	for page := range stored {

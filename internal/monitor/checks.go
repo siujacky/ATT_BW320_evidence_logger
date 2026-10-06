@@ -301,6 +301,7 @@ func (m *Monitor) checkLocalLink(ctx context.Context, force bool) {
 	m.locked(func() {
 		prev, prevAt = m.st.lastLinkRec, m.st.lastLinkRecAt
 		m.st.lastLink, m.st.lastLinkAt = &view, at
+		m.trafficLinkLocked(at, &view)
 		incident = m.st.tracker.open != nil
 		if wifiDown(&view) {
 			for _, st := range m.evidenceTargetsLocked(nil) {

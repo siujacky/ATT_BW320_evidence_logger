@@ -32,12 +32,13 @@
   // provider-attributed bad cycles outside the restart windows as it takes to open an incident.
   const RULES_RESTART_MIN_CYCLES = '2026.10-4';
   const RANGES = [['1h', '1 h'], ['6h', '6 h'], ['24h', '24 h'], ['7d', '7 d']];
+  const RANGE_MS = dict({ '1h': 3600e3, '6h': 6 * 3600e3, '24h': 86400e3, '7d': 7 * 86400e3 });
   const RECORD_TYPES = [
     'genesis', 'segment_open', 'bootstrap_import', 'monitor_start', 'monitor_stop', 'heartbeat',
     'sample', 'state_change', 'gateway_snapshot', 'gateway_event', 'service_check', 'local_link',
     'traceroute', 'clock_check', 'clock_jump', 'incident_open', 'incident_update', 'incident_close',
     'anchor', 'config_change', 'power_event', 'custody_export', 'operator_note', 'recovery',
-    'integrity_alert', 'config_state',
+    'integrity_alert', 'config_state', 'syslog',
   ];
 
   /** dict makes a lookup table without a prototype, so that a value from the data such as
@@ -153,6 +154,26 @@
   const HIJACK_TEST_HELP = 'Every check also asks this resolver for a random name under .invalid, which never exists (RFC 6761). ' +
     'NXDOMAIN is the correct answer. An address in the answer would mean the resolver is redirecting (hijacking) DNS.';
 
+  // Syslog severities (RFC 5424 §6.2.1) by number: the keyword GET /api/syslog accepts, the word
+  // shown and the tone of its chip. Notice, info and debug are routine.
+  const SYSLOG_SEVERITIES = [
+    { name: 'emerg', label: 'Emergency', tone: 'critical' },
+    { name: 'alert', label: 'Alert', tone: 'critical' },
+    { name: 'crit', label: 'Critical', tone: 'critical' },
+    { name: 'err', label: 'Error', tone: 'serious' },
+    { name: 'warning', label: 'Warning', tone: 'warning' },
+    { name: 'notice', label: 'Notice', tone: 'info' },
+    { name: 'info', label: 'Info', tone: 'none' },
+    { name: 'debug', label: 'Debug', tone: 'none' },
+  ];
+  // Syslog facilities by number (RFC 5424 §6.2.1).
+  const SYSLOG_FACILITIES = ['kern', 'user', 'mail', 'daemon', 'auth', 'syslog', 'lpr', 'news', 'uucp', 'cron', 'authpriv', 'ftp',
+    'ntp', 'audit', 'alert', 'clock', 'local0', 'local1', 'local2', 'local3', 'local4', 'local5', 'local6', 'local7'];
+  const SYSLOG_FORMATS = dict({ rfc5424: 'RFC 5424', rfc3164: 'RFC 3164 (BSD syslog)', unknown: 'not recognised: kept as received' });
+  const SYSLOG_PAGE = 200; // messages asked for at first; "Load more" doubles it
+  const SYSLOG_MAX = 5000; // the most GET /api/syslog returns
+  const SYSLOG_MAX_SPAN_MS = 31 * 86400e3; // the longest period GET /api/syslog reads
+
   // ------------------------------------------------------------------ app state
 
   const app = {
@@ -262,6 +283,7 @@
     time: new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit', second: '2-digit' }),
     hm: new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }),
     day: new Intl.DateTimeFormat(undefined, { weekday: 'short', month: 'short', day: 'numeric' }),
+    sec: new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', second: '2-digit' }),
   };
 
   /** toDate parses RFC 3339 (any fraction length), numbers (ms) and Dates. */
@@ -371,6 +393,57 @@
 
   function humanize(code) {
     return String(code == null ? '' : code).toLowerCase().replace(/_/g, ' ');
+  }
+
+  /** hiddenChar reports whether the UTF-16 code unit c would act on the display instead of
+   *  showing: C0 and C1 controls, DEL, the bidirectional marks, embeddings, overrides and
+   *  isolates, zero-width characters and joiners, the line and paragraph separators, the byte
+   *  order mark. */
+  function hiddenChar(c) {
+    return c < 0x20 || (c >= 0x7f && c <= 0x9f) || c === 0x61c || (c >= 0x200b && c <= 0x200f) ||
+      (c >= 0x2028 && c <= 0x202e) || (c >= 0x2060 && c <= 0x2069) || c === 0xfeff;
+  }
+
+  /** charEscape writes a hidden character as an escape: \t, \n, \r, \xHH or \uHHHH. */
+  function charEscape(c) {
+    switch (c) {
+      case 0x09: return '\\t';
+      case 0x0a: return '\\n';
+      case 0x0d: return '\\r';
+      default: return c < 0x100 ? '\\x' + c.toString(16).padStart(2, '0') : '\\u' + c.toString(16).padStart(4, '0');
+    }
+  }
+
+  /** visibleText shows untrusted text (a syslog message) as received, with its hidden
+   *  characters (hiddenChar) written as escapes (charEscape: an ESC as \x1b, a right-to-left
+   *  override as a \u escape of 202e) and set apart (class ctl), so that they can be neither
+   *  mistaken for the text nor reorder, hide or break what is shown around it. keepNewlines
+   *  leaves line breaks as they are (pretty-printed JSON). Returns the parts for h(). */
+  function visibleText(text, keepNewlines) {
+    const t = String(text == null ? '' : text);
+    const out = [];
+    let start = 0;
+    for (let i = 0; i < t.length; i++) {
+      const c = t.charCodeAt(i);
+      if (!hiddenChar(c) || (keepNewlines && c === 0x0a)) continue;
+      if (i > start) out.push(t.slice(start, i));
+      out.push(h('span', { class: 'ctl', title: 'U+' + c.toString(16).toUpperCase().padStart(4, '0') }, charEscape(c)));
+      start = i + 1;
+    }
+    if (start < t.length) out.push(t.slice(start));
+    return out;
+  }
+
+  /** escapedText is visibleText as one string, for text that cannot hold markup (a summary
+   *  line, a title). */
+  function escapedText(text) {
+    const t = String(text == null ? '' : text);
+    let out = '';
+    for (let i = 0; i < t.length; i++) {
+      const c = t.charCodeAt(i);
+      out += hiddenChar(c) ? charEscape(c) : t[i];
+    }
+    return out;
   }
 
   function groupFingerprint(fp) {
@@ -521,6 +594,18 @@
       s('line', { class: 'c' + slot, x1: 1.5, y1: 5, x2: 16.5, y2: 5 }));
   }
 
+  /** tickKey keys a series drawn as tick marks (slot 0: in ink, for the legend's explanation). */
+  function tickKey(slot) {
+    return s('svg', { class: 'key', viewBox: '0 0 18 10', 'aria-hidden': 'true', focusable: 'false' },
+      s('line', { class: 'pk ' + (slot ? 'c' + slot : 'ink'), x1: 5.5, y1: 5, x2: 12.5, y2: 5 }));
+  }
+
+  /** chevronKey keys the "at least" mark of lineChart. */
+  function chevronKey() {
+    return s('svg', { class: 'key', viewBox: '0 0 18 10', 'aria-hidden': 'true', focusable: 'false' },
+      s('path', { class: 'atleast', d: 'M5 8L9 3L13 8' }));
+  }
+
   function chevron() {
     return s('svg', { class: 'chev', viewBox: '0 0 12 12', 'aria-hidden': 'true', focusable: 'false' }, s('path', { d: 'M4 2l4 4-4 4' }));
   }
@@ -574,14 +659,17 @@
     if (o.caption) t.append(h('caption', null, o.caption));
     t.append(h('thead', null, h('tr', null, cols.map((c) => h('th', { scope: 'col', class: [c.num ? 'num' : '', c.cls || ''].join(' ').trim() || null }, c.label)))));
     const tb = h('tbody');
-    for (const r of rows) {
-      tb.append(h('tr', null, r.map((cell, i) => h('td', {
-        class: [cols[i] && cols[i].num ? 'num' : '', cols[i] && cols[i].cls ? cols[i].cls : ''].join(' ').trim() || null,
-        'data-label': o.stack && cols[i] ? cols[i].label : null,
-      }, cell))));
-    }
+    for (const r of rows) tb.append(tableRow(cols, r, o));
     t.append(tb);
     return h('div', { class: 'table-scroll' }, t);
+  }
+
+  /** tableRow builds a body row of table() (with the same cols and opts). */
+  function tableRow(cols, r, o) {
+    return h('tr', null, r.map((cell, i) => h('td', {
+      class: [cols[i] && cols[i].num ? 'num' : '', cols[i] && cols[i].cls ? cols[i].cls : ''].join(' ').trim() || null,
+      'data-label': o && o.stack && cols[i] ? cols[i].label : null,
+    }, cell)));
   }
 
   function field(labelText, control, hint) {
@@ -646,10 +734,12 @@
     }
   }
 
-  /** api performs a same-origin request; non-GET requests carry the CSRF header. */
+  /** api performs a same-origin request; non-GET requests carry the CSRF header. opts.signal
+   *  (an AbortSignal) cancels it: the server then stops the work for it. */
   async function api(path, opts) {
     const o = opts || {};
     const init = { method: o.method || 'GET', headers: { Accept: 'application/json' }, cache: 'no-store', credentials: 'same-origin' };
+    if (o.signal) init.signal = o.signal;
     if (init.method !== 'GET' && init.method !== 'HEAD') {
       init.headers['X-ATT-Monitor'] = '1';
       if (o.body !== undefined) {
@@ -736,6 +826,7 @@
     [/^\/incidents$/, 'incidents', (c, m, q, ctx) => renderIncidents(c, q, ctx)],
     [/^\/incidents\/([^/]+)$/, 'incidents', (c, m, q, ctx) => renderIncident(c, safeDecode(m[1]), ctx)],
     [/^\/gateway$/, 'gateway', (c, m, q, ctx) => renderGateway(c, ctx)],
+    [/^\/syslog$/, 'syslog', (c, m, q, ctx) => renderSyslog(c, q, ctx)],
     [/^\/evidence$/, 'evidence', (c, m, q, ctx) => renderEvidence(c, ctx)],
     [/^\/records$/, 'records', (c, m, q, ctx) => renderRecords(c, q, ctx)],
   ];
@@ -1214,7 +1305,7 @@
   }
 
   function fillCards(el, st) {
-    replace(el, cardInternet(st), cardGatewayWAN(st), cardFiber(st), cardLocalLink(st), cardEvidence(st), cardMonitor(st));
+    replace(el, cardInternet(st), cardGatewayWAN(st), cardFiber(st), cardLocalLink(st), syslogCard(st, true), cardEvidence(st), cardMonitor(st));
   }
 
   /** probeLabel names a probe as configured (Status.probes, else the chart series' list). */
@@ -1696,6 +1787,91 @@
     return card('Monitor & clock', kv(rows));
   }
 
+  // ------------------------------------------------------------------ gateway syslog
+
+  /** syslogCard shows the receiver of the gateway's syslog messages and the gateway's Syslog
+   *  setting (Status.syslog, docs/syslog-snmp-traffic.md §3.2), or nothing when the monitor
+   *  reports neither. link: on the Overview, linking the Syslog page (which has its own card
+   *  title). */
+  function syslogCard(st, link) {
+    const sl = st && st.syslog;
+    if (!sl || typeof sl !== 'object' || Array.isArray(sl)) return null;
+    const seq = Number(sl.gateway_seq) || 0;
+    const body = [
+      kv([
+        ['Receiver', syslogReceiver(sl)],
+        ['Messages', [syslogCounts(sl), h('span', { class: 'sub small muted' }, 'since the service started')]],
+        ['Last message', sl.last_at || sl.last
+          ? [timeEl(sl.last_at, F.sec), sl.last ? h('span', { class: 'sub syslog-text small' }, visibleText(sl.last)) : null]
+          : 'none since the service started'],
+        ['Gateway setting', syslogSetting(sl)],
+        ['Setting read', sl.gateway_at || seq
+          ? [sl.gateway_at ? timeEl(sl.gateway_at, F.short) : null, sl.gateway_at && seq ? ' · ' : null, seq ? h('a', { href: recordsLink(seq) }, 'record #' + seq) : null]
+          : null],
+      ]),
+      h('p', { class: 'card-foot' }, syslogEnforcement(sl, st)),
+    ];
+    return link ? cardWithLink('Gateway syslog', '#/syslog', 'Messages', ...body) : card('Receiver and gateway setting', ...body);
+  }
+
+  /** syslogReceiver says whether this computer listens for the gateway's messages. */
+  function syslogReceiver(sl) {
+    if (!sl.enabled) return [chip('none', 'off'), ' turned off in the configuration (syslog.enabled)'];
+    if (sl.listening) return [chip('good', 'listening'), ' on UDP ', h('code', null, String(sl.listen || '?'))];
+    if (sl.listen_error) return [chip('critical', 'not listening'), ' ', h('span', { class: 'wrap-any' }, String(sl.listen_error))];
+    return [chip('none', 'not listening yet'), sl.listen ? [' (UDP ', h('code', null, String(sl.listen)), ')'] : null];
+  }
+
+  /** syslogCounts words the receiver's counters (since the service started). */
+  function syslogCounts(sl) {
+    const n = (v) => fmtInt(Number(v) || 0);
+    return [
+      h('span', { title: 'Messages accepted from the gateway' }, n(sl.received) + ' received'), ' · ',
+      h('span', { title: 'Written to the evidence ledger' }, n(sl.recorded) + ' recorded'), ' · ',
+      Number(sl.dropped) > 0
+        ? chip('warning', n(sl.dropped) + ' dropped', 'Accepted but over the per-minute cap: counted, not recorded')
+        : h('span', { title: 'Accepted but over the per-minute cap: counted, not recorded' }, '0 dropped'), ' · ',
+      h('span', { title: 'Datagrams from senders other than the gateway: counted, not recorded' }, n(sl.rejected) + ' from other senders'),
+    ];
+  }
+
+  /** syslogTarget writes a Syslog destination as server:port. */
+  function syslogTarget(x) {
+    return x && x.server ? String(x.server) + (x.port ? ':' + x.port : '') : '';
+  }
+
+  /** syslogSetting words the gateway's Syslog setting as the monitor last read it
+   *  (Status.syslog.state: ok, off, elsewhere, unknown, error). */
+  function syslogSetting(sl) {
+    const g = sl.gateway && typeof sl.gateway === 'object' ? sl.gateway : null;
+    const level = g && g.level ? [' · level ', String(g.level)] : null;
+    const problem = sl.problem ? h('span', { class: 'sub small muted wrap-any' }, String(sl.problem)) : null;
+    const state = sl.state || (!g ? 'unknown' : g.enabled ? '' : 'off');
+    switch (state) {
+      case 'ok': return [chip('good', 'on'), ' sends to ', syslogTarget(g) || '?', ' (this PC)', level, problem];
+      case 'off': return [chip('warning', 'off'), ' the gateway sends no syslog messages', problem];
+      case 'elsewhere': return [chip('warning', 'sends elsewhere'), ' to ', syslogTarget(g) || 'another address', level, ', not to this PC', problem];
+      case 'error':
+        return [chip('warning', 'could not be read'), ' ', String(sl.problem || 'the last check failed'),
+          g ? h('span', { class: 'sub small muted' }, 'Last read: ', g.enabled ? 'on, sends to ' + (syslogTarget(g) || '?') : 'off', level) : null];
+      case 'unknown':
+        return g ? [chip('none', 'not understood'), ' ', String(sl.problem || 'the gateway’s Syslog page was not understood')]
+          : [chip('none', 'not read yet'), problem];
+    }
+    return [chip('none', humanize(state) || 'on'), g && g.enabled ? [' sends to ', syslogTarget(g) || '?', level] : null, problem];
+  }
+
+  /** syslogEnforcement says what att-monitor does with the gateway's Syslog setting. */
+  function syslogEnforcement(sl, st) {
+    if (sl.enforce) {
+      return 'att-monitor keeps the gateway sending its log to ' + (syslogTarget(sl.target) || 'this PC') + ' and records every check and change of the setting.';
+    }
+    const ip = st && st.local_link && st.local_link.local_ip;
+    const port = (sl.target && sl.target.port) || (/:(\d+)$/.exec(String(sl.listen || '')) || [])[1] || 514;
+    return ['att-monitor only reads this setting; it does not change it yet. To receive the gateway’s log, turn Syslog on in the gateway’s Diagnostics › Syslog page with server ',
+      ip ? h('code', null, String(ip)) : 'this PC’s address', ' and port ', String(port), '.'];
+  }
+
   async function loadRecentIncidents(el, ctx) {
     const from = new Date(Date.now() - 7 * 86400e3).toISOString();
     try {
@@ -1795,9 +1971,10 @@
     ctx.interval(() => { if (!document.hidden) load(); }, SERIES_REFRESH_MS);
   }
 
-  function rangeControl(current, onChange) {
+  /** rangeControl offers the RANGES as a segmented radio group; groupLabel names the group. */
+  function rangeControl(current, onChange, groupLabel) {
     const name = 'range-' + Math.random().toString(36).slice(2, 8);
-    const group = h('div', { class: 'seg', role: 'radiogroup', 'aria-label': 'Chart time range' });
+    const group = h('div', { class: 'seg', role: 'radiogroup', 'aria-label': groupLabel || 'Chart time range' });
     for (const [value, label] of RANGES) {
       const id = name + '-' + value;
       const input = h('input', { type: 'radio', name, id, value });
@@ -1864,7 +2041,98 @@
       yMin: 0, yMax: 100,
       yFmt: (v) => v + ' %', tipFmt: (v) => (v == null ? '—' : Math.round(v * 10) / 10 + ' %'), tipTime: bucketLabel, tipUTC: bucketUTC, unit: '%',
     });
-    replace(body, strip, latency, loss, opticalChart(ser, from, to, ctx));
+    replace(body, strip, latency, loss, trafficChart(ser, from, to, stepMs, ctx), trafficDaysTable(ser), opticalChart(ser, from, to, ctx));
+  }
+
+  /** fmtNum writes a number with at most two decimals (axis ticks, thresholds). */
+  function fmtNum(v) {
+    return v == null || !isFinite(v) ? '—' : Number(Number(v).toFixed(2)).toLocaleString();
+  }
+
+  /** fmtMbps writes a rate in Mb/s with the precision it deserves. */
+  function fmtMbps(v) {
+    if (v == null || !isFinite(v)) return '—';
+    const a = Math.abs(v);
+    return (a === 0 ? '0' : a < 10 ? v.toFixed(2) : a < 100 ? v.toFixed(1) : Math.round(v).toLocaleString()) + ' Mb/s';
+  }
+
+  /** fmtGB writes a byte count in GB (10^9 bytes). */
+  function fmtGB(n) {
+    if (n == null || !isFinite(n)) return '—';
+    const gb = n / 1e9;
+    return (gb < 10 ? gb.toFixed(2) : gb < 100 ? gb.toFixed(1) : Math.round(gb).toLocaleString()) + ' GB';
+  }
+
+  /** dayLabel writes a YYYY-MM-DD local date as "Mon, Oct 5" (anything else as given). */
+  function dayLabel(v) {
+    const m = /^(\d{4})-(\d\d)-(\d\d)$/.exec(String(v == null ? '' : v));
+    return m ? F.day.format(new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]))) : String(v);
+  }
+
+  /** trafficChart draws the household's traffic (Series.traffic, docs/syslog-snmp-traffic.md
+   *  §3.3): the WAN download and upload from the gateway's own counters (mean lines, peak
+   *  marks) and this computer's, against the classifier's heavy-traffic level; null when the
+   *  monitor reports no traffic at all. */
+  function trafficChart(ser, from, to, stepMs, ctx) {
+    const title = 'Traffic';
+    const heavy = Number(ser.heavy_traffic_mbps) > 0 ? Number(ser.heavy_traffic_mbps) : null;
+    const pts = (Array.isArray(ser.traffic) ? ser.traffic : []).filter((p) => p && typeof p === 'object' && toMs(p.t) != null);
+    if (!pts.length) {
+      if (heavy == null) return null;
+      return h('figure', { class: 'chart' }, h('figcaption', { class: 'chart-head' }, h('div', null, h('span', { class: 'chart-title' }, title))),
+        emptyNote('No traffic readings in this range.'));
+    }
+    const starts = pts.map((p) => toMs(p.t));
+    const num = (v) => (v == null || !isFinite(v) ? null : Number(v));
+    const col = (k) => pts.map((p) => num(p[k]));
+    const atLeast = pts.map((p) => p.at_least === true);
+    const anyAtLeast = atLeast.some(Boolean);
+    const legendExtra = [[tickKey(0), 'peak: the highest rate between two readings in the bucket']];
+    if (anyAtLeast) legendExtra.push([chevronKey(), 'at least: the true rate may have been higher']);
+    return lineChart({
+      id: 'traffic', ctx, linked: null,
+      title,
+      subtitle: 'Mean rate in each ' + fmtDur(stepMs / 1000) + ' bucket, in Mb/s. WAN: the AT&T gateway’s own IPv4 byte counters, with short marks at the highest rate between two of its readings. This PC: its own network adapter.' +
+        (heavy != null ? ' Dashed line: ' + fmtNum(heavy) + ' Mb/s, from which the household’s own traffic may slow the connection by itself, so a slowdown is not attributed to AT&T.' : '') +
+        ' Gaps: no reading.' +
+        (anyAtLeast ? ' Chevron: the gateway’s 32-bit byte counter may have wrapped more often than can be told, so the rate was at least the one shown.' : ''),
+      series: [
+        { key: 'wan_rx', label: 'WAN download', slot: 1, vals: col('wan_rx_mbps'), atLeast },
+        { key: 'wan_rx_peak', of: 'wan_rx', mark: 'tick', label: 'WAN download peak', slot: 1, vals: col('wan_rx_peak_mbps'), atLeast },
+        { key: 'wan_tx', label: 'WAN upload', slot: 2, vals: col('wan_tx_mbps'), atLeast },
+        { key: 'wan_tx_peak', of: 'wan_tx', mark: 'tick', label: 'WAN upload peak', slot: 2, vals: col('wan_tx_peak_mbps'), atLeast },
+        { key: 'pc_rx', label: 'This PC download', slot: 3, vals: col('pc_rx_mbps') },
+        { key: 'pc_tx', label: 'This PC upload', slot: 4, vals: col('pc_tx_mbps') },
+      ],
+      times: starts.map((t) => t + stepMs / 2), from, to, gapMs: stepMs * 1.5, legend: true, legendExtra,
+      yMin: 0, minMax: 1,
+      thresholds: heavy != null ? [{ v: heavy, tone: 'ref', place: 'above', label: 'Heavy household traffic ' + fmtNum(heavy) + ' Mb/s' }] : [],
+      atLeast: anyAtLeast ? { at: atLeast, keys: ['wan_rx', 'wan_tx'] } : null,
+      yFmt: fmtNum,
+      tipFmt: (v, se, i) => (v == null ? '—' : (se && se.atLeast && se.atLeast[i] ? 'at least ' : '') + fmtMbps(v)),
+      tipTime: (i) => F.short.format(new Date(starts[i])) + ' – ' + F.hm.format(new Date(starts[i] + stepMs)),
+      tipUTC: (i) => new Date(starts[i]).toISOString().slice(0, 16).replace('T', ' ') + ' – ' + new Date(starts[i] + stepMs).toISOString().slice(11, 16) + ' UTC',
+      unit: 'Mb/s',
+    });
+  }
+
+  /** trafficDaysTable lists the WAN volume per day of this computer's time zone
+   *  (Series.traffic_days), newest first; null when the monitor reports none. */
+  function trafficDaysTable(ser) {
+    const days = (Array.isArray(ser.traffic_days) ? ser.traffic_days : []).filter((d) => d && typeof d === 'object');
+    if (!days.length) return null;
+    const today = localDateValue(new Date());
+    const rows = days.slice().reverse().map((d) => [
+      h('span', { class: 'nowrap', title: String(d.day) }, dayLabel(d.day), d.day === today ? h('span', { class: 'small muted' }, ' (today, so far)') : null),
+      fmtGB(d.rx_bytes), fmtGB(d.tx_bytes),
+      Number(d.covered_s) > 0 ? fmtDur(d.covered_s) : '—',
+      d.complete ? h('span', { class: 'muted' }, 'complete')
+        : chip('warning', 'partial', 'Part of this day has no known counter delta, so its traffic was more than these totals.'),
+    ]);
+    return h('figure', { class: 'chart' },
+      h('figcaption', { class: 'chart-head' }, h('div', null, h('span', { class: 'chart-title' }, 'WAN volume per day'),
+        h('p', { class: 'chart-sub' }, 'Downloaded and uploaded through the AT&T gateway, from its own byte counters, per day of this computer’s time zone (1 GB = 1,000,000,000 bytes). Only exactly known counter deltas are added up. Partial: part of the day has none (the monitor was not running, the gateway could not be read, or its counters were reset or may have wrapped more often than can be told), so the day’s traffic was more than shown.'))),
+      table([{ label: 'Day' }, { label: 'Downloaded', num: true }, { label: 'Uploaded', num: true }, { label: 'Time counted', num: true }, { label: 'Totals' }], rows, { compact: true }));
   }
 
   function median(arr) {
@@ -2012,17 +2280,22 @@
 
   /**
    * lineChart draws one or more series against one y-axis.
-   * o: {id, title, subtitle, series:[{key,label,slot,vals}], times, from, to, gapMs, legend,
-   *     linked, yMin, yMax, minMax, robustMax, pad, thresholds, band, yFmt, tipFmt, tipTime,
-   *     tipExtra, unit, ctx}
+   * o: {id, title, subtitle, series:[{key,label,slot,vals,mark,of}], times, from, to, gapMs,
+   *     legend, legendExtra, linked, yMin, yMax, minMax, robustMax, pad, thresholds, band,
+   *     atLeast, yFmt, tipFmt(v, series, i), tipTime, tipExtra, unit, ctx}
+   * A series with mark 'tick' is drawn as a short mark per value (e.g. the peak of a bucket);
+   * one with "of" has no legend button and shows and hides with the series it names. legendExtra
+   * lists further legend entries ([key, label]). atLeast {at: [bool], keys} marks the values at
+   * those indexes, of those series, as lower bounds: a chevron above them.
    */
   function lineChart(o) {
     const { fig, tableBtn, plot, tip, live } = chartFrame(o);
     const H = o.band ? 252 : 224;
     let legendEl = null;
-    if (o.legend && o.series.length > 1) {
+    const primary = o.series.filter((se) => !se.of);
+    if (o.legend && primary.length > 1) {
       legendEl = h('ul', { class: 'legend', 'aria-label': 'Series — select to show or hide' });
-      for (const se of o.series) {
+      for (const se of primary) {
         const btn = h('button', { type: 'button', 'aria-pressed': String(!app.hidden.has(se.key)), dataset: { key: se.key } }, lineKey(se.slot), se.label);
         btn.addEventListener('click', () => {
           if (app.hidden.has(se.key)) app.hidden.delete(se.key); else app.hidden.add(se.key);
@@ -2030,6 +2303,7 @@
         });
         legendEl.append(h('li', null, btn));
       }
+      for (const [key, label] of o.legendExtra || []) legendEl.append(h('li', null, h('span', { class: 'static' }, key, label)));
       fig.append(legendEl);
     }
     if (o.band && o.band.legend) {
@@ -2045,7 +2319,7 @@
     let idx = -1;
 
     function visible() {
-      return o.series.filter((se) => !app.hidden.has(se.key));
+      return o.series.filter((se) => !app.hidden.has(se.of || se.key));
     }
 
     function layout() {
@@ -2111,7 +2385,24 @@
           s('text', { class: 'thr-label', x: g.x1 - 4, y: th.place === 'below' ? y + 13 : y - 5, 'text-anchor': 'end' }, th.label));
       }
       let clamped = 0;
+      // Tick marks span half a bucket (the times' typical spacing), 2 to 8 px, so that marks of
+      // neighbouring buckets stay apart.
+      const n = o.times.length;
+      const spacing = n > 1 ? (o.times[n - 1] - o.times[0]) / (n - 1) : o.to - o.from;
+      const half = Math.max(1, Math.min(4, (spacing / (o.to - o.from)) * (g.x1 - g.x0) / 4));
       for (const se of g.vis) {
+        if (se.mark === 'tick') {
+          for (let i = 0; i < se.vals.length; i++) {
+            const v = se.vals[i];
+            const t = o.times[i];
+            if (v == null || !isFinite(v) || t < o.from || t > o.to) continue;
+            if (v > g.hi) clamped++;
+            const x = g.xs(t);
+            const y = g.ys(Math.min(Math.max(v, g.lo), g.hi)).toFixed(1);
+            svg.append(s('line', { class: 'pk c' + se.slot, x1: (x - half).toFixed(1), x2: (x + half).toFixed(1), y1: y, y2: y }));
+          }
+          continue;
+        }
         const segs = [];
         let cur = null;
         let prevT = null;
@@ -2136,6 +2427,18 @@
           d += 'M' + seg.map((p) => p[0].toFixed(1) + ' ' + p[1].toFixed(1)).join('L');
         }
         if (d) svg.append(s('path', { class: 'ln c' + se.slot, d }));
+      }
+      if (o.atLeast) {
+        // A chevron above the highest value of the series concerned: "at least this much".
+        const marked = g.vis.filter((se) => o.atLeast.keys.includes(se.of || se.key));
+        for (let i = 0; i < n; i++) {
+          if (!o.atLeast.at[i] || o.times[i] < o.from || o.times[i] > o.to) continue;
+          const top = Math.max(...marked.map((se) => se.vals[i]).filter((v) => v != null && isFinite(v)));
+          if (!isFinite(top)) continue;
+          const x = g.xs(o.times[i]);
+          const y = g.ys(Math.min(Math.max(top, g.lo), g.hi)) - 5;
+          svg.append(s('path', { class: 'atleast', d: `M${(x - 4).toFixed(1)} ${y.toFixed(1)}L${x.toFixed(1)} ${(y - 5).toFixed(1)}L${(x + 4).toFixed(1)} ${y.toFixed(1)}` }));
+        }
       }
       if (o.band) {
         const by = H - 14;
@@ -2179,7 +2482,8 @@
         if (v != null && isFinite(v)) {
           g.dots.append(s('circle', { class: 'dot f' + se.slot, cx: x, cy: g.ys(Math.min(Math.max(v, g.lo), g.hi)), r: 4 }));
         }
-        rows.push(h('div', { class: 'tip-row' }, lineKey(se.slot), h('span', { class: 'val' }, o.tipFmt(v)), h('span', { class: 'lab' }, se.label)));
+        rows.push(h('div', { class: 'tip-row' }, se.mark === 'tick' ? tickKey(se.slot) : lineKey(se.slot),
+          h('span', { class: 'val' }, o.tipFmt(v, se, i)), h('span', { class: 'lab' }, se.label)));
       }
       g.dots.setAttribute('visibility', 'visible');
       const when = new Date(o.times[i]);
@@ -2191,7 +2495,7 @@
       if (!pointer) {
         const b = bandAt(o.times[i]);
         live.textContent = (o.tipTime ? o.tipTime(i) : F.full.format(when)) + ': ' +
-          g.vis.map((se) => se.label + ' ' + o.tipFmt(se.vals[i])).join(', ') + (b ? '; ' + b.label : '');
+          g.vis.map((se) => se.label + ' ' + o.tipFmt(se.vals[i], se, i)).join(', ') + (b ? '; ' + b.label : '');
       }
     }
 
@@ -2244,7 +2548,7 @@
       for (let i = o.times.length - 1; i >= 0; i--) {
         const r = [timeEl(o.times[i], F.full)];
         if (o.tipTime) r[0] = h('span', { title: 'UTC: ' + utcText(null, new Date(o.times[i])) }, o.tipTime(i));
-        for (const se of o.series) r.push(o.tipFmt(se.vals[i]));
+        for (const se of o.series) r.push(o.tipFmt(se.vals[i], se, i));
         if (o.band) {
           const b = bandAt(o.times[i]);
           r.push(b ? h('span', { class: 'badge' }, icon(b.tone), b.label) : '—');
@@ -2520,8 +2824,14 @@
   async function renderIncident(c, id, ctx) {
     c.append(h('p', null, h('a', { href: '#/incidents' }, '← All incidents')), h('h1', null, 'Incident ', id));
     const box = h('div', { class: 'stack' }, h('p', { class: 'loading' }, 'Loading incident…'));
-    c.append(box);
+    // The gateway's syslog around the incident: kept outside box so that the 30 s refresh of an
+    // open incident does not rebuild it (and close what the reader opened) until new data arrive.
+    const sys = h('section', { class: 'card', 'aria-labelledby': 'incident-syslog-h', hidden: true });
+    const sysIntro = h('p', { class: 'small muted' });
+    c.append(box, sys);
     let open = false;
+    let sysBrowser = null;
+    let sysPeriod = null;
     const load = async () => {
       if (box.querySelector('button[disabled]')) return; // an export is running; keep its result area
       try {
@@ -2529,12 +2839,42 @@
         if (!ctx.alive) return;
         open = !!data.incident.open;
         replace(box, ...incidentDetail(data));
+        const p = incidentSyslogPeriod(data.incident);
+        const key = JSON.stringify(p);
+        if (open || key !== sysPeriod) {
+          sysPeriod = key;
+          replace(sysIntro, 'The gateway’s own log messages recorded from 5 minutes before the incident opened to ',
+            open ? 'now (the incident is still open)' : '5 minutes after it closed', ', newest first; their times are when this PC received them.',
+            p.clipped ? ' The incident is longer than 31 days: only its last 31 days are searched.' : '');
+          if (!sysBrowser) {
+            sys.hidden = false;
+            sysBrowser = syslogBrowser(sys, ctx, {
+              heading: 'Gateway syslog around this incident', headingId: 'incident-syslog-h', intro: sysIntro,
+              empty: () => 'No syslog messages were received in this period.',
+            });
+          }
+          sysBrowser.load({ from: p.from, to: p.to });
+        }
       } catch (e) {
         if (ctx.alive) replace(box, errorNotice(e));
       }
     };
     await load();
     ctx.interval(() => { if (open && !document.hidden) load(); }, 30000);
+  }
+
+  /** incidentSyslogPeriod is the period of an incident's syslog messages: from 5 minutes before
+   *  it opened to 5 minutes after it closed, or (while it is open) until now, which the server
+   *  fills in (to is left out). A period longer than GET /api/syslog reads keeps its end
+   *  (clipped). */
+  function incidentSyslogPeriod(inc) {
+    const opened = toMs(inc.opened);
+    const closed = inc.open ? null : toMs(inc.closed);
+    const end = closed != null ? closed + 5 * 60e3 : Date.now();
+    let from = opened != null ? opened - 5 * 60e3 : end - 3600e3;
+    const clipped = end - from > SYSLOG_MAX_SPAN_MS;
+    if (clipped) from = end - SYSLOG_MAX_SPAN_MS;
+    return { from: new Date(from).toISOString(), to: closed != null ? new Date(end).toISOString() : '', clipped };
   }
 
   function incidentDetail(data) {
@@ -2816,6 +3156,16 @@
       }
       case 'monitor_stop':
         return { tone: 'warning', title: 'Monitor stopped (' + (d.reason || '?') + ')' };
+      case 'syslog': {
+        // A batch of the gateway's syslog messages; a message's text is the sender's, so its
+        // hidden characters are written as escapes.
+        const msgs = Array.isArray(d.messages) ? d.messages.filter((m) => m && typeof m === 'object') : [];
+        const parts = msgs.slice(0, 3).map((m) => escapedText(String(m.msg || m.raw || (m.raw_b64 ? '(not valid UTF-8)' : '')).slice(0, 160)));
+        if (msgs.length > 3) parts.push(`and ${fmtInt(msgs.length - 3)} more`);
+        if (d.dropped > 0) parts.push(`${fmtInt(d.dropped)} more over the per-minute cap (counted, not recorded)`);
+        if (d.rejected > 0) parts.push(`${fmtInt(d.rejected)} datagram${d.rejected === 1 ? '' : 's'} from other senders (counted, not recorded)`);
+        return { tone: 'info', title: `Gateway syslog: ${fmtInt(msgs.length)} message${msgs.length === 1 ? '' : 's'} received`, detail: parts.join(' · ') };
+      }
       default:
         return { tone: 'info', title: humanize(rec.type) };
     }
@@ -3085,6 +3435,213 @@
       pageRows.length ? table([{ label: 'Page' }, { label: 'HTTP' }, { label: 'Fetched' }, { label: 'Took', num: true }, { label: 'Size', num: true }, { label: 'SHA-256' }, { label: 'Raw page' }], pageRows, { compact: true }) : emptyNote('No pages.'));
 
     replace(el, h('div', { class: 'grid-2' }, derived, system), fiber, broadband, lan, pages);
+  }
+
+  // ------------------------------------------------------------------ syslog view
+
+  function renderSyslog(c, q, ctx) {
+    c.append(h('div', { class: 'view-head' }, h('h1', null, 'Gateway syslog'),
+      h('p', { class: 'muted' }, 'The AT&T gateway’s own log messages as this PC received them, recorded in the evidence ledger in signed batches. Every message keeps the exact datagram; its time is when this PC received it.')));
+    const statusArea = h('div');
+    let statusKey = null;
+    const update = (st) => {
+      const key = JSON.stringify([st.syslog || null, st.local_link ? st.local_link.local_ip : null]);
+      if (key === statusKey) return;
+      statusKey = key;
+      replace(statusArea, syslogCard(st, false) ||
+        callout('info', 'This monitor reports no syslog receiver: the messages below are the ones recorded in the evidence ledger.'));
+    };
+    ctx.onStatus = update;
+    if (app.status) update(app.status);
+
+    let range = RANGE_MS[q.get('range')] ? q.get('range') : '24h';
+    const sev = h('select', null, h('option', { value: '' }, 'All messages'),
+      SYSLOG_SEVERITIES.map((sv, i) => h('option', { value: sv.name }, `${sv.label} (${i})${i ? ' and more severe' : ' only'}`)));
+    sev.value = SYSLOG_SEVERITIES.some((sv) => sv.name === q.get('severity')) ? q.get('severity') : '';
+    const text = h('input', { type: 'search', maxlength: '200', autocomplete: 'off', spellcheck: 'false', placeholder: 'message, host or app' });
+    text.value = (q.get('q') || '').slice(0, 200);
+    const period = rangeControl(range, (r) => { range = r; load(); }, 'Period').querySelector('.seg');
+    const search = field('Search', text);
+    search.classList.add('grow');
+    const form = h('form', { class: 'card filters', role: 'search', 'aria-label': 'Syslog filters' },
+      h('div', { class: 'field' }, h('span', { class: 'label', 'aria-hidden': 'true' }, 'Period'), period),
+      field('Severity', sev), search,
+      h('button', { type: 'submit', class: 'btn' }, 'Refresh'));
+    const out = h('section', { class: 'card', 'aria-labelledby': 'syslog-list-h' });
+    c.append(statusArea, form, out);
+    const browser = syslogBrowser(out, ctx, {
+      heading: 'Messages', headingId: 'syslog-list-h',
+      empty: () => (sev.value || text.value.trim() ? 'No syslog message received in this period matches the filters.' : 'No syslog messages were received in this period.'),
+    });
+
+    function load() {
+      const params = new URLSearchParams();
+      if (range !== '24h') params.set('range', range);
+      if (sev.value) params.set('severity', sev.value);
+      if (text.value.trim()) params.set('q', text.value.trim());
+      // keep the URL shareable without re-triggering the router
+      const hash = '#/syslog' + (params.toString() ? '?' + params.toString() : '');
+      if (window.location.hash !== hash) window.history.replaceState(null, '', hash);
+      const to = Date.now();
+      browser.load({ from: new Date(to - RANGE_MS[range]).toISOString(), to: new Date(to).toISOString(), q: text.value.trim(), severity: sev.value });
+    }
+    let timer = 0;
+    text.addEventListener('input', () => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(load, 350);
+    });
+    ctx.cleanup(() => window.clearTimeout(timer));
+    sev.addEventListener('change', load);
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      window.clearTimeout(timer);
+      load();
+    });
+    load();
+  }
+
+  /** syslogBrowser shows in el the messages GET /api/syslog returns for a period and filters,
+   *  newest first, with "Load more" while more matched: that asks again for the same period with
+   *  a larger limit and appends what is new. o: heading, headingId, intro (optional), empty()
+   *  (the text when nothing matched). Returns { load(query) }, query: {from, to, q, severity}
+   *  (to may be left out: until now). */
+  function syslogBrowser(el, ctx, o) {
+    const status = h('p', { class: 'small muted', 'aria-live': 'polite', tabindex: '-1' });
+    const warn = h('div');
+    const list = h('div', { class: 'syslog-list' }, h('p', { class: 'loading' }, 'Loading…'));
+    const more = h('button', { type: 'button', class: 'btn', hidden: true }, 'Load more');
+    replace(el, h('div', { class: 'card-head' }, h('h2', { id: o.headingId }, o.heading)), o.intro || null, status, warn, list,
+      h('div', { class: 'btn-row' }, more));
+    const cols = [{ label: 'Received' }, { label: 'Severity' }, { label: 'Host · app', cls: 'syslog-host' }, { label: 'Message', cls: 'syslog-msg' }];
+    let token = 0;
+    let busy = false; // a request is out ("Load more" stays enabled, so that it keeps the focus)
+    let abort = null; // cancels the request out: a newer one replaces it
+    let cur = null; // the query shown, with the period the server read
+    let tbody = null;
+    let shown = [];
+    ctx.cleanup(() => { if (abort) abort.abort(); });
+
+    async function fetchList(query, append) {
+      const mine = ++token;
+      if (abort) abort.abort();
+      abort = typeof AbortController === 'function' ? new AbortController() : null;
+      const params = new URLSearchParams({ from: query.from, limit: String(query.limit) });
+      if (query.to) params.set('to', query.to);
+      if (query.q) params.set('q', query.q);
+      if (query.severity) params.set('severity', query.severity);
+      busy = true;
+      list.classList.add('is-loading');
+      list.setAttribute('aria-busy', 'true');
+      more.setAttribute('aria-disabled', 'true');
+      try {
+        const { data, headers } = await api('/api/syslog?' + params.toString(), { withHeaders: true, signal: abort ? abort.signal : null });
+        if (!ctx.alive || mine !== token) return;
+        const msgs = Array.isArray(data && data.messages) ? data.messages.filter((m) => m && typeof m === 'object') : [];
+        cur = Object.assign({}, query, { from: (data && data.from) || query.from, to: (data && data.to) || query.to });
+        const w = headers.get('X-ATT-Monitor-Warning');
+        replace(warn, w ? notice('critical', h('strong', null, 'Integrity problem in the syslog records read. '), w, ' ', h('a', { href: '#/evidence' }, 'Run Verify')) : null);
+        // A larger page of the same period starts with the messages shown already.
+        const keyOf = (m) => m.seq + '|' + m.rx + '|' + (m.raw || m.raw_b64 || m.msg || '');
+        const grows = append && tbody && shown.length <= msgs.length && shown.every((k, i) => k === keyOf(msgs[i]));
+        if (grows) {
+          for (const m of msgs.slice(shown.length)) tbody.append(tableRow(cols, syslogRow(m), { stack: true }));
+        } else if (msgs.length) {
+          const tbl = table(cols, msgs.map(syslogRow), { compact: true, stack: true });
+          tbody = tbl.querySelector('tbody');
+          replace(list, tbl);
+        } else {
+          tbody = null;
+          replace(list, emptyNote(o.empty()));
+        }
+        shown = msgs.map(keyOf);
+        const period = [timeEl(cur.from, F.short), ' to ', timeEl(cur.to, F.short)];
+        const n = fmtInt(msgs.length) + ' message' + (msgs.length === 1 ? '' : 's');
+        replace(status, !msgs.length ? null
+          : !data.truncated ? [n + ' recorded from ', period, ', newest first.']
+            : query.limit < SYSLOG_MAX ? ['The newest ' + n + ' recorded from ', period, '; more were recorded in this period.']
+              : ['The newest ' + n + ' recorded from ', period, '. Narrow the period or the filters to see older ones.']);
+        more.hidden = !data.truncated || query.limit >= SYSLOG_MAX;
+        if (append && more.hidden) status.focus(); // the button the keyboard was on is gone
+      } catch (e) {
+        if (ctx.alive && mine === token) {
+          if (append && tbody) {
+            replace(warn, errorNotice(e)); // keep what is shown: Load more can be tried again
+          } else {
+            tbody = null;
+            shown = [];
+            more.hidden = true;
+            replace(status);
+            replace(list, errorNotice(e));
+          }
+        }
+      } finally {
+        if (mine === token) {
+          busy = false;
+          list.classList.remove('is-loading');
+          list.removeAttribute('aria-busy');
+          more.removeAttribute('aria-disabled');
+        }
+      }
+    }
+    more.addEventListener('click', () => {
+      if (cur && !busy) fetchList(Object.assign({}, cur, { limit: Math.min(SYSLOG_MAX, cur.limit * 2) }), true);
+    });
+    return { load(query) { fetchList(Object.assign({ limit: SYSLOG_PAGE }, query), false); } };
+  }
+
+  /** syslogSeverity describes a severity number (SYSLOG_SEVERITIES), or null. */
+  function syslogSeverity(n) {
+    return Number.isInteger(n) && n >= 0 && n < SYSLOG_SEVERITIES.length ? SYSLOG_SEVERITIES[n] : null;
+  }
+
+  /** syslogRow is the table row of a message (GET /api/syslog): when, how severe, from which
+   *  host and program, and what it says, with the exact datagram on request. Every cell holds
+   *  one element (the stacked rows of a narrow screen lay out a cell's children as a grid). */
+  function syslogRow(m) {
+    const sv = syslogSeverity(m.severity);
+    const text = m.msg || m.raw || '';
+    return [
+      h('span', { class: 'nowrap' }, timeEl(m.rx, F.sec)),
+      h('span', null, sv ? chip(sv.tone, sv.label, 'Severity ' + m.severity + ' (' + sv.name + ')')
+        : h('span', { class: 'muted', title: 'The message carries no severity' }, '—')),
+      h('div', null, m.host ? h('span', { class: 'wrap-any' }, visibleText(m.host)) : h('span', { class: 'muted' }, '—'),
+        m.app ? h('span', { class: 'sub small muted wrap-any' }, visibleText(m.app)) : null),
+      h('div', null, text ? h('span', { class: 'syslog-text' }, visibleText(text))
+        : h('span', { class: 'muted' }, m.raw_b64 ? 'not valid UTF-8: see the exact bytes' : '(empty)'),
+      syslogDetails(m)),
+    ];
+  }
+
+  /** syslogDetails offers a message's exact datagram, its parsed header and its ledger record. */
+  function syslogDetails(m) {
+    const det = h('details', { class: 'syslog-raw' }, h('summary', null, 'Exact datagram · record #' + orQ(m.seq)));
+    let filled = false;
+    det.addEventListener('toggle', () => {
+      if (!det.open || filled) return;
+      filled = true;
+      det.append(syslogFacts(m));
+    });
+    return det;
+  }
+
+  function syslogFacts(m) {
+    const sv = syslogSeverity(m.severity);
+    const fac = Number.isInteger(m.facility) ? m.facility : null;
+    const raw = typeof m.raw === 'string' && m.raw !== '' ? m.raw : null;
+    const escaped = raw != null && escapedText(raw) !== raw;
+    return h('div', { class: 'syslog-facts' }, kv([
+      ['Datagram', raw != null ? [h('pre', { class: 'json wrap syslog-text' }, visibleText(raw)),
+        escaped ? h('span', { class: 'sub small muted' }, 'Characters that would not show as themselves are written as escapes (\\x1b, \\n, …).') : null] : null],
+      ['Bytes (base64)', m.raw_b64 ? [h('pre', { class: 'json wrap' }, String(m.raw_b64)),
+        h('span', { class: 'sub small muted' }, 'Not valid UTF-8: the exact bytes received, base64-encoded.')] : null],
+      ['Received', [timeEl(m.rx), m.src ? [' from ', h('code', null, String(m.src))] : null]],
+      ['Format', m.format ? SYSLOG_FORMATS[m.format] || String(m.format) : null],
+      ['Priority', Number.isInteger(m.pri)
+        ? `${m.pri}: facility ${fac == null ? '?' : fac + ' (' + (SYSLOG_FACILITIES[fac] || '?') + ')'}, severity ${sv ? m.severity + ' (' + sv.name + ')' : '?'}`
+        : 'none in the datagram'],
+      ['Header time', m.ts ? [h('code', null, visibleText(m.ts)), h('span', { class: 'small muted' }, ' as the gateway wrote it')] : null],
+      ['Evidence', m.seq != null ? h('a', { href: recordsLink(m.seq) }, 'ledger record #' + m.seq) : null],
+    ]));
   }
 
   // ------------------------------------------------------------------ evidence view
@@ -3469,6 +4026,12 @@
       case 'config_change': return (d.what || '') + ': ' + (d.before || '') + ' → ' + (d.after || '');
       case 'config_state': return [d.rules ? 'rules ' + d.rules : '', d.config_sha256 ? 'config ' + shortHash(d.config_sha256, 12) : ''].filter(Boolean).join(' · ');
       case 'custody_export': return d.file_name || '';
+      case 'syslog': {
+        const msgs = Array.isArray(d.messages) ? d.messages : [];
+        const first = msgs.find((m) => m && typeof m === 'object');
+        return `${fmtInt(msgs.length)} message${msgs.length === 1 ? '' : 's'}` +
+          (first ? ' · ' + escapedText(String(first.msg || first.raw || '').slice(0, 120)) : '');
+      }
       default: return '';
     }
   }
@@ -3523,7 +4086,9 @@
       verdict,
       d ? h('div', null, h('h4', null, d.title), d.detail ? h('p', { class: 'tl-detail' }, d.detail) : null) : null,
       h('h4', null, 'Body (pretty-printed; the signed bytes are in b below)'),
-      h('pre', { class: 'json', tabindex: '0' }, JSON.stringify(rec.body, null, 2)),
+      // Text from outside (syslog messages, gateway pages) may hold characters that would reorder
+      // or hide what is shown: they are written as escapes.
+      h('pre', { class: 'json', tabindex: '0' }, visibleText(JSON.stringify(rec.body, null, 2), true)),
       blobs.length ? h('div', null, h('h4', null, 'Raw data referenced by this record'),
         h('ul', null, blobs.map((b) => h('li', null, h('span', { class: 'hash' }, b), ' — ', blobLinks(b, { view: rec.type === 'gateway_snapshot', viewText: 'view (sandboxed)', downloadText: 'download' }).reduce((acc, x, i) => (i ? acc.concat([' · ', x]) : [x]), []))))) : null,
       h('h4', null, 'Ledger line exactly as stored'),
@@ -3531,7 +4096,7 @@
       kv([
         ['h (SHA-256 of b)', [h('span', { class: 'hash' }, env.h || ''), rec.hash_ok === false ? [' ', alteredChip()] : null]],
         ['s (Ed25519 signature)', h('span', { class: 'hash' }, env.s || '')],
-        ['b (signed bytes)', h('pre', { class: 'json wrap', tabindex: '0' }, env.b || '')],
+        ['b (signed bytes)', h('pre', { class: 'json wrap', tabindex: '0' }, visibleText(env.b || ''))],
       ]));
   }
 

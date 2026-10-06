@@ -478,6 +478,7 @@ func (s *Server) routes() http.Handler {
 	rt.handle(http.MethodGet, "/api/incidents", s.handleIncidents)
 	rt.handle(http.MethodGet, "/api/incidents/{id}", s.handleIncident)
 	rt.handle(http.MethodGet, "/api/records", s.handleRecords)
+	rt.handle(http.MethodGet, "/api/syslog", s.handleSyslog)
 	rt.handle(http.MethodGet, "/api/blobs/{id}", s.handleBlob)
 	rt.handle(http.MethodGet, "/api/blobs/{id}/view", s.handleBlobView)
 	rt.handle(http.MethodPost, "/api/verify", s.handleVerify)

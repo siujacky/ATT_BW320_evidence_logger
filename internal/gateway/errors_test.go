@@ -98,7 +98,7 @@ func TestGatewaySentinelsMatchContracts(t *testing.T) {
 		checkSentinels(t, fmt.Errorf("x: %w", ce), ErrCertRejected, contracts.ErrGatewayCertRejected)
 	}
 	// Errors without a contracts counterpart match none of them.
-	for _, err := range []error{ErrNotApplied, ErrLoginRequired, ErrUnexpectedPage} {
+	for _, err := range []error{ErrNotApplied, ErrLoginRequired, ErrUnexpectedPage, ErrSyslogPage} {
 		for name, c := range contractSentinels {
 			if errors.Is(err, c) {
 				t.Errorf("%q matches contracts.%s", err, name)

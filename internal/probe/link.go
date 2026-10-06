@@ -37,6 +37,7 @@ type adapterInfo struct {
 	Friendly    string // FriendlyName / interface alias, e.g. "Wi-Fi" (same as netsh "Name")
 	Description string
 	IfIndex     uint32 // IPv4 interface index
+	Luid        uint64 // NET_LUID: identifies the interface for GetIfEntry2Ex (0 = unknown)
 	IfType      uint32
 	OperStatus  uint32
 	TxSpeed     uint64         // TransmitLinkSpeed, bits/s (0 or MaxUint64 = unknown)
@@ -208,6 +209,20 @@ func mergeWLAN(l *model.LocalLink, w model.LocalLink) {
 	}
 }
 
+// readCounters sets the octet counters of the adapter the reading describes: what this computer
+// received and sent on it (GetIfEntry2Ex). The adapter is identified by its NET_LUID, which is
+// unique and stays the same while the adapter exists (an interface index can be reused, an alias
+// renamed), else by its interface index. Counters that cannot be read stay nil: they measure
+// traffic, not the link, and never go into Err.
+func (p *Prober) readCounters(l *model.LocalLink, a adapterInfo) {
+	rx, tx, err := p.ifCounters(a.Luid, a.IfIndex)
+	if err != nil {
+		p.log.Debug("interface counters not read", "interface", l.Interface, "err", err)
+		return
+	}
+	l.RxBytes, l.TxBytes = &rx, &tx
+}
+
 func appendLinkErr(l *model.LocalLink, msg string) {
 	if l.Err == "" {
 		l.Err = msg
@@ -218,7 +233,8 @@ func appendLinkErr(l *model.LocalLink, msg string) {
 
 // LocalLink describes the adapter used to reach gatewayIP (see selectAdapter): alias,
 // type (IfType 71 wifi, 6 ethernet), state (IF_OPER_STATUS), local IPv4, the adapter's
-// gateway and link speed (TransmitLinkSpeed). For Wi-Fi adapters it runs
+// gateway, link speed (TransmitLinkSpeed) and its 64-bit octet counters (RxBytes/TxBytes, see
+// readCounters). For Wi-Fi adapters it runs
 // "netsh wlan show interfaces" (5 s limit, no console window), merges SSID, BSSID, band,
 // channel, radio type, rates, signal and RSSI, and returns netsh's exact output as raw (with its
 // SHA-256 in RawSHA256) for the evidence store; for other adapters raw is nil.
@@ -261,6 +277,7 @@ func (p *Prober) LocalLink(ctx context.Context, gatewayIP string) (model.LocalLi
 	}
 	link := linkFromAdapter(a, gw)
 	p.log.Debug("local link adapter", "interface", link.Interface, "selected_by", how, "best_if", best)
+	p.readCounters(&link, a) // before netsh, which may take seconds: the reading's time is now
 	if a.IfType != ifTypeIEEE80211 {
 		return link, nil, nil
 	}

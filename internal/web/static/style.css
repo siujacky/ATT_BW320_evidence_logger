@@ -98,6 +98,7 @@
 /* ------------------------------------------------------------------ base */
 
 *, *::before, *::after { box-sizing: border-box; }
+[hidden] { display: none !important; } /* also for elements styled with a display (e.g. .btn) */
 html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 body {
   margin: 0;
@@ -344,7 +345,7 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 14px; }
 .btn-primary:hover { background: var(--btn-primary-bg); filter: brightness(1.1); }
 .btn-danger { border-color: var(--critical); }
 .btn-small { min-height: 30px; padding: 3px 10px; font-size: 13px; }
-.btn[disabled] { opacity: 0.55; cursor: not-allowed; }
+.btn[disabled], .btn[aria-disabled="true"] { opacity: 0.55; cursor: not-allowed; }
 .btn-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .link-btn { background: none; border: 0; padding: 0; font: inherit; color: var(--link); text-decoration: underline; cursor: pointer; }
 
@@ -353,7 +354,7 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 14px; }
 .field { display: grid; gap: 4px; align-content: start; }
 .field > label, .field > .label { font-weight: 650; font-size: 14px; }
 .hint { font-size: 13px; color: var(--text-2); margin: 0; }
-input[type="text"], input[type="number"], input[type="date"], input[type="datetime-local"], select, textarea {
+input[type="text"], input[type="search"], input[type="number"], input[type="date"], input[type="datetime-local"], select, textarea {
   font: inherit; padding: 7px 10px; min-height: 36px; width: 100%; min-width: 0;
   border: 1px solid var(--border-strong); border-radius: 8px; background: var(--surface); color: var(--text);
 }
@@ -392,6 +393,7 @@ textarea { min-height: 96px; resize: vertical; }
   padding: 12px 16px 14px; min-width: 0; box-shadow: var(--shadow);
 }
 .chart-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 6px 12px; flex-wrap: wrap; }
+.chart-head > div { flex: 1 1 18em; min-width: 0; } /* a long caption leaves the Table button beside it */
 .chart-title { font-weight: 680; margin: 0; font-size: 1rem; }
 .chart-sub { font-size: 13px; color: var(--text-2); margin: 2px 0 0; }
 .legend { display: flex; flex-wrap: wrap; gap: 2px 4px; list-style: none; margin: 8px 0 2px; padding: 0; }
@@ -436,6 +438,10 @@ textarea { min-height: 96px; resize: vertical; }
 .thr { fill: none; stroke-width: 1.5; stroke-dasharray: 6 4; }
 .thr-critical { stroke: var(--critical); }
 .thr-warning { stroke: var(--warning); }
+.thr-ref { stroke: var(--text-2); }
+.pk { fill: none; stroke-width: 2; stroke-linecap: butt; } /* peak marks (traffic) */
+.ink { stroke: var(--text-2); }
+.atleast { fill: none; stroke: var(--text); stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
 .thr-label { fill: var(--text-2); font-size: 11px; font-weight: 650; font-family: var(--sans); }
 .clamp { fill: var(--text-2); }
 .hit { fill: transparent; }
@@ -462,6 +468,24 @@ textarea { min-height: 96px; resize: vertical; }
 /* route check (Local link card): collapsed while every route goes through the gateway */
 details.egress > summary { cursor: pointer; font-size: 14px; color: var(--text-2); }
 details.egress[open] > summary { margin-bottom: 4px; }
+
+/* gateway syslog: a message's text as received, hidden characters as escapes (class ctl) */
+.syslog-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.ctl {
+  font-family: var(--mono); font-size: 0.85em; color: var(--text-2);
+  background: var(--surface-3); border-radius: 3px; padding: 0 2px; margin: 0 1px;
+}
+.tbl td.syslog-msg { min-width: 16em; overflow-wrap: anywhere; }
+.tbl td.syslog-host { min-width: 8.5em; }
+.filters .field.grow { flex: 1 1 16em; }
+details.syslog-raw > summary { cursor: pointer; font-size: 12.5px; color: var(--text-2); margin-top: 2px; }
+details.syslog-raw[open] > summary { margin-bottom: 6px; }
+.syslog-facts pre.json { max-height: 240px; }
+.syslog-list { transition: opacity 0.2s; }
+.syslog-list.is-loading { opacity: 0.55; } /* the previous messages stay until the new ones arrive */
+@media (max-width: 640px) {
+  .tbl.stack-narrow td.syslog-msg, .tbl.stack-narrow td.syslog-host { min-width: 0; }
+}
 
 /* meter (Wi-Fi signal) */
 .meter { display: inline-block; width: 90px; height: 8px; border-radius: 4px; background: var(--grid); vertical-align: middle; overflow: hidden; margin-left: 8px; }
@@ -520,12 +544,12 @@ dialog.dlg::backdrop { background: rgba(0, 0, 0, 0.5); }
 
 @media (prefers-reduced-motion: reduce) {
   .spinner { animation: none; border-right-color: currentColor; opacity: 0.6; }
-  .charts-body, .rec > summary .chev { transition: none; }
+  .charts-body, .rec > summary .chev, .syslog-list { transition: none; }
 }
 @media (forced-colors: active) {
   .ico .bg { fill: CanvasText; }
   .ico .fg { stroke: Canvas; }
-  .ln { stroke: CanvasText; }
+  .ln, .pk, .atleast { stroke: CanvasText; }
 }
 @media print {
   .topbar, .footer, .skip-link, .btn, .legend button, .seg { display: none !important; }
