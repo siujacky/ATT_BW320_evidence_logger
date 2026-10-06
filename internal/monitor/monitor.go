@@ -64,6 +64,9 @@ type Options struct {
 	// MongoStatus, when set, reports the MongoDB copy of the ledger for Status (it is called
 	// without holding the monitor's lock and must not block).
 	MongoStatus func() model.MongoStatus
+	// Syslog receives the gateway's syslog messages (nil: no receiver). The monitor runs it,
+	// sets its allowed senders and writes what it receives to the ledger (Config.Syslog).
+	Syslog contracts.SyslogReceiver
 }
 
 // Compile-time interface conformance.
