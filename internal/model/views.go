@@ -160,6 +160,7 @@ type MongoStatus struct {
 	Lag       uint64 `json:"lag"`               // ledger head seq minus LastSeq
 	Records   int64  `json:"records,omitempty"` // documents in the records collection (approximate)
 	Blobs     int64  `json:"blobs,omitempty"`   // documents in the blobs collection (approximate)
+	Syslog    int64  `json:"syslog,omitempty"`  // documents in the syslog collection (approximate)
 	LastSync  string `json:"last_sync,omitempty"`
 	LastError string `json:"last_error,omitempty"`
 }

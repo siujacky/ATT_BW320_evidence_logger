@@ -329,8 +329,10 @@ const eventsPageOn = `<html><body><form><input id="broadband"  type="checkbox" n
 const eventsPageOff = `<html><body><form><input id="broadband"  type="checkbox" name="bbevent"  /></form></body></html>`
 
 type fakeGateway struct {
-	mu         sync.Mutex
-	snap       func(call int, pages []string, trigger string) (model.GatewaySnapshot, map[string][]byte, error)
+	mu   sync.Mutex
+	snap func(call int, pages []string, trigger string) (model.GatewaySnapshot, map[string][]byte, error)
+	// snapCtx, when set, answers Snapshot in place of snap, with the request's context.
+	snapCtx    func(ctx context.Context, call int, pages []string, trigger string) (model.GatewaySnapshot, map[string][]byte, error)
 	calls      int
 	triggers   []string
 	pageSets   [][]string
@@ -342,7 +344,16 @@ type fakeGateway struct {
 	notifTimes []time.Time
 	setCalls   []bool
 	setErr     error
+	// syslog answers Syslog (nil: the page cannot be read, errNoSyslogPage); syslogCalls counts
+	// the reads (syslogTimes: when) and setSyslogCalls the changes, which phase 1 never makes.
+	syslog         func() (model.SyslogSetting, []byte, error)
+	syslogCalls    int
+	syslogTimes    []time.Time
+	setSyslogCalls int
 }
+
+// errNoSyslogPage is the fake gateway's answer to Syslog unless a test sets one.
+var errNoSyslogPage = errors.New("fake gateway: the Syslog page is not part of this test")
 
 func (g *fakeGateway) Snapshot(ctx context.Context, pages []string, trigger string) (model.GatewaySnapshot, map[string][]byte, error) {
 	g.mu.Lock()
@@ -350,9 +361,12 @@ func (g *fakeGateway) Snapshot(ctx context.Context, pages []string, trigger stri
 	call := g.calls
 	g.triggers = append(g.triggers, trigger)
 	g.pageSets = append(g.pageSets, append([]string(nil), pages...))
-	fn := g.snap
+	fn, fnCtx := g.snap, g.snapCtx
 	g.mu.Unlock()
-	if fn == nil {
+	switch {
+	case fnCtx != nil:
+		return fnCtx(ctx, call, pages, trigger)
+	case fn == nil:
 		return okSnapshot(pages, time.Now()), pageBodies(pages, "ok"), nil
 	}
 	return fn(call, pages, trigger)
@@ -391,14 +405,31 @@ func (g *fakeGateway) SetNotification(ctx context.Context, enabled bool) ([]byte
 	return before, after, nil
 }
 
-// Syslog and SetSyslog: the syslog page is not part of these fakes yet (phase 1 of
-// docs/syslog-snmp-traffic.md adds its behaviour with the monitor integration).
 func (g *fakeGateway) Syslog(ctx context.Context) (model.SyslogSetting, []byte, error) {
-	return model.SyslogSetting{}, nil, contracts.ErrNotRecorded
+	g.mu.Lock()
+	g.syslogCalls++
+	g.syslogTimes = append(g.syslogTimes, time.Now())
+	fn := g.syslog
+	g.mu.Unlock()
+	if fn == nil {
+		return model.SyslogSetting{}, nil, errNoSyslogPage
+	}
+	return fn()
 }
 
+// SetSyslog is counted and refused: phase 1 of docs/syslog-snmp-traffic.md only reads the page.
 func (g *fakeGateway) SetSyslog(ctx context.Context, want model.SyslogTarget) ([]byte, []byte, error) {
-	return nil, nil, contracts.ErrNotRecorded
+	g.mu.Lock()
+	g.setSyslogCalls++
+	g.mu.Unlock()
+	return nil, nil, errors.New("fake gateway: SetSyslog must not be called")
+}
+
+// syslogReads returns how often the Syslog page was read and changed.
+func (g *fakeGateway) syslogReads() (reads, sets int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.syslogCalls, g.setSyslogCalls
 }
 
 func (g *fakeGateway) SetCertObserver(o contracts.CertObserver) {
@@ -698,6 +729,12 @@ type rig struct {
 
 func newRig(t *testing.T, cfg *config.Config, led *fakeLedger) *rig {
 	t.Helper()
+	return newRigWith(t, cfg, led, nil)
+}
+
+// newRigWith is newRig with a hook that may change the options before New.
+func newRigWith(t *testing.T, cfg *config.Config, led *fakeLedger, opt func(*Options)) *rig {
+	t.Helper()
 	if cfg == nil {
 		cfg = testConfig()
 	}
@@ -705,7 +742,7 @@ func newRig(t *testing.T, cfg *config.Config, led *fakeLedger) *rig {
 		led = newFakeLedger("run-current")
 	}
 	r := &rig{cfg: cfg, led: led, gw: &fakeGateway{}, pr: newFakeProber(), anc: &fakeAnchorer{urls: cfg.Anchoring.TSAURLs}}
-	m, err := New(Options{
+	opts := Options{
 		Config:     cfg,
 		SaveConfig: func(*config.Config) error { r.saved.Add(1); return nil },
 		Ledger:     led,
@@ -718,7 +755,11 @@ func newRig(t *testing.T, cfg *config.Config, led *fakeLedger) *rig {
 		Listen:     "127.0.0.1:8320",
 		DataDir:    t.TempDir(),
 		StateDir:   t.TempDir(),
-	})
+	}
+	if opt != nil {
+		opt(&opts)
+	}
+	m, err := New(opts)
 	if err != nil {
 		t.Fatal(err)
 	}

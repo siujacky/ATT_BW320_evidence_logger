@@ -61,8 +61,9 @@ func cmdInstall(args []string) error {
 }
 
 // installService copies the program to Program Files, prepares and secures the data
-// directory, stores the access code, creates (or upgrades) the service, starts it and waits for
-// the dashboard. An upgrade that fails after stopping the service restarts the previous one.
+// directory, stores the access code, sets up the Windows Firewall rule of the syslog receiver,
+// creates (or upgrades) the service, starts it and waits for the dashboard. An upgrade that fails
+// after stopping the service restarts the previous one.
 func installService(o installOptions) error {
 	out := o.Out
 	if out == nil {
@@ -144,6 +145,13 @@ func installService(o installOptions) error {
 		return err
 	}
 	fmt.Fprintln(out, "Data directory:", o.DataDir)
+	// Windows Firewall lets the gateway's syslog datagrams in only with a rule (best effort: the
+	// monitor works without them).
+	if msg, err := syncSyslogFirewallRule(dst, cfg); err != nil {
+		fmt.Fprintln(out, "Note: could not set up the Windows Firewall rule for the gateway's syslog messages:", err)
+	} else if msg != "" {
+		fmt.Fprintln(out, msg)
+	}
 
 	if !upgrade {
 		if err := winsvc.Install(winsvc.InstallOptions{
@@ -195,9 +203,10 @@ func printFingerprint(out io.Writer, paths config.Paths) {
 	}
 }
 
-// cmdUninstall removes the service, the program, its Start menu shortcut and its Settings >
-// Apps entry. The evidence in the data directory is never touched. With --interactive (the
-// command Settings > Apps runs) it asks for confirmation and for administrator rights itself.
+// cmdUninstall removes the service, the program, its Start menu shortcut, its Settings > Apps
+// entry and the Windows Firewall rule of the syslog receiver. The evidence in the data directory
+// is never touched. With --interactive (the command Settings > Apps runs) it asks for
+// confirmation and for administrator rights itself.
 func cmdUninstall(args []string) error {
 	fs := flag.NewFlagSet("uninstall", flag.ContinueOnError)
 	interactive := fs.Bool("interactive", false, "ask for confirmation and administrator rights (Settings > Apps)")
@@ -245,6 +254,12 @@ func cmdUninstall(args []string) error {
 			pauseIfOwnWindow()
 		}
 		return err
+	}
+	switch removed, err := removeSyslogFirewallRule(); {
+	case err != nil:
+		fmt.Println("Note: could not remove the Windows Firewall rule for the gateway's syslog messages:", err)
+	case removed:
+		fmt.Printf("Windows Firewall rule %q removed.\n", syslogFirewallRule)
 	}
 	if err := unregisterApp(); err != nil {
 		fmt.Println("Note: could not remove the Settings > Apps entry:", err)

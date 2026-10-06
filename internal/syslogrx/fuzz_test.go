@@ -39,8 +39,12 @@ func FuzzParse(f *testing.F) {
 			t.Fatalf("PRI, Facility, Severity set apart: %v %v %v", deref(m.PRI), deref(m.Facility), deref(m.Severity))
 		}
 		if m.PRI == nil {
-			if m.Format != FormatUnknown || m.Msg != text {
-				t.Fatalf("without PRI: Format %q, Msg %q, want the text %q", m.Format, m.Msg, text)
+			want := text
+			if text == m.Raw {
+				want = "" // Raw holds it: not stored twice
+			}
+			if m.Format != FormatUnknown || m.Msg != want {
+				t.Fatalf("without PRI: Format %q, Msg %q, want %q", m.Format, m.Msg, want)
 			}
 		} else {
 			if *m.PRI < 0 || *m.PRI > maxPRI || *m.Facility != *m.PRI/8 || *m.Severity != *m.PRI%8 {

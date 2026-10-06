@@ -16,11 +16,13 @@ service continuously:
 | 10 s | ICMP + TCP to the gateway's LAN address | proves the customer's own network path to AT&T's gateway was working |
 | 10 s | ICMP to AT&T's next hop (the "Gateway IPv4 Address" the gateway reports) | separates AT&T access-network faults from upstream ones |
 | 10 s | ICMP to 1.1.1.1, 8.8.8.8, 9.9.9.9 and TCP 443 to 1.1.1.1, 8.8.8.8 | three independent providers — one provider's problem cannot look like an outage |
-| 60 s (15 s during an outage) | the gateway's own status pages: Broadband Status, Fiber Status, System Information | **AT&T's device reports its own WAN state, PON (fiber) state, optical power levels with its own alarm flags, uptime, firmware and clock** |
+| 60 s (15 s during an outage) | the gateway's own status pages: Broadband Status, Fiber Status, System Information | **AT&T's device reports its own WAN state, PON (fiber) state, optical power levels with its own alarm flags, uptime, firmware, clock and traffic counters** (the traffic counters also show whether the household's own traffic could explain a slowdown) |
 | 60 s (15 s during an outage) | DNS via the gateway, via AT&T's resolver and via 1.1.1.1; HTTP connectivity checks | detects DNS failures and outage-page hijacking |
 | 60 s | the PC's own link (Wi-Fi signal/BSSID/channel or Ethernet speed) | rules local link problems in or out |
 | outage start/end | traceroutes | shows where the path stops |
 | hourly | SNTP clock offsets (and the gateway's own clock every minute) | shows how far this PC's clock was from internet time (the RFC 3161 time-stamps below are what bound every record's time) |
+| as it arrives | the gateway's own log messages (syslog), once the gateway is set to send them to the PC: every datagram from the gateway's address, exactly as received, with the PC's receive time | the gateway's own account of events, kept as supporting evidence (it never changes a verdict) |
+| daily | the gateway's Syslog setting (read only) | shows whether, and where, the gateway was sending its log |
 
 Every gateway page fetch records the page's SHA-256 and the values parsed from it. The page itself is
 stored **byte-for-byte** whenever a decisive value changes (WAN/PON state, optical alarm flags, WAN IP,
@@ -76,22 +78,49 @@ be recomputed. All healthy samples are kept too — nothing is cherry-picked.
 6. **The report is bound to the records.** `att-monitor verify-bundle` re-computes REPORT.html,
    report.json and README.txt from the bundle's own ledger and fails on any difference, so a figure in
    the report cannot be edited after export.
+7. **Syslog chunks are bound to their records, and deletions are recorded.** The gateway's syslog
+   messages are the one kind of data kept outside the ledger, because the ledger never deletes
+   anything and the messages are kept within a size limit (the newest 100 MB by default). They are
+   stored in chunks. A chunk is sealed when it reaches 1 MiB; about 5 minutes after it was opened (at
+   the store's next flush, every `syslog.flush_interval`, 30 seconds by default); when the service
+   stops; or, when a crash or a failure of the ledger left it open, at the next start (reason
+   `recovered`). Then a **`syslog_chunk`** record states the SHA-256, size and message count of its
+   exact content and the receive times of its first and last message. That record is signed, chained
+   and time-stamped like every other, so the chunk's messages provably existed, exactly as they are,
+   no later than the time-stamp that covers the record: adding, removing, reordering or altering one
+   message changes the SHA-256. Every sealed chunk gets its record: one sealed while the ledger
+   refused records is recorded as soon as it takes them again, by the next start at the latest (its
+   record's time-stamp is then that much later). Every chunk the retention limits delete (the size
+   limit, or an optional age limit) is named, with its SHA-256, in a **`syslog_prune`** record written
+   before the chunk is deleted - nothing is deleted while a chunk still waits for its record - so a
+   deletion is on record, with its reason, and never silent. A bundle contains the chunks of its period that were
+   still kept at export (`syslog/`); each must match its record, and the chunks of the period that
+   are missing are listed as deleted by a retention limit (a `syslog_prune` record says so) or as not
+   in the bundle. Messages of the chunk still open at export are in no record yet and are not in the
+   bundle.
 
 **Limits (stated honestly):** the custodian controls the PC, so the system is tamper-*evident*, not
 tamper-*proof*. Records newer than the last time-stamp are only protected by the hash chain and signature
 (and back-dating that stays entirely after the newest time-stamp cannot be disproven by one).
-Verification shows exactly which records are covered by which time-stamp.
+Verification shows exactly which records are covered by which time-stamp. Syslog travels over UDP
+without authentication or delivery guarantee: the records show what this PC received from the gateway's
+address (the exact bytes, the sender as Windows reported it, the PC's receive time), not that the
+gateway sent nothing else, and the content of a chunk is protected only from when it is sealed.
 
 **Copies are not the evidence.** The owner may also keep a copy of the ledger in a local MongoDB database
 for queries. That copy is never part of a bundle and proves nothing by itself; a bundle is verified from
 its own ledger files, signatures and time-stamps alone. Each record in the MongoDB copy keeps its exact
 `h`, `s` and `b`, so any record shown from it can be checked the same way (`h` = SHA-256 of `b`, `s` a valid
-signature of `b` under the fingerprinted key).
+signature of `b` under the fingerprinted key). Its copy of the syslog messages likewise reproduces each
+chunk's SHA-256 only when complete and unaltered (`att-monitor mongo verify` checks that). The files of
+the syslog store on the PC are not evidence by themselves either: a chunk proves something once it
+matches its `syslog_chunk` record.
 
 ## How to verify a bundle
 
 The bundle (`att-evidence_<from>_<to>_<head>.zip`) contains `MANIFEST.sha256`, the complete ledger
-segments for the period, every referenced raw page (`blobs/`), the public key, the human report and
+segments for the period, every referenced raw page (`blobs/`), the gateway's syslog chunks of the period
+that were still kept at export (`syslog/`), the public key, the human report and
 `tools/verify_bundle.py`.
 
 ### Option A — Python (no installation needed beyond Python 3.9+)
@@ -99,7 +128,9 @@ segments for the period, every referenced raw page (`blobs/`), the public key, t
 python tools/verify_bundle.py att-evidence_....zip
 ```
 Checks the manifest, every record hash, the chain, segment hashes, blobs, record times against the
-time-stamps, and (if the `cryptography` package is installed: `pip install cryptography`, or with
+time-stamps, every syslog chunk against its `syslog_chunk` record (the chunks of the period that are
+not in the bundle are listed in the notes, with the `syslog_prune` record that deleted them if any),
+and (if the `cryptography` package is installed: `pip install cryptography`, or with
 `--pure-python-ed25519`) every signature; with OpenSSL on PATH it verifies every time-stamp token
 (`openssl ts -verify -attime`) against `keys/tsa-roots.pem`. It does not re-derive the report — use
 option B for that.
@@ -108,7 +139,8 @@ option B for that.
 ```
 att-monitor verify-bundle att-evidence_....zip --expect-fingerprint <fingerprint you received separately>
 ```
-Everything option A checks, plus TSA chain validation and the report re-computation (REPORT line).
+Everything option A checks, plus TSA chain validation and the report re-computation (REPORT line). The
+SYSLOG line gives the outcome of the syslog chunk checks.
 
 ### Option C — by hand with standard tools
 * Bundle integrity: `sha256sum -c MANIFEST.sha256`
@@ -124,6 +156,12 @@ Everything option A checks, plus TSA chain validation and the report re-computat
   SHA-256 fingerprints with the ones the authorities publish. `-attime` checks the certificates as of the
   time-stamp, so old tokens keep verifying after the TSA certificate expires. Only time-stamps whose
   certificate chain verifies count as proof of time.
+* A syslog chunk: find the `syslog_chunk` record whose `name` is the file's name; then
+  ```
+  gzip -dc syslog/<name> | sha256sum      # = the record's sha256
+  gzip -dc syslog/<name> | wc -c          # = the record's bytes
+  gzip -dc syslog/<name> | wc -l          # = the record's messages (one JSON message per line)
+  ```
 
 ## Setup-time evidence (bootstrap)
 

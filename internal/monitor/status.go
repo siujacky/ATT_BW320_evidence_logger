@@ -24,6 +24,19 @@ func (m *Monitor) Status() model.Status {
 		ms := f()
 		mongo = &ms
 	}
+	// The syslog receiver and store have locks of their own: never called while holding mu.
+	var (
+		rxAddr string
+		rxErr  error
+		usage  *model.SyslogUsage
+	)
+	if m.syslogOn {
+		rxAddr, rxErr = m.opts.Syslog.Listening()
+	}
+	if st := m.opts.SyslogStore; st != nil {
+		u := st.Usage()
+		usage = &u
+	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -118,6 +131,8 @@ func (m *Monitor) Status() model.Status {
 	if anchorsUntrusted(m.st.lastAnchor, m.st.lastUntrusted) {
 		s.Conditions = append(s.Conditions, anchorUntrustedCondition(m.st.lastUntrusted, m.st.untrustedSince))
 	}
+	s.Syslog = m.syslogStatusLocked(rxAddr, rxErr, usage, hasCode)
+	s.Conditions = append(s.Conditions, m.syslogConditionsLocked(rxAddr, rxErr)...)
 	switch {
 	case !hasCode:
 		s.Conditions = append(s.Conditions, noAccessCodeCondition(""))

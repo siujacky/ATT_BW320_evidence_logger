@@ -49,6 +49,8 @@
   --s6: #008300;
   --s7: #4a3aa7;
   --s8: #e34948;
+  /* an area's fill: its series hue as a light wash (traffic chart, flow meter) */
+  --area: 0.14;
 
   --radius: 10px;
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
@@ -92,6 +94,7 @@
     --s6: #008300;
     --s7: #9085e9;
     --s8: #e66767;
+    --area: 0.24;
   }
 }
 
@@ -442,7 +445,11 @@ textarea { min-height: 96px; resize: vertical; }
 .pk { fill: none; stroke-width: 2; stroke-linecap: butt; } /* peak marks (traffic) */
 .ink { stroke: var(--text-2); }
 .atleast { fill: none; stroke: var(--text); stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
-.thr-label { fill: var(--text-2); font-size: 11px; font-weight: 650; font-family: var(--sans); }
+.thr-label {
+  fill: var(--text-2); font-size: 11px; font-weight: 650; font-family: var(--sans);
+  paint-order: stroke; stroke: var(--surface); stroke-width: 3px; stroke-linejoin: round; /* legible over an area */
+}
+.area { stroke: none; fill-opacity: var(--area); }
 .clamp { fill: var(--text-2); }
 .hit { fill: transparent; }
 .run-hover { fill: none; stroke: var(--text); stroke-width: 2; }
@@ -487,9 +494,37 @@ details.syslog-raw[open] > summary { margin-bottom: 6px; }
   .tbl.stack-narrow td.syslog-msg, .tbl.stack-narrow td.syslog-host { min-width: 0; }
 }
 
-/* meter (Wi-Fi signal) */
+/* meter (Wi-Fi signal; .wide: the syslog store's use of its limit) */
 .meter { display: inline-block; width: 90px; height: 8px; border-radius: 4px; background: var(--grid); vertical-align: middle; overflow: hidden; margin-left: 8px; }
 .meter > span { display: block; height: 100%; background: var(--s1); border-radius: 4px; }
+.meter.wide { display: block; width: 100%; max-width: 420px; margin: 0; }
+
+/* the syslog store (Syslog page): use against the limits, and how much to keep */
+.store-usage { display: grid; gap: 6px; margin: 0 0 14px; }
+.store-usage p { margin: 0; }
+.form.retention { max-width: 640px; }
+
+/* traffic chart: MRTG's legend under the plot */
+.mrtg { margin-top: 10px; }
+.mrtg table.tbl { width: auto; min-width: min(100%, 520px); }
+.mrtg .key { vertical-align: -1px; }
+
+/* flow meter (Overview): live download and upload through the gateway */
+.flow { display: grid; gap: 10px; }
+.flow > p, .flow-row > p { margin: 0; }
+.flow-row { display: grid; gap: 3px; }
+.flow-label { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text); }
+.flow-value { line-height: 1.15; }
+.flow-num { font-size: 1.9rem; font-weight: 650; }
+.flow-unit { font-size: 1rem; font-weight: 600; color: var(--text-2); }
+.flow-pre { font-size: 0.9rem; font-weight: 600; color: var(--text-2); }
+.flow-bar { display: block; width: 100%; height: 10px; border-radius: 4px; overflow: hidden; }
+.flow-bar .track { fill-opacity: var(--area); }
+.flow-heavy { stroke: var(--text); stroke-width: 2; }
+.flow-scale { font-size: 12.5px; color: var(--text-2); }
+.flow-spark { display: block; width: 100%; height: 40px; overflow: visible; }
+.flow-spark-wrap > p { margin: 2px 0 0; }
+.flow-pc { font-size: 14px; }
 
 /* ------------------------------------------------------------------ records, timeline */
 
@@ -550,6 +585,7 @@ dialog.dlg::backdrop { background: rgba(0, 0, 0, 0.5); }
   .ico .bg { fill: CanvasText; }
   .ico .fg { stroke: Canvas; }
   .ln, .pk, .atleast { stroke: CanvasText; }
+  .area, .flow-bar rect { fill: CanvasText; }
 }
 @media print {
   .topbar, .footer, .skip-link, .btn, .legend button, .seg { display: none !important; }

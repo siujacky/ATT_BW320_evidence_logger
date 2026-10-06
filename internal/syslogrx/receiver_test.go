@@ -1,6 +1,7 @@
 package syslogrx
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -19,7 +20,8 @@ func TestNewDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.o.Listen != ":514" || r.o.MaxPerMinute != 2000 || r.o.MaxMessage != 8192 || r.o.MaxPending != 8000 {
+	if r.o.Listen != ":514" || r.o.MaxPerMinute != 2000 || r.o.MaxMessage != 8192 || r.o.MaxPending != 8000 ||
+		r.o.MaxBytesPerMinute != 1<<20 {
 		t.Errorf("defaults: %+v", r.o)
 	}
 	if r.o.Now == nil || r.log == nil {
@@ -40,8 +42,8 @@ func TestNewDefaults(t *testing.T) {
 	if err != nil || r.o.MaxPending <= 0 {
 		t.Errorf("MaxPending for MaxInt a minute = %d (%v)", r.o.MaxPending, err)
 	}
-	r, err = New(Options{MaxPerMinute: 10, MaxPending: 3, MaxMessage: maxDatagram})
-	if err != nil || r.o.MaxPending != 3 || r.o.MaxMessage != maxDatagram {
+	r, err = New(Options{MaxPerMinute: 10, MaxPending: 3, MaxMessage: maxDatagram, MaxBytesPerMinute: 5000})
+	if err != nil || r.o.MaxPending != 3 || r.o.MaxMessage != maxDatagram || r.o.MaxBytesPerMinute != 5000 {
 		t.Errorf("explicit limits: %+v (%v)", r.o, err)
 	}
 }
@@ -75,6 +77,7 @@ func TestNewValidates(t *testing.T) {
 		{Listen: "[::1]"},
 		{Listen: "1.2.3.4:5:6"},
 		{MaxPerMinute: -1},
+		{MaxBytesPerMinute: -1},
 		{MaxMessage: -1},
 		{MaxMessage: maxDatagram + 1},
 		{MaxPending: -1},
@@ -229,6 +232,70 @@ func TestPerMinuteCap(t *testing.T) {
 	feed(1, "d")
 	if logs.count(logOverCap) != 2 || logs.attr(logOverCap, "suppressed") != "3" {
 		t.Errorf("log: %q", logs.all())
+	}
+}
+
+// The messages of a minute may take at most MaxBytesPerMinute as stored (their JSON lines): one
+// beyond is dropped, and does not count against the minute's message cap.
+func TestPerMinuteByteCap(t *testing.T) {
+	m := Parse([]byte("<14>x 0"))
+	m.RX, m.Src = "2026-10-05T03:20:00.123456789Z", "192.168.1.254:514"
+	one := storedSize(&m)
+	limit := 3*one - 1 // two messages like m fit, a third does not, a slightly shorter one does
+	r, clk, logs := newReceiver(t, Options{MaxPerMinute: 3, MaxBytesPerMinute: limit,
+		Allowed: []netip.Addr{netip.MustParseAddr("192.168.1.254")}})
+	from := ap("192.168.1.254:514")
+	r.accept([]byte("<14>x 0"), from)
+	r.accept([]byte("<14>x 1"), from)
+	r.accept([]byte("<14>x 2"), from) // beyond the bytes of the minute
+	r.accept([]byte("<14>y"), from)   // shorter: it fits, and is the third by count (x 2 is not counted)
+	r.accept([]byte("<14>"), from)    // beyond the message cap
+	msgs, dropped, _ := r.Drain()
+	if len(msgs) != 3 || msgs[0].Raw != "<14>x 0" || msgs[1].Raw != "<14>x 1" || msgs[2].Raw != "<14>y" || dropped != 2 {
+		t.Fatalf("Drain = %+v, %d dropped", msgs, dropped)
+	}
+	total := 0
+	for i := range msgs {
+		total += storedSize(&msgs[i])
+	}
+	if total > limit || storedSize(&msgs[0]) != one {
+		t.Errorf("stored %d bytes (a message %d), limit %d", total, storedSize(&msgs[0]), limit)
+	}
+	if logs.count(logOverBytes) != 1 || logs.attr(logOverBytes, "limit_bytes") != fmt.Sprint(limit) ||
+		logs.attr(logOverBytes, "bytes") != "7" || logs.count(logOverCap) != 1 {
+		t.Errorf("log: %q", logs.all())
+	}
+	// The next minute starts afresh.
+	clk.Set(time.Date(2026, 10, 5, 3, 21, 0, 0, time.UTC))
+	r.accept([]byte("<14>x 3"), from)
+	r.accept([]byte("<14>x 4"), from)
+	if msgs, dropped, _ := r.Drain(); len(msgs) != 2 || dropped != 0 {
+		t.Errorf("next minute: %+v, %d dropped", msgs, dropped)
+	}
+}
+
+// A sender (or anyone forging the gateway's address) at the message cap with the largest
+// datagrams of escaped control characters fills at most MaxBytesPerMinute a minute in the store:
+// a 1 MiB chunk a minute instead of about 190, and the datagram is not stored twice.
+func TestByteCapBoundsAFloodOfEscapedDatagrams(t *testing.T) {
+	r, _, _ := newReceiver(t, Options{Allowed: []netip.Addr{netip.MustParseAddr("192.168.1.254")}})
+	datagram := bytes.Repeat([]byte{0x01}, DefaultMaxMessage)
+	from := ap("192.168.1.254:514")
+	for range DefaultMaxPerMinute {
+		r.accept(datagram, from)
+	}
+	msgs, dropped, _ := r.Drain()
+	total := 0
+	for i := range msgs {
+		if msgs[i].Raw != string(datagram) || msgs[i].Msg != "" {
+			t.Fatalf("message %d: Raw of %d bytes, Msg of %d", i, len(msgs[i].Raw), len(msgs[i].Msg))
+		}
+		total += storedSize(&msgs[i])
+	}
+	line := storedSize(&msgs[0])
+	if line > 6*DefaultMaxMessage+200 || total > DefaultMaxBytesPerMinute || len(msgs) != DefaultMaxBytesPerMinute/line ||
+		dropped != DefaultMaxPerMinute-len(msgs) {
+		t.Errorf("kept %d (%d bytes stored, %d a message), dropped %d", len(msgs), total, line, dropped)
 	}
 }
 

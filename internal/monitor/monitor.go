@@ -1,19 +1,22 @@
 // Package monitor is the brain of att-monitor: it schedules the probes, gateway polls,
 // service checks and housekeeping of docs/DESIGN.md §8, classifies every fast cycle
 // (§9, Classify), runs the incident state machine (§10), derives gateway events (§7),
-// anchors the ledger head (§11) and serves the live status, chart series and incident
-// views to the dashboard (contracts.StatusSource) as well as operator actions
-// (contracts.Actions).
+// anchors the ledger head (§11), keeps the gateway's syslog (docs/syslog-snmp-traffic.md) and
+// serves the live status, chart series and incident views to the dashboard
+// (contracts.StatusSource) as well as operator actions (contracts.Actions), the syslog
+// retention control (contracts.SyslogControl) and the flow meter (contracts.LiveTrafficSource).
 //
 // Everything the monitor learns is appended to the evidence ledger; its in-memory state is
 // a cache that is rebuilt from the ledger at startup (state/monitor-state.json only speeds
-// that up and is never evidence).
+// that up and is never evidence). The flow meter is the exception: a display only, never
+// recorded.
 //
 // Concurrency: one goroutine per activity (fast cycle, gateway poll, service checks, local
 // link, clock, heartbeat, anchoring, notification check, traceroutes, incident close,
-// segment compression). Locks, always acquired in this order:
+// segment compression, syslog receiver and syslog flush). Locks, always acquired in this order:
 //
 //	notifMu   makes "read the redirect setting, then enforce it" atomic w.r.t. operator changes
+//	syslogMu  serializes the syslog store's operations with their records (syslog.go)
 //	gwMu      serializes requests to the gateway (one web session at a time)
 //	anchorMu  serializes anchoring
 //	stMu      serializes appends: "append a record + apply it to memory" is atomic w.r.t.
@@ -21,8 +24,11 @@
 //	          gateway restarts are attached to incidents under it (so no incident record can
 //	          miss a restart learned at the same moment), and what a new daily segment must
 //	          contain (config_state, incident_update) follows its first record under it
-//	cfgMu     guards *config.Config after New (pin, enforce_notification_off) and SaveConfig
+//	cfgMu     guards *config.Config after New (pin, enforce_notification_off, syslog
+//	          retention) and SaveConfig
 //	mu        guards the in-memory state (never held during I/O)
+//
+// liveMu guards the flow meter (live.go) and is never held while another lock is taken.
 package monitor
 
 import (
@@ -75,9 +81,11 @@ type Options struct {
 
 // Compile-time interface conformance.
 var (
-	_ contracts.StatusSource = (*Monitor)(nil)
-	_ contracts.Actions      = (*Monitor)(nil)
-	_ contracts.Verifier     = (*Monitor)(nil)
+	_ contracts.StatusSource      = (*Monitor)(nil)
+	_ contracts.Actions           = (*Monitor)(nil)
+	_ contracts.Verifier          = (*Monitor)(nil)
+	_ contracts.SyslogControl     = (*Monitor)(nil)
+	_ contracts.LiveTrafficSource = (*Monitor)(nil)
 )
 
 // settings are the configuration values the monitor works with, resolved once in New
@@ -101,6 +109,13 @@ type settings struct {
 	anchorInterval                          time.Duration
 	clockServers                            []string
 	clockInterval, heartbeat, notifInterval time.Duration
+	// The syslog receiver (config.SyslogConfig): how often what it received is moved into the
+	// syslog store, the address it binds, the port the gateway should send to and the senders
+	// accepted besides the gateway.
+	syslogFlush  time.Duration
+	syslogListen string
+	syslogPort   int
+	syslogAllow  []string
 }
 
 func resolveSettings(c *config.Config) settings {
@@ -133,9 +148,19 @@ func resolveSettings(c *config.Config) settings {
 		clockInterval:   durOr(c.Clock.Interval, d.Clock.Interval.Duration),
 		heartbeat:       durOr(c.HeartbeatInterval, d.HeartbeatInterval.Duration),
 		notifInterval:   durOr(c.Gateway.NotificationCheckInterval, d.Gateway.NotificationCheckInterval.Duration),
+		syslogFlush:     durOr(c.Syslog.FlushInterval, d.Syslog.FlushInterval.Duration),
+		syslogListen:    c.Syslog.Listen,
+		syslogPort:      c.Syslog.Port,
+		syslogAllow:     slices.Clone(c.Syslog.Allow),
 	}
 	if s.gwHost == "" {
 		s.gwHost = d.Gateway.Host
+	}
+	if s.syslogListen == "" {
+		s.syslogListen = d.Syslog.Listen
+	}
+	if s.syslogPort <= 0 {
+		s.syslogPort = d.Syslog.Port
 	}
 	if s.gwScheme != "http" {
 		s.gwScheme = "https"
@@ -248,6 +273,24 @@ type state struct {
 	lastVerify     *model.VerifySummary
 	lastTrace      time.Time
 
+	// Syslog (syslog.go): what the receiver handed over since this run started and the newest
+	// message; since when the syslog store fails (zero while it works), how often, the latest
+	// error; why the receiver stopped listening and since when ("" while it was not seen down).
+	syslogCounts   syslogCounts
+	syslogLastAt   string
+	syslogLast     string
+	storeFailSince time.Time
+	storeFails     int
+	storeFailErr   string
+	rxDown         string
+	rxDownSince    time.Time
+	// The gateway's Syslog setting as last read and recorded (nil: none known), why the latest
+	// check of it failed ("" when it did not), and this computer's latest address toward the
+	// gateway (LocalLink.LocalIP of the newest reading that had one).
+	syslogGw  *syslogGwRead
+	syslogErr string
+	localIP   string
+
 	// Custody facts rebuilt from the ledger.
 	lastStartRun, lastStopRun string
 	lastSampleTS              string
@@ -260,8 +303,9 @@ type traceReq struct {
 	trigger, incident string
 }
 
-// Monitor implements contracts.StatusSource, contracts.Actions and contracts.Verifier.
-// All exported methods are safe for concurrent use.
+// Monitor implements contracts.StatusSource, contracts.Actions, contracts.Verifier,
+// contracts.SyslogControl and contracts.LiveTrafficSource. All exported methods are safe for
+// concurrent use.
 type Monitor struct {
 	opts     Options
 	cfg      *config.Config
@@ -288,6 +332,13 @@ type Monitor struct {
 	// the store unusable until it is reopened; the service manager restarts the service). A ledger
 	// that says so (contracts.ErrLedgerBroken) ends Run at once instead: see ledgerBroken.
 	ledgerFailExit time.Duration
+	// The syslog receiver is started again this long after it could not listen, doubling up to
+	// syslogRetryMax while that goes on.
+	syslogRetryMin, syslogRetryMax time.Duration
+	// liveEvery is the shortest time from the end of a read of the flow meter (LiveTraffic) to the
+	// next, liveTimeout the longest such a read may hold the gateway lock, liveKeep how long its
+	// readings are kept for the meter's history.
+	liveEvery, liveTimeout, liveKeep time.Duration
 
 	// ledgerBroken is closed, once, when an append fails with contracts.ErrLedgerBroken: the ledger
 	// refuses every further record until it is reopened, so Run ends at once with brokenErr
@@ -303,6 +354,28 @@ type Monitor struct {
 	// Operational log gates (the Windows event log receives Warn and above: repeated failures
 	// are reported when they start, periodically while they last, and when they end).
 	snapFailLog, appendFailLog, anchorFailLog, tsaWarnLog, notifFailLog, blobFailLog, cacheFailLog logGate
+	syslogStoreLog, syslogRxLog, syslogReadLog                                                     logGate
+
+	// syslogOn: the syslog pipeline runs (a receiver, a store and syslog.enabled; syslog.go).
+	// syslog is Options.SyslogStore with its bookkeeping (syslogBook; nil without a store).
+	// Guarded by syslogMu: when the store was last pruned (monotonic); chunks whose record was
+	// written but could not be noted in the store yet (name → seq); whether startSyslog has sorted
+	// the store's unrecorded chunks, and those the store had not noted as recorded at the start,
+	// whose records the ledger is searched for before they are recorded (syslogReconcile); the
+	// store's Recover, or a deletion whose record the ledger refused, to be tried again.
+	syslogOn         bool
+	syslog           syslogBook
+	syslogPrunedAt   time.Time
+	syslogMarkLater  map[string]uint64
+	syslogChecked    bool
+	syslogUnverified map[string]bool
+	syslogRecoverDue bool
+	syslogPruneDue   bool
+
+	// runCtx is the context of Run's workers once Run has started (the flow meter's gateway
+	// reads end with it); live is the flow meter's state (guarded by liveMu).
+	runCtx atomic.Pointer[context.Context]
+	live   liveState
 
 	running       atomic.Bool
 	shutdownSeen  atomic.Bool
@@ -311,11 +384,13 @@ type Monitor struct {
 	records       atomic.Uint64
 
 	notifMu  sync.Mutex // serializes notification check/enforce and operator changes
+	syslogMu sync.Mutex
 	gwMu     sync.Mutex
 	anchorMu sync.Mutex
 	stMu     sync.Mutex
 	cfgMu    sync.Mutex
 	cacheMu  sync.Mutex // serializes state-cache file writes
+	liveMu   sync.Mutex
 
 	cacheGen     uint64 // state-cache snapshots taken (guarded by stMu)
 	cacheWritten uint64 // generation of the cache file on disk (guarded by cacheMu)
@@ -329,8 +404,10 @@ type Monitor struct {
 	segHeadKnown   bool
 	configStateDue bool
 
-	kGateway, kService, kLink, kClock, kClose *kicker
-	traceReqs                                 chan traceReq
+	// kNotif asks the notification loop for an early settings check (this computer's address
+	// toward the gateway changed).
+	kGateway, kService, kLink, kClock, kClose, kNotif *kicker
+	traceReqs                                         chan traceReq
 
 	mu sync.Mutex
 	st state
@@ -338,8 +415,8 @@ type Monitor struct {
 
 // New validates the options, applies defaults and installs the gateway certificate observer.
 // The monitor owns *Options.Config from now on: it changes Gateway.PinnedCertSHA256,
-// Gateway.PendingCertSHA256 and Gateway.EnforceNotificationOff under its own lock and persists
-// them with SaveConfig.
+// Gateway.PendingCertSHA256, Gateway.EnforceNotificationOff and Syslog.KeepMB/KeepDays under
+// its own lock and persists them with SaveConfig.
 func New(opts Options) (*Monitor, error) {
 	switch {
 	case opts.Config == nil:
@@ -387,6 +464,11 @@ func New(opts Options) (*Monitor, error) {
 		dnsRetryPause:    500 * time.Millisecond,
 		clockRecheckMin:  time.Minute,
 		ledgerFailExit:   5 * time.Minute,
+		syslogRetryMin:   time.Minute,
+		syslogRetryMax:   10 * time.Minute,
+		liveEvery:        liveMinInterval,
+		liveTimeout:      liveReadTimeout,
+		liveKeep:         liveHistory,
 		ledgerBroken:     make(chan struct{}),
 		route:            systemRoute,
 		diskFree:         systemDiskFree,
@@ -395,11 +477,16 @@ func New(opts Options) (*Monitor, error) {
 		kLink:            newKicker(),
 		kClock:           newKicker(),
 		kClose:           newKicker(),
+		kNotif:           newKicker(),
 		traceReqs:        make(chan traceReq, 16),
 	}
 	if opts.Anchorer != nil && opts.Config.Anchoring.Enabled {
 		m.anchorer = opts.Anchorer
 	}
+	// Without a store the received messages could not be kept: the receiver is not run then.
+	m.syslogOn = opts.Syslog != nil && opts.SyslogStore != nil && opts.Config.Syslog.Enabled
+	m.syslog = bookOf(opts.SyslogStore, m.log)
+	m.syslogMarkLater, m.syslogUnverified = map[string]uint64{}, map[string]bool{}
 	m.st.incidents = map[string]model.Incident{}
 	m.st.points = newPointStore()
 	m.st.alarms = map[string]alarmMark{}
@@ -455,15 +542,19 @@ func (m *Monitor) Run(ctx context.Context) error {
 	m.closeStaleIncidents()
 	m.watchUndecidedIncidents()
 	m.checkDisk()
+	if m.syslogOn {
+		m.safely("syslog", m.startSyslog) // the chunk the previous run left open, sealed and recorded
+	}
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	m.runCtx.Store(&wctx)
 	fatal := make(chan error, 1)
-	var wg sync.WaitGroup
-	for _, w := range []struct {
+	type worker struct {
 		name string
 		f    func(context.Context)
-	}{
+	}
+	workers := []worker{
 		{"cycle", m.cycleLoop},
 		{"gateway", m.gatewayLoop},
 		{"service", m.serviceLoop},
@@ -476,7 +567,12 @@ func (m *Monitor) Run(ctx context.Context) error {
 		{"closer", m.closerLoop},
 		{"compress", m.compressLoop},
 		{"ledgerwatch", func(ctx context.Context) { m.ledgerWatch(ctx, fatal) }},
-	} {
+	}
+	if m.syslogOn {
+		workers = append(workers, worker{"syslog-receiver", m.syslogReceiverLoop}, worker{"syslog", m.syslogLoop})
+	}
+	var wg sync.WaitGroup
+	for _, w := range workers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -504,6 +600,11 @@ func (m *Monitor) Run(ctx context.Context) error {
 	// Incidents whose recovery was confirmed but whose close record was not written yet are
 	// finalized now (no network I/O), so the next start does not report them as unknown.
 	m.finishClosings(wctx)
+	if m.syslogOn {
+		// The receiver has stopped: what it still holds goes into the store, and the open chunk is
+		// sealed and recorded before monitor_stop.
+		m.safely("syslog", func() { m.flushSyslog(true) })
+	}
 
 	m.mu.Lock()
 	uptime := int64(m.now().Sub(m.st.started) / time.Second)

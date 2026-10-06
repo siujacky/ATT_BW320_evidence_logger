@@ -30,9 +30,10 @@ const (
 // dataDirEntries are the top-level names of an att-monitor data directory (docs/DESIGN.md §5,
 // config.PathsFor; a test keeps the two in sync), compared case-insensitively. "config.json.*"
 // (the temp file of an interrupted config save) and the files Explorer may drop into any
-// folder are accepted too.
+// folder are accepted too. A layout folder missing here makes the installer refuse the data
+// directory it has just laid out (SecurePrivateDir checks the keys folder's parent).
 var dataDirEntries = []string{
-	"config.json", "keys", "ledger", "blobs", "exports", "quarantine", "state", "logs",
+	"config.json", "keys", "ledger", "blobs", "exports", "quarantine", "state", "logs", "syslog",
 	"desktop.ini", "thumbs.db",
 }
 

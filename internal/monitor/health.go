@@ -64,6 +64,11 @@ const (
 	notifFailReport  = 6 * time.Hour
 	blobFailReport   = 10 * time.Minute
 	cacheFailReport  = 6 * time.Hour
+	// The syslog store (every flush interval), the syslog receiver (restarted with a back-off)
+	// and the reads of the gateway's Syslog page (daily).
+	syslogStoreReport = time.Hour
+	syslogRxReport    = 6 * time.Hour
+	syslogReadReport  = 6 * time.Hour
 )
 
 // ---------------------------------------------------------------------------- ledger write health

@@ -1145,9 +1145,10 @@ var eventLabels = map[string]string{
 	model.GwEvUnreachable:       "Gateway web interface reachability",
 }
 
-// housekeeping events are not listed (they concern this monitor, not the service).
+// housekeeping events are not listed (they concern this monitor, not the service): the gateway
+// certificate pinned, and the reads of the gateway's own settings (outage redirect, syslog).
 func housekeeping(kind string) bool {
-	return kind == model.GwEvCertPinned || kind == model.GwEvNotificationSetting
+	return kind == model.GwEvCertPinned || kind == model.GwEvNotificationSetting || kind == model.GwEvSyslogSetting
 }
 
 func (c *collector) eventRows() ([]EventRow, int) {

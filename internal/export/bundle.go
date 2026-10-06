@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"attmonitor/internal/contracts"
 	"attmonitor/internal/model"
@@ -111,13 +112,16 @@ func OpenBundle(path string) (*Bundle, error) {
 	return b, nil
 }
 
-// checkEntryName rejects absolute, parent-relative, drive-qualified or otherwise unsafe paths.
+// checkEntryName rejects absolute, parent-relative, drive-qualified or otherwise unsafe paths,
+// and names with control, format, private-use or surrogate characters (unicode.C, which
+// tools/verify_bundle.py refuses too): no name att-monitor writes has one, and they could
+// disguise a name or the output that shows it.
 func checkEntryName(name string) error {
 	if name == "" || strings.ContainsAny(name, "\\:") || strings.HasPrefix(name, "/") {
 		return fmt.Errorf("unsafe entry name %q", name)
 	}
 	for _, r := range name {
-		if r < 0x20 || r == 0x7f {
+		if unicode.Is(unicode.C, r) {
 			return fmt.Errorf("unsafe entry name %q", name)
 		}
 	}

@@ -2,8 +2,10 @@
 // complete ledger segments that cover a period, every blob those records reference, the
 // ledger public key, a self-contained human report (REPORT.html), a machine-readable summary
 // (report.json), an independent Python verifier, the extra files the caller supplies (such as
-// keys/tsa-roots.pem) and a SHA-256 manifest. It also reads bundles back (OpenBundle, a
-// contracts.LedgerReader over the zip) and checks their manifests.
+// keys/tsa-roots.pem), the syslog chunks of the period that the syslog store still keeps
+// (syslog/<name>, each checked against its syslog_chunk record: VerifySyslogChunks) and a
+// SHA-256 manifest. It also reads bundles back (OpenBundle, a contracts.LedgerReader over the
+// zip) and checks their manifests.
 //
 // Every number and statement in a report is computed from the ledger records written into
 // the same bundle; nothing is taken from live monitor state. The few inputs that cannot come
@@ -72,6 +74,11 @@ type Options struct {
 	// ChainNote is shown when false); without one, the anchor record's issue-time flags
 	// (verified && chain_ok) decide and the report says so.
 	TokenVerifier contracts.TokenVerifier
+	// Syslog (optional) is the syslog store. A bundle then includes, as syslog/<name>, the exact
+	// stored bytes of every chunk named by one of its syslog_chunk records whose messages overlap
+	// the period, as far as the store still keeps it; the report files do not describe them. nil:
+	// no chunks.
+	Syslog contracts.SyslogReader
 	// ExtraFiles are additional bundle files by relative path ("keys/tsa-roots.pem"), written
 	// verbatim and listed in MANIFEST.sha256. A path must use forward slashes, contain no "..",
 	// no drive or absolute syntax, and must not collide with a generated file (also not when
@@ -365,8 +372,8 @@ func (e *Exporter) Build(ctx context.Context, req contracts.ExportRequest) (cont
 		Blobs:          res.blobs,
 	}
 	e.log.Info("evidence bundle written", "file", res.name, "sha256", sum, "records", res.records,
-		"blobs", res.blobs, "from", from.UTC().Format(time.RFC3339), "to", to.UTC().Format(time.RFC3339),
-		"bundle_checks_ok", res.checksOK)
+		"blobs", res.blobs, "syslog_chunks", res.syslogChunks, "from", from.UTC().Format(time.RFC3339),
+		"to", to.UTC().Format(time.RFC3339), "bundle_checks_ok", res.checksOK)
 
 	if e.opts.Actions == nil {
 		return info, nil
@@ -456,12 +463,14 @@ type buildResult struct {
 	manifestSHA256 string
 	records        int
 	blobs          int
+	syslogChunks   int
 	checksOK       bool
 }
 
 // writeBundle streams the zip to out. Ledger segments are copied line by line while they are
 // analysed (so the analysed bytes are exactly the bytes in the bundle, even for the active
-// segment that keeps growing), then blobs, then the generated documents and the manifest.
+// segment that keeps growing), then blobs, then the syslog chunks the copied records name, then
+// the generated documents and the manifest.
 func (e *Exporter) writeBundle(ctx context.Context, out io.Writer, p *buildParams) (*buildResult, error) {
 	zw := zip.NewWriter(out)
 	bw := &bundleWriter{zw: zw, modified: p.now.Truncate(time.Second), sums: map[string]string{}}
@@ -472,6 +481,10 @@ func (e *Exporter) writeBundle(ctx context.Context, out io.Writer, p *buildParam
 		}
 	}
 	if err := copyBlobs(ctx, e.opts.Reader, bw, col, nil); err != nil {
+		return nil, err
+	}
+	chunks, err := e.copySyslogChunks(ctx, bw, col)
+	if err != nil {
 		return nil, err
 	}
 	if err := p.awaitFull(ctx); err != nil {
@@ -515,6 +528,7 @@ func (e *Exporter) writeBundle(ctx context.Context, out io.Writer, p *buildParam
 		manifestSHA256: sha256Hex(manifest),
 		records:        rep.Ledger.Records,
 		blobs:          rep.Verification.Bundle.BlobsIncluded,
+		syslogChunks:   chunks,
 		checksOK:       rep.Verification.Bundle.OK,
 	}, nil
 }

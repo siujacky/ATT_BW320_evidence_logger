@@ -203,6 +203,13 @@ func TestSecurityHeadersOnEveryResponse(t *testing.T) {
 		{"head status", func() *http.Request { return hs.request("HEAD", "/api/status", nil, nil) }, 200, false},
 		{"syslog", func() *http.Request { return hs.request("GET", "/api/syslog", nil, nil) }, 200, false},
 		{"syslog bad request", func() *http.Request { return hs.request("GET", "/api/syslog?severity=9", nil, nil) }, 400, false},
+		{"syslog retention", func() *http.Request {
+			return hs.request("POST", "/api/syslog/retention", strings.NewReader(`{"keep_mb":100}`), nil)
+		}, 200, false},
+		{"syslog retention bad request", func() *http.Request {
+			return hs.request("POST", "/api/syslog/retention", strings.NewReader(`{"keep_mb":0}`), nil)
+		}, 400, false},
+		{"live traffic", func() *http.Request { return hs.request("GET", "/api/traffic/live", nil, nil) }, 200, false},
 		{"not found", func() *http.Request { return hs.request("GET", "/nope", nil, nil) }, 404, false},
 		{"method not allowed", func() *http.Request { return hs.request("GET", "/api/verify", nil, nil) }, 405, false},
 		{"options", func() *http.Request { return hs.request("OPTIONS", "/api/notes", nil, nil) }, 405, false},
@@ -258,8 +265,11 @@ func TestNotFoundAndMethodNotAllowedAreJSON(t *testing.T) {
 		{"GET", "/api/notes", 405, "POST"},
 		{"GET", "/api/gateway/notification", 405, "POST"},
 		{"GET", "/api/gateway/trust-cert", 405, "POST"},
+		{"GET", "/api/syslog/retention", 405, "POST"},
 		{"POST", "/api/status", 405, "GET, HEAD"},
 		{"POST", "/api/syslog", 405, "GET, HEAD"},
+		{"POST", "/api/traffic/live", 405, "GET, HEAD"},
+		{"GET", "/api/traffic", 404, ""},
 		{"PUT", "/api/exports", 405, "GET, HEAD, POST"},
 		{"DELETE", "/api/blobs/" + strings.Repeat("a", 64), 405, "GET, HEAD"},
 		{"POST", "/", 405, "GET, HEAD"},

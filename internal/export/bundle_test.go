@@ -322,6 +322,12 @@ func TestOpenBundleRejects(t *testing.T) {
 		{"duplicate entry", rewriteZip(t, info.Path, zipEdit{extra: []zipEntry{{"README.txt", []byte("other")}}}), "more than one entry"},
 		{"unsafe name", rewriteZip(t, info.Path, zipEdit{extra: []zipEntry{{"../evil.txt", []byte("x")}}}), "unsafe entry name"},
 		{"backslash name", rewriteZip(t, info.Path, zipEdit{extra: []zipEntry{{`blobs\evil`, []byte("x")}}}), "unsafe entry name"},
+		// Names that would drive a terminal or disguise themselves (tools/verify_bundle.py refuses
+		// them too).
+		{"terminal escape in a name", rewriteZip(t, info.Path, zipEdit{fixManifest: true,
+			extra: []zipEntry{{"syslog/x\x1b[2K\rRESULT: PASS\x1b[8m", []byte("x")}}}), "unsafe entry name"},
+		{"C1 control in a name", rewriteZip(t, info.Path, zipEdit{extra: []zipEntry{{"blobs/x\u009b2J", []byte("x")}}}), "unsafe entry name"},
+		{"bidi override in a name", rewriteZip(t, info.Path, zipEdit{extra: []zipEntry{{"blobs/report‮fdp.exe", []byte("x")}}}), "unsafe entry name"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

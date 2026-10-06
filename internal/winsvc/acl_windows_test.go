@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -66,24 +67,28 @@ func readDACL(t *testing.T, path string) (windows.SECURITY_DESCRIPTOR_CONTROL, s
 // it keeps WRITE_DAC. Must be called after t.TempDir so it runs first.
 func restoreAccessOnCleanup(t *testing.T, dir string) {
 	t.Helper()
-	t.Cleanup(func() {
-		user, err := windows.GetCurrentProcessToken().GetTokenUser()
-		if err != nil {
-			t.Logf("restore ACL: %v", err)
-			return
-		}
-		sd, err := windows.SecurityDescriptorFromString("D:(A;OICI;FA;;;" + user.User.Sid.String() + ")")
-		if err != nil {
-			t.Logf("restore ACL: %v", err)
-			return
-		}
-		dacl, _, _ := sd.DACL()
-		err = windows.SetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT,
-			windows.DACL_SECURITY_INFORMATION|windows.UNPROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil)
-		if err != nil && !os.IsNotExist(err) {
-			t.Logf("restore ACL on %s: %v", dir, err)
-		}
-	})
+	t.Cleanup(func() { restoreAccess(t, dir) })
+}
+
+// restoreAccess gives the current user full control of dir again (it still owns it).
+func restoreAccess(t *testing.T, dir string) {
+	t.Helper()
+	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		t.Logf("restore ACL: %v", err)
+		return
+	}
+	sd, err := windows.SecurityDescriptorFromString("D:(A;OICI;FA;;;" + user.User.Sid.String() + ")")
+	if err != nil {
+		t.Logf("restore ACL: %v", err)
+		return
+	}
+	dacl, _, _ := sd.DACL()
+	err = windows.SetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.UNPROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil)
+	if err != nil && !os.IsNotExist(err) {
+		t.Logf("restore ACL on %s: %v", dir, err)
+	}
 }
 
 func TestSecureDataDir(t *testing.T) {
@@ -339,16 +344,62 @@ func TestSecureDataDirAcceptsLayoutEntries(t *testing.T) {
 }
 
 // dataDirEntries must list every top-level name of the config layout, or SecureDataDir would
-// refuse the product's own data directory.
+// refuse the product's own data directory. Every path field of config.Paths is checked, so a
+// folder added to the layout later cannot be missed here (the syslog folder once was).
 func TestDataDirEntriesMatchConfigLayout(t *testing.T) {
 	p := config.PathsFor(`C:\ProgramData\ATTMonitor`)
-	for _, path := range []string{p.Config, p.Keys, p.Ledger, p.Blobs, p.Exports, p.Quarantine, p.State, p.Logs} {
+	v := reflect.ValueOf(p)
+	checked := 0
+	for i := 0; i < v.NumField(); i++ {
+		field := v.Type().Field(i)
+		if field.Name == "Root" || field.Type.Kind() != reflect.String {
+			continue
+		}
+		path := v.Field(i).String()
 		if filepath.Dir(path) != p.Root {
-			t.Errorf("%s is not directly inside the data directory; update the content check", path)
+			t.Errorf("Paths.%s = %s is not directly inside the data directory; update the content check", field.Name, path)
 		}
 		if name := filepath.Base(path); !isDataDirEntry(name) {
-			t.Errorf("layout entry %q is not in dataDirEntries", name)
+			t.Errorf("layout entry %q (Paths.%s) is not in dataDirEntries", name, field.Name)
 		}
+		checked++
+	}
+	if checked < 9 {
+		t.Fatalf("checked %d layout paths, want every path of config.Paths", checked)
+	}
+}
+
+// The installer's exact order on a new machine: SecureDataDir on the (still empty) data
+// directory, the layout created inside it (now with syslog\), then the keys folder made
+// private, which checks the data directory's entries again. A later service start repeats the
+// last step on the full layout.
+func TestInstallOrderSecuresANewDataDirectory(t *testing.T) {
+	data := filepath.Join(t.TempDir(), "ATTMonitor")
+	paths := config.PathsFor(data)
+	restoreAccessOnCleanup(t, data)
+	restoreAccessOnCleanup(t, paths.Keys)
+	if err := SecureDataDir(data); err != nil {
+		t.Fatalf("SecureDataDir: %v", err)
+	}
+	if !IsAdmin() {
+		// The elevated installer can still create the layout in the secured folder; a test
+		// run as a normal user takes that right back as the folder's owner.
+		restoreAccess(t, data)
+	}
+	if err := paths.MkdirAll(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(paths.Syslog); err != nil {
+		t.Fatalf("the layout has no syslog folder: %v", err)
+	}
+	if err := SecurePrivateDir(paths.Keys); err != nil {
+		t.Fatalf("SecurePrivateDir(keys) after the layout was created: %v", err)
+	}
+	if _, sddl, _ := readDACL(t, paths.Keys); sddl != privateDirSDDL {
+		t.Errorf("keys DACL = %s, want %s", sddl, privateDirSDDL)
+	}
+	if err := SecurePrivateDir(paths.Keys); err != nil { // the service at its next start
+		t.Fatalf("SecurePrivateDir(keys) again: %v", err)
 	}
 }
 

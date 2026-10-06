@@ -10,8 +10,12 @@
  *
  * Scenarios: "hostile" (every remote string carries the marker), "cert" (a changed gateway
  * certificate is waiting for confirmation; the harness looks at the Gateway page, then confirms
- * it through the dialog on the overview) and "overview" (the overview and the Syslog page only);
- * any other name visits every view.
+ * it through the dialog on the overview), "overview" (the overview and the Syslog page only) and
+ * "syslog" (the flow meter's polling while the overview is shown, hidden and left, then the
+ * Syslog page's retention form); any other name visits every view.
+ *
+ * Timers of a second or more (the flow meter's polling) do not run by themselves: the harness
+ * fires them (fireLongTimers), so that a test sees exactly which requests a poll makes.
  *
  * The fake DOM has no HTML parser: assigning innerHTML/outerHTML, insertAdjacentHTML and
  * document.write are recorded as violations. After every step the whole document is checked:
@@ -220,6 +224,7 @@ class FakeDocument extends FakeNode {
     super(9);
     this.title = '';
     this.hidden = false;
+    this.visibilityState = 'visible';
     this.readyState = 'complete';
     this.documentElement = new FakeElement('html');
     this.appendChild(this.documentElement);
@@ -365,8 +370,17 @@ document.body.append(
 const windowEvents = new FakeNode(0);
 const location = { hash: '' };
 const intervals = [];
+const longTimers = new Map(); // id -> function, for timers of a second or more
+let longTimerID = 0;
 const storage = new Map();
 let inflight = 0;
+
+/** fireLongTimers runs the pending timers of a second or more (each once). */
+function fireLongTimers() {
+  const due = [...longTimers.values()];
+  longTimers.clear();
+  for (const fn of due) guard('timer', fn);
+}
 
 async function pageFetch(path, init) {
   inflight++;
@@ -398,8 +412,17 @@ const context = {
     setItem: (k, v) => { storage.set(k, String(v)); },
     removeItem: (k) => { storage.delete(k); },
   },
-  setTimeout: (fn, ms) => setTimeout(() => guard('timer', fn), ms),
-  clearTimeout: (id) => clearTimeout(id),
+  setTimeout: (fn, ms) => {
+    if (ms >= 1000) {
+      longTimers.set(++longTimerID, fn);
+      return 'long-' + longTimerID;
+    }
+    return setTimeout(() => guard('timer', fn), ms);
+  },
+  clearTimeout: (id) => {
+    if (typeof id === 'string' && id.startsWith('long-')) longTimers.delete(Number(id.slice(5)));
+    else clearTimeout(id);
+  },
   setInterval: (fn) => intervals.push(fn), // never fires by itself: the harness drives the page
   clearInterval: (id) => { if (id > 0) intervals[id - 1] = null; },
   scrollTo() {},
@@ -451,6 +474,12 @@ function checkDocument(where) {
 
 function view() { return document.getElementById('view'); }
 
+/** shownEl reports whether neither e nor an element around it is hidden. */
+function shownEl(e) {
+  for (let x = e; x; x = x.parentElement) if (x.hasAttribute('hidden')) return false;
+  return true;
+}
+
 /** chipOf describes a status chip as "<tone>:<label>" (e.g. "critical:NXDOMAIN"). */
 function chipOf(c) {
   const m = /(?:^|\s)tone-([\w-]+)/.exec(c.className);
@@ -470,17 +499,29 @@ function capture(name) {
     title: document.title,
     hero: hero ? hero.textContent : '',
     markers,
-    buttons: view().querySelectorAll('button').map((b) => ({ text: b.textContent.trim(), disabled: b.disabled })),
+    buttons: view().querySelectorAll('button').map((b) => ({ text: b.textContent.trim(), disabled: b.disabled, shown: shownEl(b) })),
     // Every table row with the status chips it shows, so that a test can tell a red chip
     // from a green one (the text alone cannot).
     rows: view().querySelectorAll('tr').map((tr) => ({ text: tr.textContent, chips: tr.querySelectorAll('.chip').map(chipOf) })),
     // Chart marks that carry meaning without text: peak marks, "at least" chevrons, reference
-    // lines.
+    // lines, filled areas, the flow meter's bars and its heavy-traffic marks; and the elements
+    // that set hidden characters of remote text apart (ctl).
     marks: {
       peak: view().querySelectorAll('line.pk').length,
       atleast: view().querySelectorAll('path.atleast').length,
       ref: view().querySelectorAll('line.thr-ref').length,
+      area: view().querySelectorAll('path.area').length,
+      flowbar: view().querySelectorAll('svg.flow-bar').length,
+      heavy: view().querySelectorAll('line.flow-heavy').length,
+      ctl: view().querySelectorAll('.ctl').length,
     },
+    // The section headings shown (hidden ones still have text, so the text alone cannot tell).
+    headings: view().querySelectorAll('h2').filter(shownEl).map((e) => e.textContent.trim()),
+    // How many requests the page had made when the view was captured, and the timers waiting.
+    requests: requests.length,
+    timers: longTimers.size,
+    // The live regions the view's text is in (none for the flow meter's numbers).
+    live: view().querySelectorAll('[aria-live]').map((e) => e.getAttribute('aria-live') + ':' + (e.className || e.localName)),
   };
 }
 
@@ -564,6 +605,65 @@ async function incidents() {
   return res.json();
 }
 
+function setVisibility(state) {
+  document.visibilityState = state;
+  document.hidden = state !== 'visible';
+  document.dispatchEvent(new FakeEvent('visibilitychange'));
+}
+
+/** syslogScenario (on the overview): the flow meter asks again when its timer fires, not while
+ *  the page is hidden, at once when it is shown again, and never after the Overview was left.
+ *  Then the Syslog page's retention form: keep 50 MiB and 30 days; then 3 days, which deletes
+ *  the older messages (confirmed in the dialog); the same limits again, which changes nothing;
+ *  then a value the page refuses itself. */
+async function syslogScenario() {
+  fireLongTimers();
+  await settle();
+  capture('overview poll');
+  setVisibility('hidden');
+  await settle();
+  fireLongTimers();
+  await settle();
+  capture('overview hidden');
+  setVisibility('visible');
+  await settle();
+  capture('overview visible');
+  await visit('#/syslog');
+  fireLongTimers();
+  await settle();
+  await openAllDetails();
+  capture('syslog');
+
+  const form = view().querySelector('form.retention');
+  if (!form) {
+    errors.push('the Syslog page has no retention form');
+    return;
+  }
+  const [mib, days] = form.querySelectorAll('input');
+  const type = (input, value) => {
+    input.value = value;
+    input.dispatchEvent(new FakeEvent('input'));
+  };
+  type(mib, '50');
+  type(days, '30');
+  await submit(form);
+  capture('syslog retention');
+  type(days, '3');
+  await submit(form);
+  await answerDialog(true);
+  await settle();
+  capture('syslog retention pruned');
+  type(mib, '50');
+  type(days, '3');
+  await submit(form);
+  if (document.querySelector('dialog')) await answerDialog(true); // recorded (dialogs), never expected
+  await settle();
+  capture('syslog retention unchanged');
+  type(mib, '0');
+  await submit(form);
+  capture('syslog retention refused');
+}
+
 async function run() {
   const res = await fetch(new URL('/static/app.js', base));
   const code = await res.text();
@@ -577,6 +677,10 @@ async function run() {
   if (scenario === 'overview') { // the status cards only (and the Syslog page's)
     await visit('#/syslog');
     capture('syslog');
+    return;
+  }
+  if (scenario === 'syslog') {
+    await syslogScenario();
     return;
   }
   // The charts over 7 days (the range is remembered: back to 24 hours afterwards).

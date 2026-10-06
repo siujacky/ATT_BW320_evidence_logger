@@ -38,7 +38,7 @@
     'sample', 'state_change', 'gateway_snapshot', 'gateway_event', 'service_check', 'local_link',
     'traceroute', 'clock_check', 'clock_jump', 'incident_open', 'incident_update', 'incident_close',
     'anchor', 'config_change', 'power_event', 'custody_export', 'operator_note', 'recovery',
-    'integrity_alert', 'config_state', 'syslog',
+    'integrity_alert', 'config_state', 'syslog_chunk', 'syslog_prune',
   ];
 
   /** dict makes a lookup table without a prototype, so that a value from the data such as
@@ -170,9 +170,25 @@
   const SYSLOG_FACILITIES = ['kern', 'user', 'mail', 'daemon', 'auth', 'syslog', 'lpr', 'news', 'uucp', 'cron', 'authpriv', 'ftp',
     'ntp', 'audit', 'alert', 'clock', 'local0', 'local1', 'local2', 'local3', 'local4', 'local5', 'local6', 'local7'];
   const SYSLOG_FORMATS = dict({ rfc5424: 'RFC 5424', rfc3164: 'RFC 3164 (BSD syslog)', unknown: 'not recognised: kept as received' });
+  // Why the syslog store sealed a chunk (model.SyslogChunk.reason).
+  const SEAL_REASONS = dict({ size: 'full', age: 'age limit', stop: 'service stopping', recovered: 'left open by a crash, sealed at the next start' });
   const SYSLOG_PAGE = 200; // messages asked for at first; "Load more" doubles it
   const SYSLOG_MAX = 5000; // the most GET /api/syslog returns
+  // A row of the syslog list shows at most this much of a message's text and of its host and app
+  // (characters as shown: an escape counts its length), each with at most SYSLOG_ROW_RUNS runs of
+  // hidden characters (an element each): a sender controls the text, and 5000 rows of whole
+  // datagrams would be millions of elements. "Exact datagram" under the row shows all of it.
+  const SYSLOG_ROW_TEXT = 500;
+  const SYSLOG_ROW_NAME = 100;
+  const SYSLOG_ROW_RUNS = 16;
   const SYSLOG_MAX_SPAN_MS = 31 * 86400e3; // the longest period GET /api/syslog reads
+  // How much syslog may be kept (internal/config MinSyslogKeepMB, MaxSyslogKeepMB, MaxSyslogKeepDays).
+  const SYSLOG_KEEP_MB_MIN = 1;
+  const SYSLOG_KEEP_MB_MAX = 1048576;
+  const SYSLOG_KEEP_DAYS_MAX = 3650;
+  const MIB = 1048576;
+  // The flow meter asks for a reading this often while the Overview is shown (GET /api/traffic/live).
+  const LIVE_REFRESH_MS = 5000;
 
   // ------------------------------------------------------------------ app state
 
@@ -315,6 +331,12 @@
     return h('time', { datetime: d.toISOString(), title: 'UTC: ' + utcText(v, d) }, (fmt || F.full).format(d));
   }
 
+  /** whenText writes a time as text, in local time with seconds ("?" when it is missing). */
+  function whenText(v) {
+    const d = toDate(v);
+    return d ? F.sec.format(d) : orQ(v);
+  }
+
   function fmtDur(sec) {
     if (sec == null || !isFinite(sec)) return '—';
     sec = Math.max(0, Math.round(sec));
@@ -372,7 +394,8 @@
     if (n == null || !isFinite(n)) return '—';
     if (n < 1024) return n + ' B';
     if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KiB';
-    return (n / 1024 / 1024).toFixed(1) + ' MiB';
+    if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MiB';
+    return (n / 1024 / 1024 / 1024).toFixed(1) + ' GiB';
   }
 
   function fmtMeasure(v, unit) {
@@ -417,21 +440,80 @@
   /** visibleText shows untrusted text (a syslog message) as received, with its hidden
    *  characters (hiddenChar) written as escapes (charEscape: an ESC as \x1b, a right-to-left
    *  override as a \u escape of 202e) and set apart (class ctl), so that they can be neither
-   *  mistaken for the text nor reorder, hide or break what is shown around it. keepNewlines
-   *  leaves line breaks as they are (pretty-printed JSON). Returns the parts for h(). */
+   *  mistaken for the text nor reorder, hide or break what is shown around it. A run of hidden
+   *  characters is one element, however long (titled ctlTitle): a datagram of 8 KiB of control
+   *  characters is one element, not 8,192. keepNewlines leaves line breaks as they are
+   *  (pretty-printed JSON). Returns the parts for h(). */
   function visibleText(text, keepNewlines) {
     const t = String(text == null ? '' : text);
+    const hidden = (i) => {
+      const c = t.charCodeAt(i);
+      return hiddenChar(c) && !(keepNewlines && c === 0x0a);
+    };
     const out = [];
     let start = 0;
     for (let i = 0; i < t.length; i++) {
-      const c = t.charCodeAt(i);
-      if (!hiddenChar(c) || (keepNewlines && c === 0x0a)) continue;
+      if (!hidden(i)) continue;
+      let end = i + 1;
+      while (end < t.length && hidden(end)) end++;
       if (i > start) out.push(t.slice(start, i));
-      out.push(h('span', { class: 'ctl', title: 'U+' + c.toString(16).toUpperCase().padStart(4, '0') }, charEscape(c)));
-      start = i + 1;
+      let esc = '';
+      for (let j = i; j < end; j++) esc += charEscape(t.charCodeAt(j));
+      out.push(h('span', { class: 'ctl', title: ctlTitle(t.slice(i, end)) }, esc));
+      start = end;
+      i = end - 1;
     }
     if (start < t.length) out.push(t.slice(start));
     return out;
+  }
+
+  /** ctlTitle names the characters of a run of hidden characters for its tooltip: their code
+   *  points ("U+001B", "U+0000 U+007F"), a repeated one once with its count ("U+0001 ×8192"),
+   *  at most eight of them. */
+  function ctlTitle(run) {
+    const parts = [];
+    for (let i = 0; i < run.length;) {
+      if (parts.length === 8) {
+        parts.push('…');
+        break;
+      }
+      const c = run.charCodeAt(i);
+      let n = 1;
+      while (i + n < run.length && run.charCodeAt(i + n) === c) n++;
+      parts.push('U+' + c.toString(16).toUpperCase().padStart(4, '0') + (n > 1 ? ' ×' + n : ''));
+      i += n;
+    }
+    return parts.join(' ');
+  }
+
+  /** clipText returns the start of untrusted text that a list shows - at most maxChars
+   *  characters as visibleText shows them (a hidden character counts the length of its escape,
+   *  a UTF-16 code unit the others; never half of a surrogate pair), holding at most maxRuns
+   *  runs of hidden characters, each an element of its own - and how many characters it leaves
+   *  out. */
+  function clipText(text, maxChars, maxRuns) {
+    const t = String(text == null ? '' : text);
+    let end = 0;
+    let shown = 0;
+    let runs = 0;
+    for (; end < t.length; end++) {
+      const c = t.charCodeAt(end);
+      const hidden = hiddenChar(c);
+      if (hidden && (end === 0 || !hiddenChar(t.charCodeAt(end - 1))) && ++runs > maxRuns) break;
+      shown += hidden ? charEscape(c).length : 1;
+      if (shown > maxChars) break;
+    }
+    if (end > 0 && end < t.length && (t.charCodeAt(end) & 0xfc00) === 0xdc00 && (t.charCodeAt(end - 1) & 0xfc00) === 0xd800) end--;
+    let more = 0;
+    for (let i = end; i < t.length; i++) if ((t.charCodeAt(i) & 0xfc00) !== 0xdc00) more++;
+    return { text: t.slice(0, end), more };
+  }
+
+  /** clippedText is visibleText of what clipText keeps of text, then how much it leaves out
+   *  (shown in full under "Exact datagram"). */
+  function clippedText(text, maxChars) {
+    const c = clipText(text, maxChars, SYSLOG_ROW_RUNS);
+    return [visibleText(c.text), c.more ? h('span', { class: 'muted small nowrap' }, ' … ' + fmtInt(c.more) + ' more character' + (c.more === 1 ? '' : 's')) : null];
   }
 
   /** escapedText is visibleText as one string, for text that cannot hold markup (a summary
@@ -592,6 +674,13 @@
   function lineKey(slot) {
     return s('svg', { class: 'key', viewBox: '0 0 18 10', 'aria-hidden': 'true', focusable: 'false' },
       s('line', { class: 'c' + slot, x1: 1.5, y1: 5, x2: 16.5, y2: 5 }));
+  }
+
+  /** areaKey keys a series drawn as a filled area: the wash with its edge on top. */
+  function areaKey(slot) {
+    return s('svg', { class: 'key', viewBox: '0 0 18 10', 'aria-hidden': 'true', focusable: 'false' },
+      s('rect', { class: 'area f' + slot, x: 1, y: 2, width: 16, height: 8 }),
+      s('line', { class: 'c' + slot, x1: 1, y1: 2, x2: 17, y2: 2 }));
   }
 
   /** tickKey keys a series drawn as tick marks (slot 0: in ink, for the legend's explanation). */
@@ -909,6 +998,7 @@
     const conditions = h('div', { class: 'conditions' });
     const tiles = h('section', { 'aria-label': 'Availability statistics' });
     const cards = h('div', { class: 'grid' });
+    const flow = flowMeter(ctx);
     const charts = h('section', { 'aria-labelledby': 'history-h' });
     const recent = h('section', { class: 'card', 'aria-labelledby': 'recent-h' });
     c.append(h('h1', { class: 'sr-only' }, 'Overview'), hero, conditions, tiles, cards, charts, recent);
@@ -917,7 +1007,7 @@
       fillHero(hero, st);
       fillAlerts(conditions, st, null);
       fillTiles(tiles, st);
-      fillCards(cards, st);
+      fillCards(cards, st, flow);
     };
     ctx.onStatus = update;
     if (app.status) update(app.status);
@@ -1207,6 +1297,12 @@
     return t.charAt(0).toUpperCase() + t.slice(1);
   }
 
+  /** sentence ends text with a full stop unless it ends with one already (or ? or !). */
+  function sentence(text) {
+    const t = String(text || '');
+    return /[.!?]$/.test(t) ? t : t + '.';
+  }
+
   /** certBanner explains a changed gateway TLS certificate (GATEWAY_CERT_CHANGED), shows the
    *  pinned and the presented fingerprints and lets the operator trust the new one. Everything
    *  comes from the monitor's certificate state (Status.gateway_cert); only a status without it
@@ -1304,8 +1400,10 @@
         tile('Monitoring coverage', (x) => x.coverage_pct, (p) => fmtPct(p, 1), 'Share of the window during which the monitor was measuring')));
   }
 
-  function fillCards(el, st) {
-    replace(el, cardInternet(st), cardGatewayWAN(st), cardFiber(st), cardLocalLink(st), syslogCard(st, true), cardEvidence(st), cardMonitor(st));
+  /** fillCards rebuilds the Overview's cards from st; flow (the flow meter) is put back as it is:
+   *  it keeps its own state and readings. */
+  function fillCards(el, st, flow) {
+    replace(el, cardInternet(st), cardGatewayWAN(st), flow, cardFiber(st), cardLocalLink(st), syslogCard(st, true), cardEvidence(st), cardMonitor(st));
   }
 
   /** probeLabel names a probe as configured (Status.probes, else the chart series' list). */
@@ -1728,10 +1826,10 @@
     return 'route check: ' + (via === routes.length ? 'all ' + via : via + ' of ' + routes.length) + ' destinations through the AT&T gateway';
   }
 
-  function meter(pct) {
+  function meter(pct, cls) {
     const fill = h('span');
     fill.style.width = Math.max(0, Math.min(100, Number(pct) || 0)) + '%'; // CSSOM: allowed by the CSP
-    return h('span', { class: 'meter', 'aria-hidden': 'true' }, fill);
+    return h('span', { class: 'meter' + (cls ? ' ' + cls : ''), 'aria-hidden': 'true' }, fill);
   }
 
   function cardEvidence(st) {
@@ -1766,7 +1864,7 @@
     let state = chip('good', 'in sync');
     if (m.last_error) state = chip('warning', 'problem', m.last_error);
     else if (!m.has_data || m.lag > 0) state = chip('warning', m.has_data ? fmtInt(m.lag) + ' records behind' : 'copying');
-    return [state, ` · ${fmtInt(m.records || 0)} records, ${fmtInt(m.blobs || 0)} blobs in “${m.database}”`, upTo];
+    return [state, ` · ${fmtInt(m.records || 0)} records, ${fmtInt(m.blobs || 0)} blobs${m.syslog ? `, ${fmtInt(m.syslog)} syslog messages` : ''} in “${m.database}”`, upTo];
   }
 
   function cardMonitor(st) {
@@ -1787,20 +1885,204 @@
     return card('Monitor & clock', kv(rows));
   }
 
+  // ------------------------------------------------------------------ flow meter
+
+  /** flowMeter builds the Overview's live traffic card (GET /api/traffic/live, docs/
+   *  syslog-snmp-traffic.md §3.3): the newest download and upload rates through the AT&T
+   *  gateway, from its own counters, as large numbers and bars; the recent readings as a
+   *  sparkline; this PC's rates; when the reading was taken. It asks for a reading every
+   *  LIVE_REFRESH_MS while the Overview is shown and the page is visible, and stops otherwise:
+   *  the gateway gets no extra request while nobody watches. The numbers change every few
+   *  seconds and are not announced (aria-live off). A monitor without a flow meter (404) gets
+   *  no card. Returns the card, which the status refresh puts back among the cards as it is. */
+  function flowMeter(ctx) {
+    const body = h('div', { class: 'flow', 'aria-live': 'off' }, h('p', { class: 'loading' }, 'Reading the gateway’s counters…'));
+    const el = h('section', { class: 'card', 'aria-labelledby': 'flow-h' },
+      h('div', { class: 'card-head' }, h('h2', { id: 'flow-h' }, 'Live traffic'),
+        h('span', { class: 'small muted' }, 'flow meter · every ' + fmtDur(LIVE_REFRESH_MS / 1000))),
+      body);
+    let timer = 0;
+    let busy = false;
+    let stopped = false;
+    let abort = null;
+    let last = null; // the newest reading received
+    let failure = null; // why the newest request failed (null: it did not)
+    const shown = () => document.visibilityState === 'visible';
+
+    async function poll() {
+      window.clearTimeout(timer);
+      timer = 0;
+      if (busy || stopped || !shown()) return;
+      busy = true;
+      abort = typeof AbortController === 'function' ? new AbortController() : null;
+      try {
+        const lt = await api('/api/traffic/live', { signal: abort ? abort.signal : null });
+        last = lt && typeof lt === 'object' && !Array.isArray(lt) ? lt : {};
+        failure = null;
+      } catch (e) {
+        failure = e;
+      } finally {
+        busy = false;
+        abort = null;
+      }
+      if (stopped) return;
+      if (failure && failure.status === 404) { // this monitor offers no flow meter
+        stopped = true;
+        el.hidden = true;
+        return;
+      }
+      replace(body, flowContent(last, failure));
+      if (shown()) timer = window.setTimeout(poll, LIVE_REFRESH_MS);
+    }
+
+    const onVisibility = () => {
+      if (shown()) {
+        poll();
+      } else {
+        window.clearTimeout(timer);
+        timer = 0;
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    ctx.cleanup(() => {
+      stopped = true;
+      window.clearTimeout(timer);
+      document.removeEventListener('visibilitychange', onVisibility);
+      if (abort) abort.abort();
+    });
+    poll();
+    return el;
+  }
+
+  /** flowContent shows a flow meter reading (model.LiveTraffic), and why the newest request or
+   *  read failed if one did: then the reading shown is the last one received, which says when it
+   *  was taken. */
+  function flowContent(lt, failure) {
+    const out = [];
+    if (failure) {
+      out.push(callout('warning', h('strong', null, lt ? 'No new reading. ' : 'No reading. '), sentence(capitalize(failure.message)),
+        lt && lt.at ? [' Shown: the reading of ', timeEl(lt.at, F.time), '.'] : null));
+    }
+    if (!lt) return out;
+    if (lt.error) {
+      // A read skipped because the monitor was taking its own evidence snapshot is not a failure.
+      const skipped = /^skipped\b/i.test(String(lt.error));
+      out.push(callout(skipped ? 'info' : 'warning',
+        h('strong', null, skipped ? 'Waiting for the next read: ' : 'The newest read of the gateway’s counters failed: '), sentence(lt.error),
+        lt.at ? [' Shown: the reading of ', timeEl(lt.at, F.time), '.'] : null));
+    }
+    const rate = (v) => (v == null || !isFinite(v) ? null : Number(v));
+    const down = rate(lt.wan_rx_mbps);
+    const up = rate(lt.wan_tx_mbps);
+    const hist = (Array.isArray(lt.history) ? lt.history : []).filter((p) => p && typeof p === 'object' && toMs(p.t) != null);
+    const heavy = app.series && Number(app.series.heavy_traffic_mbps) > 0 ? Number(app.series.heavy_traffic_mbps) : null;
+    // The bars' scale: the larger of the recent maximum and the heavy-traffic level, rounded up.
+    let recent = Math.max(down || 0, up || 0);
+    for (const p of hist) recent = Math.max(recent, rate(p.wan_rx_mbps) || 0, rate(p.wan_tx_mbps) || 0);
+    const scale = niceTicks(0, Math.max(recent, heavy || 0, 0.01), 1).hi;
+    if (down == null && up == null && !lt.error) {
+      out.push(h('p', { class: 'muted' }, 'Measuring: a rate needs two readings of the gateway’s counters, a few seconds apart.'));
+    }
+    out.push(flowRow('Download', areaKey(1), 1, down, !!lt.at_least, scale, heavy),
+      flowRow('Upload', lineKey(2), 2, up, !!lt.at_least, scale, heavy),
+      h('p', { class: 'flow-scale' }, 'Bars from 0 to ' + fmtLevel(scale), heavy != null ? ' · mark: heavy household traffic, ' + fmtLevel(heavy) : null));
+    if (lt.at_least && (down != null || up != null)) {
+      out.push(h('p', { class: 'small' }, chip('warning', 'at least'),
+        ' The gateway’s 32-bit byte counter may have wrapped between the two readings, so the rates were at least these.'));
+    }
+    out.push(flowSpark(hist));
+    const pcRx = rate(lt.pc_rx_mbps);
+    const pcTx = rate(lt.pc_tx_mbps);
+    if (pcRx != null || pcTx != null) {
+      out.push(h('p', { class: 'flow-pc' }, h('span', { class: 'muted' }, 'This PC (its network adapter): '),
+        'download ' + fmtRate(pcRx) + ' · upload ' + fmtRate(pcTx)));
+    }
+    const gap = Number(lt.interval_s) > 0 ? Number(lt.interval_s) : null;
+    out.push(h('p', { class: 'card-foot' }, lt.at ? ['Reading of ', timeEl(lt.at, F.time)] : 'No reading yet',
+      gap ? ', over the ' + gap.toFixed(1) + ' s between two readings' : '',
+      '. Updated every ' + fmtDur(LIVE_REFRESH_MS / 1000) + ' while this page is open; shown, not recorded (the gateway snapshots every minute are the evidence).'));
+    return out;
+  }
+
+  /** flowRow is one direction of the flow meter: its rate as a large number and as a bar against
+   *  scale (Mb/s), heavy marked on it. */
+  function flowRow(label, key, slot, v, atLeast, scale, heavy) {
+    const [num, unit] = rateParts(v);
+    const pct = (x) => Math.max(0, Math.min(100, (x / scale) * 100)).toFixed(2);
+    const bar = s('svg', { class: 'flow-bar', viewBox: '0 0 100 10', preserveAspectRatio: 'none', 'aria-hidden': 'true', focusable: 'false' },
+      s('rect', { class: 'track f' + slot, x: 0, y: 0, width: 100, height: 10 }),
+      v != null ? s('rect', { class: 'f' + slot, x: 0, y: 0, width: pct(v), height: 10 }) : null,
+      heavy != null && heavy <= scale
+        ? s('line', { class: 'flow-heavy', x1: pct(heavy), x2: pct(heavy), y1: 0, y2: 10, 'vector-effect': 'non-scaling-stroke' }) : null);
+    return h('div', { class: 'flow-row' },
+      h('p', { class: 'flow-label' }, key, ' ', label, h('span', { class: 'muted' }, ' through the gateway')),
+      h('p', { class: 'flow-value' }, v != null && atLeast ? h('span', { class: 'flow-pre' }, 'at least ') : null,
+        h('span', { class: 'flow-num' }, num), unit ? h('span', { class: 'flow-unit' }, ' ' + unit) : null),
+      bar);
+  }
+
+  /** flowSpark draws the flow meter's recent readings (LiveTraffic.history): download filled,
+   *  upload as a line, on the scale of the largest; gaps where a reading had no rate or readings
+   *  are missing. null with fewer than two readings. */
+  function flowSpark(hist) {
+    const rate = (v) => (v == null || !isFinite(v) ? null : Number(v));
+    const pts = hist.map((p) => ({ t: toMs(p.t), rx: rate(p.wan_rx_mbps), tx: rate(p.wan_tx_mbps) }));
+    if (pts.length < 2 || !(pts[pts.length - 1].t > pts[0].t)) return null;
+    const t0 = pts[0].t;
+    const t1 = pts[pts.length - 1].t;
+    const diffs = [];
+    for (let i = 1; i < pts.length; i++) diffs.push(pts[i].t - pts[i - 1].t);
+    const gapMs = 3 * (median(diffs) || LIVE_REFRESH_MS);
+    let top = 0;
+    for (const p of pts) top = Math.max(top, p.rx || 0, p.tx || 0);
+    const W = 300;
+    const H = 40;
+    const X = (t) => (((t - t0) / (t1 - t0)) * W).toFixed(1);
+    const Y = (v) => (H - 1 - (top > 0 ? v / top : 0) * (H - 4)).toFixed(1);
+    const runs = (k) => {
+      const out = [];
+      let cur = null;
+      let prev = null;
+      for (const p of pts) {
+        if (p[k] == null) { cur = null; continue; }
+        if (!cur || p.t - prev > gapMs) out.push(cur = []);
+        cur.push(p);
+        prev = p.t;
+      }
+      return out.filter((r) => r.length > 1);
+    };
+    const line = (r, k) => 'M' + r.map((p) => X(p.t) + ' ' + Y(p[k])).join('L');
+    const rx = runs('rx');
+    const tx = runs('tx');
+    const svg = s('svg', { class: 'flow-spark', viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: 'none', 'aria-hidden': 'true', focusable: 'false' },
+      s('line', { class: 'al', x1: 0, x2: W, y1: H - 0.5, y2: H - 0.5, 'vector-effect': 'non-scaling-stroke' }),
+      rx.length ? s('path', { class: 'area f1', d: rx.map((r) => 'M' + X(r[0].t) + ' ' + H + 'L' + line(r, 'rx').slice(1) + 'L' + X(r[r.length - 1].t) + ' ' + H + 'Z').join('') }) : null,
+      rx.length ? s('path', { class: 'ln c1', d: rx.map((r) => line(r, 'rx')).join(''), 'vector-effect': 'non-scaling-stroke' }) : null,
+      tx.length ? s('path', { class: 'ln c2', d: tx.map((r) => line(r, 'tx')).join(''), 'vector-effect': 'non-scaling-stroke' }) : null);
+    const most = (k) => pts.reduce((m, p) => (p[k] != null && p[k] > m ? p[k] : m), -Infinity);
+    const span = (t1 - t0 + (median(diffs) || 0)) / 1000; // each reading covers the time since the one before
+    return h('div', { class: 'flow-spark-wrap' }, svg,
+      h('p', { class: 'flow-scale' }, 'Last ' + fmtDur(span) + ': highest download ' + fmtRate(isFinite(most('rx')) ? most('rx') : null) +
+        ', upload ' + fmtRate(isFinite(most('tx')) ? most('tx') : null)));
+  }
+
   // ------------------------------------------------------------------ gateway syslog
 
   /** syslogCard shows the receiver of the gateway's syslog messages and the gateway's Syslog
    *  setting (Status.syslog, docs/syslog-snmp-traffic.md §3.2), or nothing when the monitor
    *  reports neither. link: on the Overview, linking the Syslog page (which has its own card
-   *  title). */
+   *  title and shows the syslog store in its own card); the Overview's card also says how much
+   *  the store holds. */
   function syslogCard(st, link) {
     const sl = st && st.syslog;
     if (!sl || typeof sl !== 'object' || Array.isArray(sl)) return null;
     const seq = Number(sl.gateway_seq) || 0;
+    const store = syslogStore(sl);
     const body = [
       kv([
         ['Receiver', syslogReceiver(sl)],
         ['Messages', [syslogCounts(sl), h('span', { class: 'sub small muted' }, 'since the service started')]],
+        ['Stored', link && store ? [syslogUsageText(store), store.oldest ? h('span', { class: 'sub small muted' }, 'oldest message ', timeEl(store.oldest, F.short)) : null] : null],
         ['Last message', sl.last_at || sl.last
           ? [timeEl(sl.last_at, F.sec), sl.last ? h('span', { class: 'sub syslog-text small' }, visibleText(sl.last)) : null]
           : 'none since the service started'],
@@ -1827,12 +2109,26 @@
     const n = (v) => fmtInt(Number(v) || 0);
     return [
       h('span', { title: 'Messages accepted from the gateway' }, n(sl.received) + ' received'), ' · ',
-      h('span', { title: 'Written to the evidence ledger' }, n(sl.recorded) + ' recorded'), ' · ',
+      h('span', { title: 'Kept in the syslog store; each chunk of messages is recorded in the evidence ledger with its SHA-256 when it is sealed' },
+        n(sl.recorded) + ' stored'), ' · ',
       Number(sl.dropped) > 0
-        ? chip('warning', n(sl.dropped) + ' dropped', 'Accepted but over the per-minute cap: counted, not recorded')
-        : h('span', { title: 'Accepted but over the per-minute cap: counted, not recorded' }, '0 dropped'), ' · ',
-      h('span', { title: 'Datagrams from senders other than the gateway: counted, not recorded' }, n(sl.rejected) + ' from other senders'),
+        ? chip('warning', n(sl.dropped) + ' dropped', 'Accepted but over the per-minute cap: counted, not stored')
+        : h('span', { title: 'Accepted but over the per-minute cap: counted, not stored' }, '0 dropped'), ' · ',
+      h('span', { title: 'Datagrams from senders other than the gateway: counted, not stored' }, n(sl.rejected) + ' from other senders'),
     ];
+  }
+
+  /** syslogStore returns the syslog store's volume and limits (Status.syslog.store), or null
+   *  when the monitor reports no store. */
+  function syslogStore(sl) {
+    const u = sl && sl.store;
+    return u && typeof u === 'object' && !Array.isArray(u) ? u : null;
+  }
+
+  /** syslogUsageText words how much the syslog store holds against its size limit. */
+  function syslogUsageText(u) {
+    const used = fmtBytes(Number(u.bytes) || 0);
+    return Number(u.keep_mb) > 0 ? used + ' of ' + fmtInt(u.keep_mb) + ' MiB used' : used + ' used';
   }
 
   /** syslogTarget writes a Syslog destination as server:port. */
@@ -1861,15 +2157,28 @@
     return [chip('none', humanize(state) || 'on'), g && g.enabled ? [' sends to ', syslogTarget(g) || '?', level] : null, problem];
   }
 
-  /** syslogEnforcement says what att-monitor does with the gateway's Syslog setting. */
+  /** syslogEnforcement says what att-monitor does with the gateway's Syslog setting. It reads
+   *  the setting only in the daily settings check (and within 10 minutes after the service
+   *  starts, or after this PC's address changed), so a change made on the gateway shows above
+   *  only after the next read, while its messages show at once: once messages have arrived
+   *  since the setting was read, the card says so instead of how to set it by hand. */
   function syslogEnforcement(sl, st) {
     if (sl.enforce) {
       return 'att-monitor keeps the gateway sending its log to ' + (syslogTarget(sl.target) || 'this PC') + ' and records every check and change of the setting.';
     }
+    const reads = 'att-monitor reads this setting in its daily settings check and within 10 minutes after the service starts (att-monitor stop, then start); it does not change it yet.';
+    if (sl.state === 'ok') return reads;
+    const readAt = toMs(sl.gateway_at);
+    const lastAt = toMs(sl.last_at);
+    if (lastAt != null && readAt == null) return reads;
+    if (lastAt != null && lastAt > readAt) {
+      return ['Messages have arrived since this setting was read, so it may have been changed on the gateway since. ', reads];
+    }
     const ip = st && st.local_link && st.local_link.local_ip;
     const port = (sl.target && sl.target.port) || (/:(\d+)$/.exec(String(sl.listen || '')) || [])[1] || 514;
-    return ['att-monitor only reads this setting; it does not change it yet. To receive the gateway’s log, turn Syslog on in the gateway’s Diagnostics › Syslog page with server ',
-      ip ? h('code', null, String(ip)) : 'this PC’s address', ' and port ', String(port), '.'];
+    return ['To receive the gateway’s log, turn Syslog on in the gateway’s Diagnostics › Syslog page with server ',
+      ip ? h('code', null, String(ip)) : 'this PC’s address', ' and port ', String(port),
+      sl.listening ? ': its messages then show here within a minute. ' : '. ', reads];
   }
 
   async function loadRecentIncidents(el, ctx) {
@@ -2049,11 +2358,74 @@
     return v == null || !isFinite(v) ? '—' : Number(Number(v).toFixed(2)).toLocaleString();
   }
 
-  /** fmtMbps writes a rate in Mb/s with the precision it deserves. */
-  function fmtMbps(v) {
-    if (v == null || !isFinite(v)) return '—';
-    const a = Math.abs(v);
-    return (a === 0 ? '0' : a < 10 ? v.toFixed(2) : a < 100 ? v.toFixed(1) : Math.round(v).toLocaleString()) + ' Mb/s';
+  // Units of rates, given in Mb/s: bits per second with SI prefixes (1 kb/s = 1,000 bit/s).
+  const RATE_UNITS = [[1e-3, 'kb/s'], [1, 'Mb/s'], [1e3, 'Gb/s']];
+
+  /** rateParts writes a rate given in Mb/s in the unit that suits it (kb/s, Mb/s or Gb/s), with
+   *  the precision it deserves, as [number, unit]. */
+  function rateParts(mbps) {
+    if (mbps == null || !isFinite(mbps)) return ['—', ''];
+    if (mbps === 0) return ['0', 'b/s'];
+    const a = Math.abs(mbps);
+    let i = a >= 1e3 ? 2 : a >= 1 ? 1 : 0;
+    if (i < 2 && a / RATE_UNITS[i][0] >= 999.5) i++; // 999.96 Mb/s is 1.00 Gb/s, not "1,000 Mb/s"
+    const v = mbps / RATE_UNITS[i][0];
+    const r = Math.abs(v);
+    return [r < 10 ? v.toFixed(2) : r < 100 ? v.toFixed(1) : Math.round(v).toLocaleString(), RATE_UNITS[i][1]];
+  }
+
+  /** fmtRate writes a rate given in Mb/s as rateParts does, in one string. */
+  function fmtRate(mbps) {
+    const [n, unit] = rateParts(mbps);
+    return unit ? n + ' ' + unit : n;
+  }
+
+  /** rateAxis returns the tick labels of a rate axis that ends at hi Mb/s: every tick in the unit
+   *  of the top one. */
+  function rateAxis(hi) {
+    const [div, unit] = RATE_UNITS[hi >= 1e3 ? 2 : hi >= 1 ? 1 : 0];
+    return (v) => fmtNum(v / div) + ' ' + unit;
+  }
+
+  /** fmtLevel writes a set rate level in Mb/s (a threshold, a scale's end) as an axis does:
+   *  "80 Mb/s", "1 Gb/s". */
+  function fmtLevel(mbps) {
+    return rateAxis(mbps)(mbps);
+  }
+
+  /** rateStats is what MRTG's legend says of a traffic series over the range: its maximum (from
+   *  peaks when given: the highest rate between two readings; else the highest bucket), its
+   *  average over the buckets with a reading, and its current value (the newest bucket with a
+   *  reading). vals and peaks are Mb/s per bucket (null: no reading); atLeast flags the buckets
+   *  whose rates are lower bounds, and a figure drawn from such a bucket is one too. Each figure
+   *  is {v, i (its bucket; none for the average), atLeast}; null when nothing was read. */
+  function rateStats(vals, peaks, atLeast) {
+    let sum = 0;
+    let n = 0;
+    let anyAtLeast = false;
+    let cur = -1;
+    let top = -1;
+    let topV = -Infinity;
+    const lower = (i) => !!(atLeast && atLeast[i]);
+    for (let i = 0; i < vals.length; i++) {
+      const v = vals[i];
+      if (v == null || !isFinite(v)) continue;
+      sum += v;
+      n++;
+      cur = i;
+      anyAtLeast = anyAtLeast || lower(i);
+      const p = peaks && peaks[i] != null && isFinite(peaks[i]) ? Math.max(peaks[i], v) : v;
+      if (p > topV) {
+        topV = p;
+        top = i;
+      }
+    }
+    if (!n) return null;
+    return {
+      max: { v: topV, i: top, atLeast: lower(top) },
+      avg: { v: sum / n, atLeast: anyAtLeast },
+      cur: { v: vals[cur], i: cur, atLeast: lower(cur) },
+    };
   }
 
   /** fmtGB writes a byte count in GB (10^9 bytes). */
@@ -2069,10 +2441,13 @@
     return m ? F.day.format(new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]))) : String(v);
   }
 
-  /** trafficChart draws the household's traffic (Series.traffic, docs/syslog-snmp-traffic.md
-   *  §3.3): the WAN download and upload from the gateway's own counters (mean lines, peak
-   *  marks) and this computer's, against the classifier's heavy-traffic level; null when the
-   *  monitor reports no traffic at all. */
+  /** trafficChart draws the household's traffic in the manner of an MRTG graph — the "SNMP flow
+   *  chart" without SNMP (Series.traffic, docs/syslog-snmp-traffic.md §3.3): from the AT&T
+   *  gateway's own byte counters, the WAN download as a filled area and the upload as a line, in
+   *  bits per second, each bucket's mean drawn across the bucket, with the highest rate between
+   *  two readings marked and the classifier's heavy-traffic level; under it MRTG's legend: the
+   *  maximum, average and current rate of each direction over the range, and this computer's.
+   *  null when the monitor reports no traffic at all. */
   function trafficChart(ser, from, to, stepMs, ctx) {
     const title = 'Traffic';
     const heavy = Number(ser.heavy_traffic_mbps) > 0 ? Number(ser.heavy_traffic_mbps) : null;
@@ -2087,33 +2462,67 @@
     const col = (k) => pts.map((p) => num(p[k]));
     const atLeast = pts.map((p) => p.at_least === true);
     const anyAtLeast = atLeast.some(Boolean);
+    const rx = col('wan_rx_mbps');
+    const tx = col('wan_tx_mbps');
+    const rxPeak = col('wan_rx_peak_mbps');
+    const txPeak = col('wan_tx_peak_mbps');
+    const pcRx = col('pc_rx_mbps');
+    const pcTx = col('pc_tx_mbps');
+    const bucket = (i) => F.short.format(new Date(starts[i])) + ' – ' + F.hm.format(new Date(starts[i] + stepMs));
     const legendExtra = [[tickKey(0), 'peak: the highest rate between two readings in the bucket']];
     if (anyAtLeast) legendExtra.push([chevronKey(), 'at least: the true rate may have been higher']);
+    const summary = trafficSummary([
+      { key: areaKey(1), label: 'WAN download', vals: rx, peaks: rxPeak, atLeast },
+      { key: lineKey(2), label: 'WAN upload', vals: tx, peaks: txPeak, atLeast },
+      { label: 'This PC download', vals: pcRx },
+      { label: 'This PC upload', vals: pcTx },
+    ], bucket);
     return lineChart({
       id: 'traffic', ctx, linked: null,
       title,
-      subtitle: 'Mean rate in each ' + fmtDur(stepMs / 1000) + ' bucket, in Mb/s. WAN: the AT&T gateway’s own IPv4 byte counters, with short marks at the highest rate between two of its readings. This PC: its own network adapter.' +
-        (heavy != null ? ' Dashed line: ' + fmtNum(heavy) + ' Mb/s, from which the household’s own traffic may slow the connection by itself, so a slowdown is not attributed to AT&T.' : '') +
+      subtitle: 'Bits per second through the AT&T gateway, from its own IPv4 byte counters (it offers no SNMP), as MRTG draws it: download filled, upload as a line, the mean of each ' +
+        fmtDur(stepMs / 1000) + ' bucket across the bucket, and short marks at the highest rate between two of the gateway’s readings.' +
+        (heavy != null ? ' Dashed line: ' + fmtLevel(heavy) + ', from which the household’s own traffic may slow the connection by itself, so a slowdown is not attributed to AT&T.' : '') +
         ' Gaps: no reading.' +
         (anyAtLeast ? ' Chevron: the gateway’s 32-bit byte counter may have wrapped more often than can be told, so the rate was at least the one shown.' : ''),
       series: [
-        { key: 'wan_rx', label: 'WAN download', slot: 1, vals: col('wan_rx_mbps'), atLeast },
-        { key: 'wan_rx_peak', of: 'wan_rx', mark: 'tick', label: 'WAN download peak', slot: 1, vals: col('wan_rx_peak_mbps'), atLeast },
-        { key: 'wan_tx', label: 'WAN upload', slot: 2, vals: col('wan_tx_mbps'), atLeast },
-        { key: 'wan_tx_peak', of: 'wan_tx', mark: 'tick', label: 'WAN upload peak', slot: 2, vals: col('wan_tx_peak_mbps'), atLeast },
-        { key: 'pc_rx', label: 'This PC download', slot: 3, vals: col('pc_rx_mbps') },
-        { key: 'pc_tx', label: 'This PC upload', slot: 4, vals: col('pc_tx_mbps') },
+        { key: 'wan_rx', label: 'WAN download', slot: 1, vals: rx, atLeast, area: true, step: true },
+        { key: 'wan_rx_peak', of: 'wan_rx', mark: 'tick', label: 'WAN download peak', slot: 1, vals: rxPeak, atLeast },
+        { key: 'wan_tx', label: 'WAN upload', slot: 2, vals: tx, atLeast, step: true },
+        { key: 'wan_tx_peak', of: 'wan_tx', mark: 'tick', label: 'WAN upload peak', slot: 2, vals: txPeak, atLeast },
+        { key: 'pc_rx', label: 'This PC download', vals: pcRx, plot: false },
+        { key: 'pc_tx', label: 'This PC upload', vals: pcTx, plot: false },
       ],
-      times: starts.map((t) => t + stepMs / 2), from, to, gapMs: stepMs * 1.5, legend: true, legendExtra,
+      times: starts.map((t) => t + stepMs / 2), from, to, gapMs: stepMs * 1.5, stepMs, legend: true, legendExtra,
       yMin: 0, minMax: 1,
-      thresholds: heavy != null ? [{ v: heavy, tone: 'ref', place: 'above', label: 'Heavy household traffic ' + fmtNum(heavy) + ' Mb/s' }] : [],
+      thresholds: heavy != null ? [{ v: heavy, tone: 'ref', place: 'above', label: 'Heavy household traffic ' + fmtLevel(heavy) }] : [],
       atLeast: anyAtLeast ? { at: atLeast, keys: ['wan_rx', 'wan_tx'] } : null,
-      yFmt: fmtNum,
-      tipFmt: (v, se, i) => (v == null ? '—' : (se && se.atLeast && se.atLeast[i] ? 'at least ' : '') + fmtMbps(v)),
-      tipTime: (i) => F.short.format(new Date(starts[i])) + ' – ' + F.hm.format(new Date(starts[i] + stepMs)),
+      yFmt: fmtNum, yFmtFor: rateAxis,
+      tipFmt: (v, se, i) => (v == null ? '—' : (se && se.atLeast && se.atLeast[i] ? 'at least ' : '') + fmtRate(v)),
+      tipTime: bucket,
       tipUTC: (i) => new Date(starts[i]).toISOString().slice(0, 16).replace('T', ' ') + ' – ' + new Date(starts[i] + stepMs).toISOString().slice(11, 16) + ' UTC',
-      unit: 'Mb/s',
+      after: summary,
     });
+  }
+
+  /** trafficSummary is MRTG's legend under the traffic chart: for each row (key, label, vals,
+   *  peaks, atLeast) the maximum, average and current rate over the range (rateStats), with the
+   *  bucket of a maximum or current value on hover (bucket(i) words it). */
+  function trafficSummary(rows, bucket) {
+    const cell = (x) => {
+      if (!x) return '—';
+      const text = (x.atLeast ? 'at least ' : '') + fmtRate(x.v);
+      return x.i != null ? h('span', { title: bucket(x.i) }, text) : text;
+    };
+    const body = rows.map((r) => {
+      const st = rateStats(r.vals, r.peaks, r.atLeast);
+      return [h('span', { class: 'nowrap' }, r.key || null, r.key ? ' ' : null, r.label), cell(st && st.max), cell(st && st.avg), cell(st && st.cur)];
+    });
+    return h('div', { class: 'mrtg' },
+      table([{ label: 'In this range' }, { label: 'Maximum', num: true }, { label: 'Average', num: true }, { label: 'Current', num: true }], body,
+        { compact: true, stack: true }),
+      h('p', { class: 'chart-note' }, 'Maximum: the highest rate between two readings of the gateway’s counters (this PC: the highest bucket). ' +
+        'Average: over the buckets with a reading. Current: the newest bucket with a reading. Hover a figure for its time.'));
   }
 
   /** trafficDaysTable lists the WAN volume per day of this computer's time zone
@@ -2280,23 +2689,29 @@
 
   /**
    * lineChart draws one or more series against one y-axis.
-   * o: {id, title, subtitle, series:[{key,label,slot,vals,mark,of}], times, from, to, gapMs,
-   *     legend, legendExtra, linked, yMin, yMax, minMax, robustMax, pad, thresholds, band,
-   *     atLeast, yFmt, tipFmt(v, series, i), tipTime, tipExtra, unit, ctx}
+   * o: {id, title, subtitle, series:[{key,label,slot,vals,mark,of,step,area,plot}], times, from,
+   *     to, gapMs, stepMs, legend, legendExtra, linked, yMin, yMax, minMax, robustMax, pad,
+   *     thresholds, band, atLeast, yFmt, yFmtFor, tipFmt(v, series, i), tipTime, tipExtra, unit,
+   *     after, ctx}
    * A series with mark 'tick' is drawn as a short mark per value (e.g. the peak of a bucket);
-   * one with "of" has no legend button and shows and hides with the series it names. legendExtra
-   * lists further legend entries ([key, label]). atLeast {at: [bool], keys} marks the values at
-   * those indexes, of those series, as lower bounds: a chevron above them.
+   * one with "of" has no legend button and shows and hides with the series it names. A series
+   * with step is drawn level across each bucket (stepMs wide, centred on its time), one with
+   * area is filled down to the axis, and one with plot false is not drawn: the tooltip and the
+   * table view show it. legendExtra lists further legend entries ([key, label]). atLeast {at:
+   * [bool], keys} marks the values at those indexes, of those series, as lower bounds: a chevron
+   * above them. yFmtFor(hi), when given, returns the tick labels for an axis that ends at hi
+   * (units that follow the scale). after is shown under the plot.
    */
   function lineChart(o) {
     const { fig, tableBtn, plot, tip, live } = chartFrame(o);
     const H = o.band ? 252 : 224;
     let legendEl = null;
-    const primary = o.series.filter((se) => !se.of);
+    const primary = o.series.filter((se) => !se.of && se.plot !== false);
     if (o.legend && primary.length > 1) {
       legendEl = h('ul', { class: 'legend', 'aria-label': 'Series — select to show or hide' });
       for (const se of primary) {
-        const btn = h('button', { type: 'button', 'aria-pressed': String(!app.hidden.has(se.key)), dataset: { key: se.key } }, lineKey(se.slot), se.label);
+        const btn = h('button', { type: 'button', 'aria-pressed': String(!app.hidden.has(se.key)), dataset: { key: se.key } },
+          se.area ? areaKey(se.slot) : lineKey(se.slot), se.label);
         btn.addEventListener('click', () => {
           if (app.hidden.has(se.key)) app.hidden.delete(se.key); else app.hidden.add(se.key);
           for (const c of o.linked || [api_]) c.refresh();
@@ -2312,7 +2727,7 @@
     }
     const note = h('p', { class: 'chart-note', hidden: true });
     const tableWrap = h('div', { hidden: true });
-    fig.append(plot, note, live, tableWrap);
+    add(fig, [plot, note, o.after, live, tableWrap]);
 
     let W = 0;
     let g = null;
@@ -2333,6 +2748,7 @@
       let mx = -Infinity;
       const all = [];
       for (const se of vis) {
+        if (se.plot === false) continue;
         for (const v of se.vals) {
           if (v == null || !isFinite(v)) continue;
           all.push(v);
@@ -2366,11 +2782,12 @@
     function draw() {
       W = Math.max(260, Math.round(plot.clientWidth));
       g = layout();
+      g.yFmt = o.yFmtFor ? o.yFmtFor(g.hi) : o.yFmt;
       const svg = s('svg', { width: W, height: H, viewBox: `0 0 ${W} ${H}`, 'aria-hidden': 'true', focusable: 'false' });
       for (const t of g.ticks) {
         const y = Math.round(g.ys(t)) + 0.5;
         svg.append(s('line', { class: 'gl', x1: g.x0, x2: g.x1, y1: y, y2: y }),
-          s('text', { class: 'tk', x: g.x0 - 8, y: y + 3.5, 'text-anchor': 'end' }, o.yFmt(t)));
+          s('text', { class: 'tk', x: g.x0 - 8, y: y + 3.5, 'text-anchor': 'end' }, g.yFmt(t)));
       }
       svg.append(s('line', { class: 'al', x1: g.x0, x2: g.x1, y1: g.y0 + 0.5, y2: g.y0 + 0.5 }));
       for (const t of timeTicks(o.from, o.to, g.x1 - g.x0)) {
@@ -2390,7 +2807,9 @@
       const n = o.times.length;
       const spacing = n > 1 ? (o.times[n - 1] - o.times[0]) / (n - 1) : o.to - o.from;
       const half = Math.max(1, Math.min(4, (spacing / (o.to - o.from)) * (g.x1 - g.x0) / 4));
+      const base = g.ys(g.lo).toFixed(1); // the axis, where areas end
       for (const se of g.vis) {
+        if (se.plot === false) continue;
         if (se.mark === 'tick') {
           for (let i = 0; i < se.vals.length; i++) {
             const v = se.vals[i];
@@ -2403,7 +2822,7 @@
           }
           continue;
         }
-        const segs = [];
+        const segs = []; // runs of readings without a gap: [{t, y}]
         let cur = null;
         let prevT = null;
         for (let i = 0; i < se.vals.length; i++) {
@@ -2413,19 +2832,38 @@
           let vv = v;
           if (vv > g.hi) { vv = g.hi; clamped++; }
           if (vv < g.lo) vv = g.lo;
-          const pt = [g.xs(t), g.ys(vv)];
+          const pt = { t, y: g.ys(vv) };
           if (cur && prevT != null && t - prevT <= o.gapMs) cur.push(pt);
           else { cur = [pt]; segs.push(cur); }
           prevT = t;
         }
         let d = '';
-        for (const seg of segs) {
-          if (seg.length === 1) {
-            svg.append(s('circle', { class: 'dot f' + se.slot, cx: seg[0][0].toFixed(1), cy: seg[0][1].toFixed(1), r: 4 }));
-            continue;
+        let fill = '';
+        if (se.step) {
+          // Each bucket's value level across the bucket, verticals where it changes.
+          const hw = (o.stepMs || spacing) / 2;
+          const X = (t) => Math.min(g.x1, Math.max(g.x0, g.xs(t))).toFixed(1);
+          for (const seg of segs) {
+            let sd = '';
+            for (let k = 0; k < seg.length; k++) {
+              const y = seg[k].y.toFixed(1);
+              sd += (k ? 'H' + X(seg[k].t - hw) + 'V' + y : 'M' + X(seg[k].t - hw) + ' ' + y) + 'H' + X(seg[k].t + hw);
+            }
+            d += sd;
+            if (se.area) fill += 'M' + X(seg[0].t - hw) + ' ' + base + 'L' + sd.slice(1) + 'V' + base + 'Z';
           }
-          d += 'M' + seg.map((p) => p[0].toFixed(1) + ' ' + p[1].toFixed(1)).join('L');
+        } else {
+          for (const seg of segs) {
+            if (seg.length === 1) {
+              svg.append(s('circle', { class: 'dot f' + se.slot, cx: g.xs(seg[0].t).toFixed(1), cy: seg[0].y.toFixed(1), r: 4 }));
+              continue;
+            }
+            const line = seg.map((p) => g.xs(p.t).toFixed(1) + ' ' + p.y.toFixed(1)).join('L');
+            d += 'M' + line;
+            if (se.area) fill += 'M' + g.xs(seg[0].t).toFixed(1) + ' ' + base + 'L' + line + 'L' + g.xs(seg[seg.length - 1].t).toFixed(1) + ' ' + base + 'Z';
+          }
         }
+        if (fill) svg.append(s('path', { class: 'area f' + se.slot, d: fill }));
         if (d) svg.append(s('path', { class: 'ln c' + se.slot, d }));
       }
       if (o.atLeast) {
@@ -2454,7 +2892,7 @@
         }
       }
       note.hidden = clamped === 0;
-      if (clamped) note.textContent = `${clamped} value${clamped > 1 ? 's' : ''} above ${o.yFmt(g.hi)} ${clamped > 1 ? 'are' : 'is'} drawn at the top edge; the table view has the exact numbers.`;
+      if (clamped) note.textContent = `${clamped} value${clamped > 1 ? 's' : ''} above ${g.yFmt(g.hi)} ${clamped > 1 ? 'are' : 'is'} drawn at the top edge; the table view has the exact numbers.`;
       g.xh = s('line', { class: 'xh', x1: 0, x2: 0, y1: g.y1, y2: g.y0, visibility: 'hidden' });
       g.dots = s('g', { visibility: 'hidden' });
       svg.append(g.xh, g.dots);
@@ -2479,10 +2917,11 @@
       const rows = [];
       for (const se of g.vis) {
         const v = se.vals[i];
-        if (v != null && isFinite(v)) {
+        const drawn = se.plot !== false;
+        if (drawn && v != null && isFinite(v)) {
           g.dots.append(s('circle', { class: 'dot f' + se.slot, cx: x, cy: g.ys(Math.min(Math.max(v, g.lo), g.hi)), r: 4 }));
         }
-        rows.push(h('div', { class: 'tip-row' }, se.mark === 'tick' ? tickKey(se.slot) : lineKey(se.slot),
+        rows.push(h('div', { class: 'tip-row' }, !drawn ? h('span') : se.mark === 'tick' ? tickKey(se.slot) : lineKey(se.slot),
           h('span', { class: 'val' }, o.tipFmt(v, se, i)), h('span', { class: 'lab' }, se.label)));
       }
       g.dots.setAttribute('visibility', 'visible');
@@ -3156,15 +3595,27 @@
       }
       case 'monitor_stop':
         return { tone: 'warning', title: 'Monitor stopped (' + (d.reason || '?') + ')' };
-      case 'syslog': {
-        // A batch of the gateway's syslog messages; a message's text is the sender's, so its
-        // hidden characters are written as escapes.
-        const msgs = Array.isArray(d.messages) ? d.messages.filter((m) => m && typeof m === 'object') : [];
-        const parts = msgs.slice(0, 3).map((m) => escapedText(String(m.msg || m.raw || (m.raw_b64 ? '(not valid UTF-8)' : '')).slice(0, 160)));
-        if (msgs.length > 3) parts.push(`and ${fmtInt(msgs.length - 3)} more`);
-        if (d.dropped > 0) parts.push(`${fmtInt(d.dropped)} more over the per-minute cap (counted, not recorded)`);
-        if (d.rejected > 0) parts.push(`${fmtInt(d.rejected)} datagram${d.rejected === 1 ? '' : 's'} from other senders (counted, not recorded)`);
-        return { tone: 'info', title: `Gateway syslog: ${fmtInt(msgs.length)} message${msgs.length === 1 ? '' : 's'} received`, detail: parts.join(' · ') };
+      case 'syslog_chunk': {
+        // A sealed chunk of the gateway's syslog messages: the store keeps the file within its
+        // limit, this record its SHA-256 for good.
+        const n = Number(d.messages) || 0;
+        const parts = ['received ' + whenText(d.from) + ' to ' + whenText(d.to),
+          'SHA-256 ' + shortHash(d.sha256, 16) + ' of ' + fmtBytes(d.bytes) + ' (' + fmtBytes(d.gz_bytes) + ' compressed)', 'chunk ' + orQ(d.name)];
+        if (d.dropped > 0) parts.push(`${fmtInt(d.dropped)} more over the per-minute cap (counted, not stored)`);
+        if (d.rejected > 0) parts.push(`${fmtInt(d.rejected)} datagram${d.rejected === 1 ? '' : 's'} from other senders (counted, not stored)`);
+        return { tone: 'info', title: `Gateway syslog: ${fmtInt(n)} message${n === 1 ? '' : 's'} sealed in a chunk (${SEAL_REASONS[d.reason] || orQ(d.reason)})`, detail: parts.join(' · ') };
+      }
+      case 'syslog_prune': {
+        // Chunks deleted to stay within the limits; their SHA-256 stay in their syslog_chunk records.
+        const del = Array.isArray(d.deleted) ? d.deleted.filter((x) => x && typeof x === 'object') : [];
+        const msgs = del.reduce((acc, x) => acc + (Number(x.messages) || 0), 0);
+        const parts = ['limit ' + orQ(d.reason), `${fmtInt(d.kept_chunks)} chunks (${fmtBytes(d.kept_bytes)}) kept`];
+        if (del.length) parts.push('deleted ' + del.slice(0, 3).map((x) => orQ(x.name)).join(', ') + (del.length > 3 ? ` and ${fmtInt(del.length - 3)} more` : ''));
+        return {
+          tone: 'info',
+          title: `Gateway syslog: ${fmtInt(del.length)} chunk${del.length === 1 ? '' : 's'} (${fmtInt(msgs)} message${msgs === 1 ? '' : 's'}) deleted to stay within the limit`,
+          detail: parts.join(' · '),
+        };
       }
       default:
         return { tone: 'info', title: humanize(rec.type) };
@@ -3441,15 +3892,17 @@
 
   function renderSyslog(c, q, ctx) {
     c.append(h('div', { class: 'view-head' }, h('h1', null, 'Gateway syslog'),
-      h('p', { class: 'muted' }, 'The AT&T gateway’s own log messages as this PC received them, recorded in the evidence ledger in signed batches. Every message keeps the exact datagram; its time is when this PC received it.')));
+      h('p', { class: 'muted' }, 'The AT&T gateway’s own log messages as this PC received them, kept in the syslog store within the limit you choose, the oldest deleted first. Every sealed chunk of messages is recorded in the evidence ledger with its SHA-256, and so is every deletion. Each message keeps the exact datagram; its time is when this PC received it.')));
     const statusArea = h('div');
+    const store = syslogStorePanel();
     let statusKey = null;
     const update = (st) => {
+      store.update(st);
       const key = JSON.stringify([st.syslog || null, st.local_link ? st.local_link.local_ip : null]);
       if (key === statusKey) return;
       statusKey = key;
       replace(statusArea, syslogCard(st, false) ||
-        callout('info', 'This monitor reports no syslog receiver: the messages below are the ones recorded in the evidence ledger.'));
+        callout('info', 'This monitor reports no syslog receiver: the messages below are the ones the syslog store holds.'));
     };
     ctx.onStatus = update;
     if (app.status) update(app.status);
@@ -3468,7 +3921,7 @@
       field('Severity', sev), search,
       h('button', { type: 'submit', class: 'btn' }, 'Refresh'));
     const out = h('section', { class: 'card', 'aria-labelledby': 'syslog-list-h' });
-    c.append(statusArea, form, out);
+    c.append(statusArea, store.el, form, out);
     const browser = syslogBrowser(out, ctx, {
       heading: 'Messages', headingId: 'syslog-list-h',
       empty: () => (sev.value || text.value.trim() ? 'No syslog message received in this period matches the filters.' : 'No syslog messages were received in this period.'),
@@ -3500,9 +3953,157 @@
     load();
   }
 
+  /** syslogStorePanel shows how much the syslog store holds against its limits
+   *  (Status.syslog.store) and lets the operator choose how much to keep (POST
+   *  /api/syslog/retention). The form is built once: a status refresh updates the figures and,
+   *  until the operator types, the form's values, never what is being typed. A change that
+   *  deletes messages now is confirmed first; saving the limits in force is said to change,
+   *  record and delete nothing (the monitor's answer "unchanged"). Returns { el, update(st) }. */
+  function syslogStorePanel() {
+    const usage = h('div');
+    const mib = h('input', { type: 'number', name: 'keep_mb', min: String(SYSLOG_KEEP_MB_MIN), max: String(SYSLOG_KEEP_MB_MAX), step: '1', inputmode: 'numeric', required: true });
+    const days = h('input', { type: 'number', name: 'keep_days', min: '0', max: String(SYSLOG_KEEP_DAYS_MAX), step: '1', inputmode: 'numeric', placeholder: 'no age limit' });
+    const btn = h('button', { type: 'submit', class: 'btn btn-primary' }, 'Save');
+    const out = h('div', { 'aria-live': 'polite' });
+    const form = h('form', { class: 'form retention', 'aria-label': 'How much syslog to keep' },
+      h('div', { class: 'form-grid' },
+        field('Keep at most (MiB)', mib, `The oldest messages are deleted first once the stored messages take more. ${fmtInt(SYSLOG_KEEP_MB_MIN)} to ${fmtInt(SYSLOG_KEEP_MB_MAX)} MiB (1 TiB); 100 by default.`),
+        field('Also delete messages older than (days)', days, `Optional: empty or 0 keeps messages of any age that fit. At most ${fmtInt(SYSLOG_KEEP_DAYS_MAX)}.`)),
+      h('div', { class: 'btn-row' }, btn));
+    const el = h('section', { class: 'card', 'aria-labelledby': 'syslog-store-h', hidden: true },
+      h('div', { class: 'card-head' }, h('h2', { id: 'syslog-store-h' }, 'Stored messages')), usage, form, out);
+    let store = null; // the store as last shown (Status.syslog.store)
+    let usageKey = null;
+    let edited = false; // the operator changed the form since it was filled in
+    let unavailable = false; // the monitor offers no control of the store (404)
+    for (const inp of [mib, days]) inp.addEventListener('input', () => { edited = true; });
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const mb = wholeNumber(mib.value);
+      const d = days.value.trim() === '' ? 0 : wholeNumber(days.value);
+      if (mb == null || mb < SYSLOG_KEEP_MB_MIN || mb > SYSLOG_KEEP_MB_MAX) {
+        replace(out, notice('critical', `Enter a whole number of MiB from ${fmtInt(SYSLOG_KEEP_MB_MIN)} to ${fmtInt(SYSLOG_KEEP_MB_MAX)}.`));
+        mib.focus();
+        return;
+      }
+      if (d == null || d > SYSLOG_KEEP_DAYS_MAX) {
+        replace(out, notice('critical', `Enter a whole number of days from 0 (no age limit) to ${fmtInt(SYSLOG_KEEP_DAYS_MAX)}, or leave it empty.`));
+        days.focus();
+        return;
+      }
+      const loss = retentionLoss(store, mb, d);
+      if (loss && !(await dialog({
+        title: 'Delete the oldest syslog messages now?',
+        body: [h('p', null, loss),
+          h('p', null, 'The SHA-256 of every deleted chunk stays in the evidence ledger (its syslog_chunk record) and the deletion is recorded (a syslog_prune record), but the messages themselves cannot be brought back.')],
+        confirm: 'Save and delete',
+      }))) return;
+      btn.disabled = true;
+      replace(out, notice('info', spinner(), ' Saving…'));
+      try {
+        const cc = (await api('/api/syslog/retention', { method: 'POST', body: { keep_mb: mb, keep_days: d } })) || {};
+        edited = false;
+        const result = String(cc.result || 'applied');
+        const limits = 'at most ' + fmtInt(mb) + ' MiB' +
+          (d > 0 ? ', and nothing older than ' + fmtInt(d) + ' day' + (d === 1 ? '' : 's') : ' of messages of any age');
+        if (/^\s*unchanged/i.test(result)) {
+          // The limits in force: the monitor neither recorded nor deleted anything.
+          replace(out, notice('good', h('strong', null, 'Already in force. '), 'The syslog store keeps ' + limits +
+            ' already: nothing was changed, so nothing was recorded in the evidence ledger and nothing was deleted.'));
+          announce('Syslog retention unchanged: already in force.');
+        } else {
+          replace(out, notice('good', h('strong', null, 'Saved. '), 'The syslog store keeps ' + limits +
+            '. Recorded in the evidence ledger as a configuration change: ', String(cc.what || 'syslog retention'), ', ',
+            String(cc.before || '?'), ' → ', String(cc.after || '?'), ' (', result, ').'));
+          announce('Syslog retention saved.');
+        }
+      } catch (err) {
+        if (err.status === 404) {
+          unavailable = true;
+          form.hidden = true;
+          replace(out, callout('info', sentence(capitalize(err.message))));
+        } else {
+          // Do not claim "not changed": the limits may be in effect although something after
+          // that failed (the answer's change says so).
+          const ch = err.data && err.data.change;
+          const result = ch && ch.result ? String(ch.result) : '';
+          replace(out, result && !/^\s*failed/i.test(result)
+            ? notice('warning', sentence(capitalize(err.message)))
+            : notice('critical', 'The setting could not be saved: ', sentence(err.message)));
+        }
+      } finally {
+        btn.disabled = false;
+        refreshStatus();
+      }
+    });
+
+    return {
+      el,
+      update(st) {
+        const sl = st && st.syslog && typeof st.syslog === 'object' ? st.syslog : null;
+        const u = syslogStore(sl);
+        el.hidden = !sl; // without a receiver the page says so above
+        const key = JSON.stringify(u);
+        if (key !== usageKey) {
+          usageKey = key;
+          replace(usage, u ? syslogUsageBlock(u)
+            : callout('info', 'This monitor reports no syslog store, so how much is kept cannot be shown or changed here.'));
+        }
+        store = u;
+        form.hidden = !u || unavailable;
+        if (u && !edited) {
+          mib.value = Number(u.keep_mb) > 0 ? String(u.keep_mb) : '';
+          days.value = Number(u.keep_days) > 0 ? String(u.keep_days) : '';
+        }
+      },
+    };
+  }
+
+  /** wholeNumber parses a whole number typed in a form (null: not one). */
+  function wholeNumber(v) {
+    const t = String(v == null ? '' : v).trim();
+    return /^\d{1,9}$/.test(t) ? Number(t) : null;
+  }
+
+  /** syslogUsageBlock shows the syslog store's volume against its limits: "<used> of <limit>
+   *  used, oldest message <time>, <n> chunks", then what it holds. */
+  function syslogUsageBlock(u) {
+    const used = Number(u.bytes) || 0;
+    const limit = Number(u.keep_mb) > 0 ? Number(u.keep_mb) * MIB : 0;
+    const chunks = Number(u.chunks) || 0;
+    const open = Number(u.open_messages) || 0;
+    return h('div', { class: 'store-usage' },
+      h('p', { class: 'store-line' }, h('strong', null, syslogUsageText(u)),
+        u.oldest ? [', oldest message ', timeEl(u.oldest, F.short)] : ', no message kept yet',
+        ', ' + fmtInt(chunks) + ' chunk' + (chunks === 1 ? '' : 's')),
+      limit ? meter((100 * used) / limit, 'wide') : null,
+      h('p', { class: 'small muted' }, fmtInt(Number(u.messages) || 0) + ' messages kept',
+        open ? ', ' + fmtInt(open) + ' of them in the open chunk (sealed and recorded in the evidence ledger within minutes)' : '',
+        '. ', Number(u.keep_days) > 0 ? 'Messages older than ' + fmtInt(u.keep_days) + ' days are deleted too.' : 'No age limit.'));
+  }
+
+  /** retentionLoss says what new limits would delete from the store now ('' = nothing). The
+   *  limits in force delete nothing when saved again (the monitor answers "unchanged" and
+   *  neither records nor prunes), although the store may hold a little more than its size
+   *  limit between two seals: the open chunk counts uncompressed until it is sealed. */
+  function retentionLoss(u, keepMB, keepDays) {
+    if (!u) return '';
+    if (keepMB === Number(u.keep_mb) && keepDays === (Number(u.keep_days) || 0)) return '';
+    const parts = [];
+    const used = Number(u.bytes) || 0;
+    if (used > keepMB * MIB) parts.push('the store holds ' + fmtBytes(used) + ', more than ' + fmtInt(keepMB) + ' MiB');
+    const oldest = toMs(u.oldest);
+    if (keepDays > 0 && oldest != null && Date.now() - oldest > keepDays * 86400e3) {
+      parts.push('its oldest message, received ' + F.full.format(new Date(oldest)) + ', is older than ' + fmtInt(keepDays) + ' day' + (keepDays === 1 ? '' : 's'));
+    }
+    return parts.length ? 'The oldest messages are deleted as soon as you save: ' + parts.join(', and ') + '.' : '';
+  }
+
   /** syslogBrowser shows in el the messages GET /api/syslog returns for a period and filters,
    *  newest first, with "Load more" while more matched: that asks again for the same period with
-   *  a larger limit and appends what is new. o: heading, headingId, intro (optional), empty()
+   *  a larger limit and appends what is new (not offered when the answer ended at the size one
+   *  answer may take: a larger limit gets the same). o: heading, headingId, intro (optional), empty()
    *  (the text when nothing matched). Returns { load(query) }, query: {from, to, q, severity}
    *  (to may be left out: until now). */
   function syslogBrowser(el, ctx, o) {
@@ -3539,9 +4140,10 @@
         const msgs = Array.isArray(data && data.messages) ? data.messages.filter((m) => m && typeof m === 'object') : [];
         cur = Object.assign({}, query, { from: (data && data.from) || query.from, to: (data && data.to) || query.to });
         const w = headers.get('X-ATT-Monitor-Warning');
-        replace(warn, w ? notice('critical', h('strong', null, 'Integrity problem in the syslog records read. '), w, ' ', h('a', { href: '#/evidence' }, 'Run Verify')) : null);
-        // A larger page of the same period starts with the messages shown already.
-        const keyOf = (m) => m.seq + '|' + m.rx + '|' + (m.raw || m.raw_b64 || m.msg || '');
+        replace(warn, w ? notice('critical', h('strong', null, 'Integrity problem in the syslog_chunk records read. '), w, ' ', h('a', { href: '#/evidence' }, 'Run Verify')) : null);
+        // A larger page of the same period starts with the messages shown already (a message's
+        // chunk never changes; its record may have become known meanwhile).
+        const keyOf = (m) => m.chunk + '|' + m.rx + '|' + (m.raw || m.raw_b64 || m.msg || '');
         const grows = append && tbody && shown.length <= msgs.length && shown.every((k, i) => k === keyOf(msgs[i]));
         if (grows) {
           for (const m of msgs.slice(shown.length)) tbody.append(tableRow(cols, syslogRow(m), { stack: true }));
@@ -3556,11 +4158,16 @@
         shown = msgs.map(keyOf);
         const period = [timeEl(cur.from, F.short), ' to ', timeEl(cur.to, F.short)];
         const n = fmtInt(msgs.length) + ' message' + (msgs.length === 1 ? '' : 's');
+        // The server also ends a list at the size an answer may take: fewer messages than asked
+        // for and more matched. A larger limit would not show more.
+        const full = !!(data && data.truncated) && Array.isArray(data.messages) && data.messages.length < query.limit;
         replace(status, !msgs.length ? null
-          : !data.truncated ? [n + ' recorded from ', period, ', newest first.']
-            : query.limit < SYSLOG_MAX ? ['The newest ' + n + ' recorded from ', period, '; more were recorded in this period.']
-              : ['The newest ' + n + ' recorded from ', period, '. Narrow the period or the filters to see older ones.']);
-        more.hidden = !data.truncated || query.limit >= SYSLOG_MAX;
+          : !data.truncated ? [n + ' received from ', period, ', newest first.']
+            : full ? ['The newest ' + n + ' received from ', period, '; more were received, but these messages are long and one answer holds no more of them. Narrow the period or the filters to see older ones.']
+              : query.limit < SYSLOG_MAX ? ['The newest ' + n + ' received from ', period, '; more were received in this period.']
+                : ['The newest ' + n + ' received from ', period, '. Narrow the period or the filters to see older ones.'],
+          prunedNote(cur.from));
+        more.hidden = !data.truncated || full || query.limit >= SYSLOG_MAX;
         if (append && more.hidden) status.focus(); // the button the keyboard was on is gone
       } catch (e) {
         if (ctx.alive && mine === token) {
@@ -3571,7 +4178,8 @@
             shown = [];
             more.hidden = true;
             replace(status);
-            replace(list, errorNotice(e));
+            // A monitor without a syslog store (404) has no messages to show, which is no error.
+            replace(list, e.status === 404 ? callout('info', sentence(capitalize(e.message))) : errorNotice(e));
           }
         }
       } finally {
@@ -3589,32 +4197,61 @@
     return { load(query) { fetchList(Object.assign({ limit: SYSLOG_PAGE }, query), false); } };
   }
 
+  /** prunedNote says when a period starts before the oldest message the syslog store still
+   *  keeps (Status.syslog.store.oldest): what was received before is not shown because it is not
+   *  kept any more, not because nothing was received. */
+  function prunedNote(from) {
+    const u = syslogStore(app.status && app.status.syslog);
+    const oldest = u ? toMs(u.oldest) : null;
+    const start = toMs(from);
+    if (oldest == null || start == null || oldest <= start) return null;
+    return [' The store keeps no message received before ', timeEl(u.oldest, F.short),
+      ': older ones, if there were any, were deleted by the retention limit.'];
+  }
+
   /** syslogSeverity describes a severity number (SYSLOG_SEVERITIES), or null. */
   function syslogSeverity(n) {
     return Number.isInteger(n) && n >= 0 && n < SYSLOG_SEVERITIES.length ? SYSLOG_SEVERITIES[n] : null;
   }
 
   /** syslogRow is the table row of a message (GET /api/syslog): when, how severe, from which
-   *  host and program, and what it says, with the exact datagram on request. Every cell holds
-   *  one element (the stacked rows of a narrow screen lay out a cell's children as a grid). */
+   *  host and program, and what it says (as much as SYSLOG_ROW_TEXT and SYSLOG_ROW_NAME allow),
+   *  with the exact datagram on request. Every cell holds one element (the stacked rows of a
+   *  narrow screen lay out a cell's children as a grid). */
   function syslogRow(m) {
     const sv = syslogSeverity(m.severity);
     const text = m.msg || m.raw || '';
     return [
-      h('span', { class: 'nowrap' }, timeEl(m.rx, F.sec)),
+      h('span', { class: 'nowrap' }, timeEl(m.rx, F.sec), h('span', { class: 'sub small' }, chunkRecordLink(m, 'record #'))),
       h('span', null, sv ? chip(sv.tone, sv.label, 'Severity ' + m.severity + ' (' + sv.name + ')')
         : h('span', { class: 'muted', title: 'The message carries no severity' }, '—')),
-      h('div', null, m.host ? h('span', { class: 'wrap-any' }, visibleText(m.host)) : h('span', { class: 'muted' }, '—'),
-        m.app ? h('span', { class: 'sub small muted wrap-any' }, visibleText(m.app)) : null),
-      h('div', null, text ? h('span', { class: 'syslog-text' }, visibleText(text))
+      h('div', null, m.host ? h('span', { class: 'wrap-any' }, clippedText(m.host, SYSLOG_ROW_NAME)) : h('span', { class: 'muted' }, '—'),
+        m.app ? h('span', { class: 'sub small muted wrap-any' }, clippedText(m.app, SYSLOG_ROW_NAME)) : null),
+      h('div', null, text ? h('span', { class: 'syslog-text' }, clippedText(text, SYSLOG_ROW_TEXT))
         : h('span', { class: 'muted' }, m.raw_b64 ? 'not valid UTF-8: see the exact bytes' : '(empty)'),
       syslogDetails(m)),
     ];
   }
 
-  /** syslogDetails offers a message's exact datagram, its parsed header and its ledger record. */
+  // Why a message is not linked to a ledger record (yet).
+  const CHUNK_UNRECORDED = 'Messages are recorded in the evidence ledger by chunk, when the chunk is sealed: a syslog_chunk record states its SHA-256. ' +
+    'A chunk is sealed when it reaches its size limit, minutes after its first message, or when the service stops. ' +
+    'This message’s chunk is still open, or its record was not found near it, or not yet: one request looks through a bounded part of the ledger, ' +
+    'for the newest messages first, and the next request further back.';
+
+  /** chunkRecordLink links the syslog_chunk record of a message's chunk (label + seq), or says
+   *  that it is not known (yet). */
+  function chunkRecordLink(m, label) {
+    const seq = Number(m.seq) || 0;
+    return seq > 0
+      ? h('a', { href: recordsLink(seq), title: 'The syslog_chunk record of this message’s chunk, which states the chunk’s SHA-256' }, label + seq)
+      : h('span', { class: 'muted', title: CHUNK_UNRECORDED }, 'no record yet');
+  }
+
+  /** syslogDetails offers a message's exact datagram, its parsed header and its chunk's ledger
+   *  record. */
   function syslogDetails(m) {
-    const det = h('details', { class: 'syslog-raw' }, h('summary', null, 'Exact datagram · record #' + orQ(m.seq)));
+    const det = h('details', { class: 'syslog-raw' }, h('summary', null, 'Exact datagram'));
     let filled = false;
     det.addEventListener('toggle', () => {
       if (!det.open || filled) return;
@@ -3640,7 +4277,8 @@
         ? `${m.pri}: facility ${fac == null ? '?' : fac + ' (' + (SYSLOG_FACILITIES[fac] || '?') + ')'}, severity ${sv ? m.severity + ' (' + sv.name + ')' : '?'}`
         : 'none in the datagram'],
       ['Header time', m.ts ? [h('code', null, visibleText(m.ts)), h('span', { class: 'small muted' }, ' as the gateway wrote it')] : null],
-      ['Evidence', m.seq != null ? h('a', { href: recordsLink(m.seq) }, 'ledger record #' + m.seq) : null],
+      ['Stored in', m.chunk ? [h('code', { class: 'wrap-any' }, String(m.chunk)), h('span', { class: 'sub small' }, 'chunk of the syslog store; evidence: ',
+        chunkRecordLink(m, 'ledger record #'))] : null],
     ]));
   }
 
@@ -4026,11 +4664,10 @@
       case 'config_change': return (d.what || '') + ': ' + (d.before || '') + ' → ' + (d.after || '');
       case 'config_state': return [d.rules ? 'rules ' + d.rules : '', d.config_sha256 ? 'config ' + shortHash(d.config_sha256, 12) : ''].filter(Boolean).join(' · ');
       case 'custody_export': return d.file_name || '';
-      case 'syslog': {
-        const msgs = Array.isArray(d.messages) ? d.messages : [];
-        const first = msgs.find((m) => m && typeof m === 'object');
-        return `${fmtInt(msgs.length)} message${msgs.length === 1 ? '' : 's'}` +
-          (first ? ' · ' + escapedText(String(first.msg || first.raw || '').slice(0, 120)) : '');
+      case 'syslog_chunk': return `${fmtInt(d.messages)} message${d.messages === 1 ? '' : 's'} · ${SEAL_REASONS[d.reason] || orQ(d.reason)} · ${orQ(d.name)}`;
+      case 'syslog_prune': {
+        const n = Array.isArray(d.deleted) ? d.deleted.length : 0;
+        return `${fmtInt(n)} chunk${n === 1 ? '' : 's'} deleted · ${orQ(d.reason)}`;
       }
       default: return '';
     }

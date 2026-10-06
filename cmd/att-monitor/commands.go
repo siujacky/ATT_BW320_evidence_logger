@@ -269,8 +269,12 @@ func cmdGateway(args []string) error {
 	if len(args) > 0 && args[0] == "trust-cert" {
 		return cmdTrustCert(args[1:])
 	}
+	if len(args) > 0 && args[0] == "syslog" {
+		return gatewaySyslog(os.Stdout, args[1:])
+	}
 	if len(args) == 0 || args[0] != "notification" {
-		return errors.New("usage: att-monitor gateway notification [status|on|off]\n       att-monitor gateway trust-cert")
+		return errors.New("usage: att-monitor gateway notification [status|on|off]\n       att-monitor gateway syslog [status] [--json]\n" +
+			"       att-monitor gateway trust-cert")
 	}
 	args = args[1:]
 	action := "status"
@@ -484,6 +488,15 @@ func cmdVerifyBundle(args []string) error {
 	if rc != nil && len(rc.Stated) > 0 {
 		fmt.Println("          taken as stated by report.json (cannot come from records):", strings.Join(rc.Stated, "; "))
 	}
+	// Syslog chunks (syslog/<name>) against their syslog_chunk records; chunks of the period the
+	// retention limit deleted, or that were not kept at export, are reported, not failed.
+	syslogFailed := false
+	if sc, serr := export.VerifySyslogChunks(path); serr != nil {
+		syslogFailed = true
+		fmt.Println("SYSLOG:   FAILED —", serr)
+	} else {
+		fmt.Printf("SYSLOG:   OK (%s)\n", sc.Summary())
+	}
 	b, err := export.OpenBundle(path)
 	if err != nil {
 		return err
@@ -503,7 +516,7 @@ func cmdVerifyBundle(args []string) error {
 		fmt.Println("Bundle SHA-256:", sum)
 	}
 	err = reportVerify(rep, *asJSON)
-	if err == nil && reportFailed {
+	if err == nil && (reportFailed || syslogFailed) {
 		return exitCode(2)
 	}
 	return err

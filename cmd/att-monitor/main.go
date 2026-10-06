@@ -28,7 +28,12 @@ Usage:
   att-monitor run [--data DIR]                 run in the foreground (console mode)
   att-monitor set-access-code (--file PATH | --stdin) [--data DIR]
   att-monitor gateway notification [status|on|off] [--data DIR]
+  att-monitor gateway syslog [status] [--json] [--data DIR]   the gateway's Syslog setting, the receiver and the store
   att-monitor gateway trust-cert [--data DIR]  confirm a changed gateway certificate (after AT&T updates)
+  att-monitor syslog [--since 24h] [--grep TEXT] [--severity LEVEL] [--limit N] [--json] [--data DIR]
+                                               the gateway's syslog messages kept on this PC, oldest first
+  att-monitor syslog retention [--keep-mb N] [--keep-days D] [--yes] [--data DIR]
+                                               how much syslog is kept (100 MiB unless changed)
   att-monitor verify [--data DIR] [--json]     verify the whole evidence ledger
   att-monitor verify-bundle FILE.zip [--json]  verify an exported evidence bundle
   att-monitor export --from TIME --to TIME [--incident ID] [--prepared-by NAME] [--notes TEXT] [--out DIR] [--data DIR]
@@ -93,6 +98,8 @@ func run(args []string) error {
 		return cmdSetAccessCode(rest)
 	case "gateway":
 		return cmdGateway(rest)
+	case "syslog":
+		return cmdSyslog(rest)
 	case "verify":
 		return cmdVerify(rest)
 	case "verify-bundle":

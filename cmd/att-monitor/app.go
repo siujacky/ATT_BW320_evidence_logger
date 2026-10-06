@@ -5,8 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +24,8 @@ import (
 	"attmonitor/internal/monitor"
 	"attmonitor/internal/probe"
 	"attmonitor/internal/sysinfo"
+	"attmonitor/internal/syslogrx"
+	"attmonitor/internal/syslogstore"
 	"attmonitor/internal/web"
 	"attmonitor/internal/winsvc"
 )
@@ -47,6 +52,11 @@ type stack struct {
 	// mongo copies the ledger into MongoDB (service and console modes, when enabled; nil
 	// otherwise). The ledger stays the source of truth; see docs/DESIGN.md §17.
 	mongo *mongostore.Replicator
+	// syslog is the syslog store (docs/DESIGN.md §18; nil when it cannot be opened). The
+	// service writes it when syslog.enabled, through the monitor, which then also runs syslogRx;
+	// otherwise (the CLI, or syslog switched off) it is opened read-only and syslogRx is nil.
+	syslog   *syslogstore.Store
+	syslogRx *syslogrx.Receiver
 }
 
 type stackOptions struct {
@@ -68,7 +78,11 @@ func openStack(o stackOptions) (*stack, error) {
 			return nil, fmt.Errorf("no evidence ledger found in %s (is the service using a different --data directory?)", o.dataDir)
 		}
 	}
-	if err := s.paths.MkdirAll(); err != nil {
+	// The syslog store's folder is left to openSyslog: a problem with it must not keep the
+	// evidence collection from starting.
+	layout := s.paths
+	layout.Syslog = layout.Root
+	if err := layout.MkdirAll(); err != nil {
 		return nil, fmt.Errorf("data directory %s: %w", o.dataDir, err)
 	}
 	var keysACLErr error
@@ -120,6 +134,9 @@ func openStack(o stackOptions) (*stack, error) {
 	if o.mode != "cli" {
 		s.importBootstrapOnce()
 	}
+	// After the ledger: its writer lock keeps a second monitor, and so a second writer of the
+	// syslog store, away.
+	s.openSyslog(o.mode)
 
 	s.gw = gateway.New(gateway.Options{
 		Host:             cfg.Gateway.Host,
@@ -149,6 +166,7 @@ func openStack(o stackOptions) (*stack, error) {
 			StoreBlobs: cfg.Mongo.StoreBlobs,
 			Interval:   cfg.Mongo.Interval.Duration,
 			Logger:     lg.With("component", "mongo"),
+			Syslog:     s.syslogReader(),
 		})
 		if err != nil {
 			// The copy is a convenience: evidence collection goes on without it.
@@ -175,6 +193,8 @@ func openStack(o stackOptions) (*stack, error) {
 		StateDir:    s.paths.State,
 		Logger:      lg.With("component", "monitor"),
 		MongoStatus: mongoStatus,
+		Syslog:      s.syslogReceiver(),
+		SyslogStore: s.syslogWriter(),
 	})
 	if err != nil {
 		s.close()
@@ -186,12 +206,102 @@ func openStack(o stackOptions) (*stack, error) {
 		Verifier:      s.ledger,
 		Actions:       s.mon,
 		TokenVerifier: s.anchor, // per-anchor chain verdict: only chain-trusted tokens prove time
+		Syslog:        s.syslogReader(),
 		// keys/tsa-roots.pem lets anyone run `openssl ts -verify -attime … -CAfile keys/tsa-roots.pem`.
 		ExtraFiles: map[string][]byte{"keys/tsa-roots.pem": tsaRootsPEM},
 		Software:   s.sw,
 		Logger:     lg.With("component", "export"),
 	})
 	return s, nil
+}
+
+// openSyslog opens the syslog store and the receiver of the gateway's syslog messages
+// (docs/DESIGN.md §18). The service and console modes write the store when syslog.enabled: the
+// monitor runs the receiver, moves what it receives into the store and records every chunk the
+// store seals (syslog_chunk) and every deletion (syslog_prune). Otherwise - the CLI, whose
+// exports read the chunks while the service is stopped, or syslog switched off - the store is
+// only read, so that the dashboard, exports and the MongoDB copy still find the chunks kept so
+// far; nothing then writes it. A store that cannot be opened is logged, and evidence collection
+// goes on without syslog.
+func (s *stack) openSyslog(mode string) {
+	sc := s.cfg.Syslog
+	lg := s.log.With("component", "syslog")
+	if mode == "cli" || !sc.Enabled {
+		st, err := openSyslogReader(s.paths.Syslog, sc, lg)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			lg.Debug("no syslog store to read", "dir", s.paths.Syslog)
+		case err != nil:
+			lg.Warn("the syslog store cannot be read; its chunks are left out of exports and the dashboard", "dir", s.paths.Syslog, "err", err)
+		default:
+			s.syslog = st
+		}
+		return
+	}
+	st, err := syslogstore.New(syslogstore.Options{Dir: s.paths.Syslog, KeepMB: sc.KeepMB, KeepDays: sc.KeepDays, Logger: lg.With("part", "store")})
+	if err != nil {
+		lg.Error("syslog is off: the syslog store cannot be opened", "dir", s.paths.Syslog, "err", err)
+		return
+	}
+	rx, err := syslogrx.New(syslogrx.Options{
+		Listen:       sc.Listen,
+		Allowed:      syslogSenders(s.cfg),
+		MaxPerMinute: sc.MaxPerMinute,
+		Logger:       lg.With("part", "receiver"),
+	})
+	if err != nil {
+		lg.Error("syslog is off: the syslog receiver cannot be set up", "listen", sc.Listen, "err", err)
+		if cerr := st.Close(); cerr != nil {
+			lg.Warn("closing the syslog store", "err", cerr)
+		}
+		return
+	}
+	s.syslog, s.syslogRx = st, rx
+}
+
+// openSyslogReader opens the syslog store in dir read-only: it indexes the sealed chunks as they
+// are now and reads the writer's open chunk as it grows (a snapshot: open a new one per command).
+// Its limits are only reported (Usage). The error wraps os.ErrNotExist when there is no store.
+func openSyslogReader(dir string, sc config.SyslogConfig, lg *slog.Logger) (*syslogstore.Store, error) {
+	return syslogstore.New(syslogstore.Options{Dir: dir, KeepMB: sc.KeepMB, KeepDays: sc.KeepDays, ReadOnly: true, Logger: lg})
+}
+
+// syslogSenders returns the senders the syslog receiver accepts: the gateway and syslog.allow
+// (the configuration's validation makes them IP addresses; anything else is skipped). The
+// monitor sets the same list again when it starts.
+func syslogSenders(cfg *config.Config) []netip.Addr {
+	var out []netip.Addr
+	for _, h := range append([]string{cfg.Gateway.Host}, cfg.Syslog.Allow...) {
+		if a, err := netip.ParseAddr(strings.TrimSpace(h)); err == nil && !slices.Contains(out, a) {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// syslogReader is the syslog store for its readers: the dashboard, exports and the MongoDB copy
+// (nil, an untyped nil, when there is none).
+func (s *stack) syslogReader() contracts.SyslogReader {
+	if s.syslog == nil {
+		return nil
+	}
+	return s.syslog
+}
+
+// syslogWriter is the syslog store for the monitor: only when this process writes it.
+func (s *stack) syslogWriter() contracts.SyslogStore {
+	if s.syslog == nil || s.syslogRx == nil {
+		return nil
+	}
+	return s.syslog
+}
+
+// syslogReceiver is the syslog receiver for the monitor (nil when the store is not written).
+func (s *stack) syslogReceiver() contracts.SyslogReceiver {
+	if s.syslogRx == nil {
+		return nil
+	}
+	return s.syslogRx
 }
 
 // importBootstrapOnce imports cfg.BootstrapDir if no bootstrap_import record exists yet. The
@@ -239,6 +349,14 @@ func (s *stack) importBootstrapOnce() {
 }
 
 func (s *stack) close() {
+	if s.syslog != nil {
+		// The monitor sealed the open chunk when it stopped; Close releases what is left open (a
+		// chunk the ledger could not record is sealed by the next start's Recover).
+		if err := s.syslog.Close(); err != nil && s.log != nil {
+			s.log.Error("closing the syslog store", "err", err)
+		}
+		s.syslog = nil
+	}
 	if s.ledger != nil {
 		if err := s.ledger.Close(); err != nil && s.log != nil {
 			s.log.Error("closing ledger", "err", err)
@@ -260,14 +378,17 @@ func runMonitor(ctx context.Context, o stackOptions, power <-chan string) error 
 	defer s.close()
 
 	srv, err := web.New(web.Options{
-		Listen:   s.cfg.Web.Listen,
-		Status:   s.mon,
-		Actions:  s.mon,
-		Reader:   s.ledger,
-		Verifier: s.ledger,
-		Exporter: s.exp,
-		Version:  version,
-		Logger:   s.log.With("component", "web"),
+		Listen:        s.cfg.Web.Listen,
+		Status:        s.mon,
+		Actions:       s.mon,
+		Reader:        s.ledger,
+		Verifier:      s.ledger,
+		Exporter:      s.exp,
+		SyslogReader:  s.syslogReader(),
+		SyslogControl: s.mon,
+		LiveTraffic:   s.mon,
+		Version:       version,
+		Logger:        s.log.With("component", "web"),
 	})
 	if err != nil {
 		return fmt.Errorf("web server: %w", err)
@@ -321,8 +442,12 @@ func runMonitor(ctx context.Context, o stackOptions, power <-chan string) error 
 		}
 	}()
 
+	syslogListen := "off"
+	if s.syslogRx != nil {
+		syslogListen = "udp " + s.cfg.Syslog.Listen
+	}
 	s.log.Info("att-monitor running", "version", version, "mode", o.mode, "data", o.dataDir,
-		"dashboard", "http://"+s.cfg.Web.Listen, "fingerprint", s.ledger.Fingerprint())
+		"dashboard", "http://"+s.cfg.Web.Listen, "syslog", syslogListen, "fingerprint", s.ledger.Fingerprint())
 	err = s.mon.Run(runCtx)
 	cancel(errors.New("monitor stopped"))
 	wg.Wait()

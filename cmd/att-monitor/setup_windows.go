@@ -128,6 +128,13 @@ var stdin = bufio.NewReader(os.Stdin)
 
 func stdinReader() *bufio.Reader { return stdin }
 
+// stdinIsConsole reports whether standard input is a console, so that a question can be
+// answered (not a pipe or a file).
+func stdinIsConsole() bool {
+	var mode uint32
+	return windows.GetConsoleMode(windows.Handle(os.Stdin.Fd()), &mode) == nil
+}
+
 // readHiddenLine reads one line from the console without showing what is typed. When standard
 // input is not a console (a pipe), the line is read as it is.
 func readHiddenLine() (string, error) {

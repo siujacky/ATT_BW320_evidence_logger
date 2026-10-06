@@ -67,17 +67,23 @@ func samePath(a, b string) bool {
 }
 
 func (a *apiClient) do(ctx context.Context, method, path string, in, out any) error {
+	_, err := a.call(ctx, method, path, in, out)
+	return err
+}
+
+// call is do, and also returns the response's header (nil when there was no response).
+func (a *apiClient) call(ctx context.Context, method, path string, in, out any) (http.Header, error) {
 	var body io.Reader
 	if in != nil {
 		b, err := json.Marshal(in)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		body = bytes.NewReader(b)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, a.base+path, body)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if method != http.MethodGet {
 		req.Header.Set("X-ATT-Monitor", "1")
@@ -85,26 +91,26 @@ func (a *apiClient) do(ctx context.Context, method, path string, in, out any) er
 	}
 	resp, err := a.hc.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 	if err != nil {
-		return err
+		return resp.Header, err
 	}
 	if resp.StatusCode/100 != 2 {
 		var e struct {
 			Error string `json:"error"`
 		}
 		if json.Unmarshal(data, &e) == nil && e.Error != "" {
-			return fmt.Errorf("service: %s", e.Error)
+			return resp.Header, fmt.Errorf("service: %s", e.Error)
 		}
-		return fmt.Errorf("service: HTTP %d", resp.StatusCode)
+		return resp.Header, fmt.Errorf("service: HTTP %d", resp.StatusCode)
 	}
 	if out == nil {
-		return nil
+		return resp.Header, nil
 	}
-	return json.Unmarshal(data, out)
+	return resp.Header, json.Unmarshal(data, out)
 }
 
 // download saves GET path into dir/name.

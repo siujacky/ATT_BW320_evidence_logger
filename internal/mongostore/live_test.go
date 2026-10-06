@@ -80,7 +80,8 @@ func mustVerify(t *testing.T, e *liveEnv, r contracts.LedgerReader, pub ed25519.
 
 func requireVerifyOK(t *testing.T, res VerifyResult) {
 	t.Helper()
-	if !res.OK || res.Missing+res.Mismatched+res.BadHash+res.BlobsMissing+res.BlobsCorrupt != 0 || len(res.Problems) != 0 {
+	if !res.OK || res.Missing+res.Mismatched+res.BadHash+res.BlobsMissing+res.BlobsCorrupt != 0 || len(res.Problems) != 0 ||
+		res.SyslogBad+res.SyslogPruned+res.SyslogForged+res.SyslogMissing != 0 {
 		t.Fatalf("verification failed: %+v", res)
 	}
 }

@@ -442,6 +442,14 @@ func TestErrorSentinelMapping(t *testing.T) {
 			func(hs *harness) *httptest.ResponseRecorder { return hs.post("/api/verify", "") }},
 		{"series", func(hs *harness, err error) { hs.status.seriesErr = err },
 			func(hs *harness) *httptest.ResponseRecorder { return hs.get("/api/series?range=1h") }},
+		{"syslog", func(hs *harness, err error) { hs.syslog.queryErr = err },
+			func(hs *harness) *httptest.ResponseRecorder { return hs.get("/api/syslog") }},
+		{"syslog retention", func(hs *harness, err error) { hs.syslogCtl.err = err },
+			func(hs *harness) *httptest.ResponseRecorder {
+				return hs.post("/api/syslog/retention", `{"keep_mb":50}`)
+			}},
+		{"live traffic", func(hs *harness, err error) { hs.live.err = err },
+			func(hs *harness) *httptest.ResponseRecorder { return hs.get("/api/traffic/live") }},
 	}
 	for _, ep := range endpoints {
 		for _, tc := range cases {

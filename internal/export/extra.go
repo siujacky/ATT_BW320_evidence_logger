@@ -17,11 +17,11 @@ type extraFile struct {
 	data []byte
 }
 
-// generatedFiles are the files every bundle contains besides the ledger/ and blobs/ entries;
-// generatedDirs hold generated entries only.
+// generatedFiles are the files every bundle contains besides the ledger/, blobs/ and syslog/
+// entries; generatedDirs hold generated entries only.
 var (
 	generatedFiles = []string{"README.txt", "REPORT.html", "report.json", "keys/public-key.txt", "tools/verify_bundle.py", manifestName}
-	generatedDirs  = []string{"ledger", "blobs"}
+	generatedDirs  = []string{"ledger", "blobs", "syslog"}
 )
 
 // extraElemRE: a path element is a plain name - letters, digits, '.', '_' and '-', starting

@@ -117,6 +117,7 @@ const (
 	logRejected  = "syslog receiver: datagram from a sender that is not allowed; counted as rejected, not kept"
 	logTooLarge  = "syslog receiver: datagram larger than the limit; counted as dropped, not kept"
 	logOverCap   = "syslog receiver: more messages in this minute than the limit; counted as dropped, not kept"
+	logOverBytes = "syslog receiver: the messages of this minute would take more space than the limit; counted as dropped, not kept"
 	logFull      = "syslog receiver: too many messages wait to be recorded; counted as dropped, not kept"
 	logTransient = "syslog receiver: skipped a receive error about a single datagram"
 	logFailing   = "syslog receiver: receiving failed; trying again"

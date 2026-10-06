@@ -272,17 +272,27 @@ func TestAppJSURLAndAttributeGuards(t *testing.T) {
 // ----------------------------------------------------------------------------- the real script
 
 type dashboardView struct {
-	Text    string `json:"text"`
-	Pill    string `json:"pill"`  // the status pill in the top bar
-	Title   string `json:"title"` // document.title
-	Hero    string `json:"hero"`  // the status hero card, if the view has one
-	Markers int    `json:"markers"`
-	Buttons []struct {
-		Text     string `json:"text"`
-		Disabled bool   `json:"disabled"`
-	} `json:"buttons"`
-	Rows  []dashboardRow `json:"rows"`
-	Marks map[string]int `json:"marks"` // chart marks by kind: "peak", "atleast", "ref"
+	Text    string            `json:"text"`
+	Pill    string            `json:"pill"`  // the status pill in the top bar
+	Title   string            `json:"title"` // document.title
+	Hero    string            `json:"hero"`  // the status hero card, if the view has one
+	Markers int               `json:"markers"`
+	Buttons []dashboardButton `json:"buttons"`
+	Rows    []dashboardRow    `json:"rows"`
+	// Marks counts chart marks by kind: "peak", "atleast", "ref", "area", and the flow meter's
+	// "flowbar" and "heavy" marks; "ctl" counts the elements of hidden characters in remote text.
+	Marks    map[string]int `json:"marks"`
+	Headings []string       `json:"headings"` // the section headings (h2) shown: not inside a hidden element
+	Requests int            `json:"requests"` // requests the page had made when the view was captured
+	Timers   int            `json:"timers"`   // timers of a second or more waiting (the flow meter's next reading)
+	Live     []string       `json:"live"`     // the view's live regions, "<aria-live>:<class>"
+}
+
+// dashboardButton is one button of a rendered view.
+type dashboardButton struct {
+	Text     string `json:"text"`
+	Disabled bool   `json:"disabled"`
+	Shown    bool   `json:"shown"` // not inside a hidden element
 }
 
 // dashboardRow is one table row of a rendered view.
@@ -329,7 +339,14 @@ func runHarness(t *testing.T, base, scenario string) dashboardReport {
 func runDashboard(t *testing.T, w *demoWorld, scenario string) dashboardReport {
 	t.Helper()
 	requireNode(t)
-	base, _ := startServer(t, newDemoServer(t, w, nil))
+	return runDashboardOn(t, newDemoServer(t, w, nil), scenario)
+}
+
+// runDashboardOn is runDashboard for a server the test built (e.g. one without some features).
+func runDashboardOn(t *testing.T, srv *Server, scenario string) dashboardReport {
+	t.Helper()
+	requireNode(t)
+	base, _ := startServer(t, srv)
 	rep := runHarness(t, base, scenario)
 	for _, v := range rep.Violations {
 		t.Errorf("markup/URL violation: %s", v)
@@ -598,10 +615,7 @@ func TestDashboardCertificateAndAccountingViews(t *testing.T) {
 		"pages not attempted (the gateway could not be reached)")
 	contains("incident "+model.CausePacketLoss, "Degraded", "16 min", "(truncated)")
 	contains("gateway", "No usable gateway access code", "no access code", "gateway local time")
-	if v := rep.Views["gateway"]; !slices.ContainsFunc(v.Buttons, func(b struct {
-		Text     string `json:"text"`
-		Disabled bool   `json:"disabled"`
-	}) bool {
+	if v := rep.Views["gateway"]; !slices.ContainsFunc(v.Buttons, func(b dashboardButton) bool {
 		return strings.HasPrefix(b.Text, "Turn redirect") && b.Disabled
 	}) {
 		t.Errorf("gateway setting buttons not disabled without a usable access code: %+v", v.Buttons)

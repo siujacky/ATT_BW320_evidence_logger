@@ -297,6 +297,7 @@ func (m *Monitor) checkLocalLink(ctx context.Context, force bool) {
 		prev     *model.LocalLink
 		prevAt   time.Time
 		incident bool
+		movedIP  string // this computer's address toward the gateway changed from it
 	)
 	m.locked(func() {
 		prev, prevAt = m.st.lastLinkRec, m.st.lastLinkRecAt
@@ -308,7 +309,18 @@ func (m *Monitor) checkLocalLink(ctx context.Context, force bool) {
 				st.inc.Stats.LocalLinkDown = true
 			}
 		}
+		if ip := view.LocalIP; ip != "" {
+			if m.st.localIP != "" && ip != m.st.localIP {
+				movedIP = m.st.localIP
+			}
+			m.st.localIP = ip
+		}
 	})
+	if movedIP != "" {
+		// The gateway's Syslog setting names the address it sends to: it is read again soon.
+		m.log.Info("this computer's address toward the gateway changed", "from", movedIP, "to", view.LocalIP)
+		m.kNotif.kick(kickAddressChange)
+	}
 	fresh := m.set.incident.SnapshotFreshness.Duration
 	refresh := (incident || wifiDown(&link) || bypassRoute(egress) != nil) && at.Sub(prevAt) >= max(fresh-m.set.linkInterval, fresh/2)
 	if !force && !refresh && prev != nil && !linkChanged(prev, &link) && !egressChanged(prev.Egress, egress) && at.Sub(prevAt) < m.set.linkRecordEvery {

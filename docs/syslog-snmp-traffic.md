@@ -51,33 +51,44 @@ or snmp flow chart". Built in the phases below.
 ### 3.2 Syslog receiver and the syslog store (kept within 100 MB)
 
 * **Receiver** (`internal/syslogrx`, built): UDP `syslog.listen` (`:514`), only from the gateway's
-  address (and `syslog.allow`), size, rate and buffer caps, exact bytes kept, RFC 3164 / 5424 parsed.
+  address (and `syslog.allow`), size, rate, stored-size (1 MiB of lines a minute) and buffer caps,
+  exact bytes kept, RFC 3164 / 5424 parsed. The caps bound what a forged sender can add to the
+  ledger (at most about one `syslog_chunk` record a minute).
 * **Why not the ledger:** the ledger is append-only and hash-chained; nothing in it can ever be
   deleted, so it cannot honour a 100 MB limit. Messages therefore go to the **syslog store**, and the
   ledger keeps their proof:
 * **Store** (`internal/syslogstore`, new; folder `syslog\` in the data directory): messages are
   appended (one JSON object per line, exact) to an open chunk file, flushed to disk every
-  `syslog.flush_interval` (30 s). A chunk is sealed when it reaches 1 MiB or is 5 minutes old (and at
-  shutdown): it is compressed (gzip) and its SHA-256 (of the uncompressed lines), message count, time
-  range and size go into a ledger record **`syslog_chunk`**. A chunk left open by a crash is sealed
-  at the next start ("recovered").
+  `syslog.flush_interval` (30 s). A chunk is sealed when it reaches 1 MiB or, at a flush, is 5 minutes
+  old (and at shutdown): it is compressed (gzip) and its SHA-256 (of the uncompressed lines), message
+  count, time range and size go into a ledger record **`syslog_chunk`**. A chunk left open by a crash
+  (or while the ledger refused records) is sealed at the next start ("recovered"). The store notes
+  which sealed chunks have their record, so one sealed while the ledger refused records is recorded
+  once it takes records again - by the next start at the latest, after a search of the ledger so that
+  none is recorded twice.
 * **Retention:** after every seal the store deletes the oldest sealed chunks until it holds at most
   `syslog.keep_mb` MiB (default **100**), and, when `syslog.keep_days` is above 0, nothing older
   than that. Each deletion is a ledger record **`syslog_prune`** naming the deleted chunks and their
-  SHA-256. So the ledger shows what existed, when and why it was deleted; what is still kept is
+  SHA-256, written before the chunks are deleted (nothing is deleted while a chunk waits for its
+  record). So the ledger shows what existed, when and why it was deleted; what is still kept is
   verifiable against its `syslog_chunk` record.
 * **User choice:** the dashboard's Syslog page shows the space used and lets the user set how much
   to keep (MB, and optionally days); `att-monitor syslog retention --keep-mb N [--keep-days D]` does
   the same; both go through `SetSyslogRetention`, which saves the setting, records a
   `config_change`, applies it at once and prunes what no longer fits.
 * **Reading:** `GET /api/syslog` reads the store (open and sealed chunks, newest first) with the
-  filters; entries name their chunk and its `syslog_chunk` record.
+  filters, at most 5000 messages and 16 MiB of JSON per answer (a sender controls how long its
+  messages are); entries name their chunk and its `syslog_chunk` record, looked up newest first. The
+  dashboard shortens long messages in its list and shows each run of control characters as one
+  escaped element; the exact datagram is shown on request.
 * **Exports:** a bundle includes the kept chunks overlapping its period (`syslog/…jsonl.gz`);
   `att-monitor verify-bundle` and `tools/verify_bundle.py` check each against its `syslog_chunk`
   record (chunks already pruned are listed as such).
 * **MongoDB:** the replicator copies the messages of each sealed chunk into collection `syslog` (one
   document per message, with its exact line) and deletes them when a `syslog_prune` record removes
-  the chunk, so the copy follows the same limit; `mongo verify` checks them against the chunks.
+  the chunk; as uncompressed documents take far more than the store's gzip chunks, the collection
+  also keeps to `syslog.keep_mb` MiB of documents of its own, deleting its oldest chunks' documents
+  beyond that; `mongo verify` checks them against the chunks.
 * **Windows Firewall:** install adds an inbound rule (UDP 514, remote address = the gateway,
   program = the monitor); uninstall removes it.
 * **Verdicts are unchanged:** syslog is supporting evidence; RulesVersion stays 2026.10-4.
@@ -95,7 +106,9 @@ or snmp flow chart". Built in the phases below.
   sparkline of the last ~15 minutes) while the dashboard is open. `GET /api/traffic/live` reads the
   gateway's Broadband Status counters on demand, at most once every 5 seconds whoever asks, plus this
   PC's counters, and keeps the last ~15 minutes in memory. It is a display only: nothing is recorded,
-  and when nobody watches the gateway gets no extra requests.
+  and when nobody watches the gateway gets no extra requests. It never holds up the evidence: a read
+  is skipped while the monitor itself reads the gateway, takes the gateway for at most 5 seconds, and
+  is not made while the gateway does not answer the monitor's polls.
 
 ### 3.4 Configuration
 
@@ -132,12 +145,12 @@ would fight over the gateway's setting: only one should enforce (README).
 | 1.3 | Syslog receiver (`internal/syslogrx`) | done |
 | 1.4 | Traffic series, this PC's counters, daily volume | done |
 | 1.5 | Dashboard first pass: Syslog page and card, traffic chart, daily totals (reading the old ledger batches) | done, revised in 1.8 |
-| 1.6 | Syslog store with retention (`internal/syslogstore`) | |
-| 1.7 | Monitor: receiver → store → `syslog_chunk` / `syslog_prune` records, `SetSyslogRetention`, the Syslog page read in the daily check, `Status.syslog`, conditions, rebuild; live traffic (`LiveTraffic`) | |
-| 1.8 | Web: `/api/syslog` from the store, retention controls, MRTG-style chart, flow meter, `/api/traffic/live` | |
-| 1.9 | Exports and verifiers: chunks in bundles, checked against their records | |
-| 1.10 | MongoDB: `syslog` collection following the chunks and prunes; `mongo verify` | |
-| 1.11 | CLI and install: wiring, firewall rule, `gateway syslog status`, `syslog` (list), `syslog retention`; docs | |
+| 1.6 | Syslog store with retention (`internal/syslogstore`) | done |
+| 1.7 | Monitor: receiver → store → `syslog_chunk` / `syslog_prune` records, `SetSyslogRetention`, the Syslog page read in the daily check, `Status.syslog`, conditions, rebuild; live traffic (`LiveTraffic`) | done |
+| 1.8 | Web: `/api/syslog` from the store, retention controls, MRTG-style chart, flow meter, `/api/traffic/live` | done |
+| 1.9 | Exports and verifiers: chunks in bundles, checked against their records | done |
+| 1.10 | MongoDB: `syslog` collection following the chunks and prunes; `mongo verify` | done |
+| 1.11 | CLI and install: wiring, firewall rule, `gateway syslog status`, `syslog` (list), `syslog retention`; docs | done |
 | 1.12 | Review (correctness, gateway safety and security, evidence and UX), fixes, full tests (`-race`, live MongoDB), e2e with test datagrams | |
 | 1.13 | Deploy (one UAC prompt): the service reads `syslog.ha` once (read-only) and records the page | |
 

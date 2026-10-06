@@ -22,7 +22,8 @@
 // mapped with errors.Is (see classifyErr): contracts.ErrBusy 409, ErrRateLimited 429,
 // ErrUnavailable 503, ErrNotRecorded 500 ("applied but could not be recorded"),
 // ErrLedgerBroken 503 (nothing can be recorded until the service restarts), and the gateway
-// sentinels to 409/502/503 with an explanation the operator can act on.
+// sentinels to 409/502/503 with an explanation the operator can act on. A feature the monitor
+// does not offer at all (the syslog store, its retention control, the flow meter) answers 404.
 package web
 
 import (
@@ -90,7 +91,9 @@ const (
 var shutdownTimeout = 5 * time.Second
 
 // Options configures the web server. Every dependency may be nil; the endpoints that need
-// a missing dependency answer 503 (e.g. the CLI may serve a read-only view).
+// a missing dependency answer 503 (e.g. the CLI may serve a read-only view). The syslog
+// store, its retention control and the flow meter are features a monitor may not offer: their
+// endpoints then answer 404 and the dashboard leaves them out or says why.
 type Options struct {
 	Listen   string // loopback ip:port; "" = config default (127.0.0.1:8320); port 0 = ephemeral
 	Status   contracts.StatusSource
@@ -98,19 +101,28 @@ type Options struct {
 	Reader   contracts.LedgerReader
 	Verifier contracts.Verifier
 	Exporter contracts.Exporter
-	Version  string // shown in the dashboard footer ("" = "dev")
-	Logger   *slog.Logger
+	// SyslogReader reads the syslog store (GET /api/syslog); its messages are linked to their
+	// syslog_chunk records through Reader. SyslogControl changes how much of it is kept (POST
+	// /api/syslog/retention). LiveTraffic is the flow meter (GET /api/traffic/live).
+	SyslogReader  contracts.SyslogReader
+	SyslogControl contracts.SyslogControl
+	LiveTraffic   contracts.LiveTrafficSource
+	Version       string // shown in the dashboard footer ("" = "dev")
+	Logger        *slog.Logger
 }
 
 // Server is the localhost dashboard and JSON API.
 type Server struct {
-	status   contracts.StatusSource
-	actions  contracts.Actions
-	reader   contracts.LedgerReader
-	verifier contracts.Verifier
-	exporter contracts.Exporter
-	version  string
-	log      *slog.Logger
+	status    contracts.StatusSource
+	actions   contracts.Actions
+	reader    contracts.LedgerReader
+	verifier  contracts.Verifier
+	exporter  contracts.Exporter
+	syslog    contracts.SyslogReader
+	syslogCtl contracts.SyslogControl
+	live      contracts.LiveTrafficSource
+	version   string
+	log       *slog.Logger
 
 	listen   string // configured listen address
 	listenIP string // its IP, lower-case, without brackets (allowed as Host too)
@@ -122,11 +134,16 @@ type Server struct {
 
 	// Long-running operations are single-flight: a second request gets 409. gatewayMu covers
 	// every operator action on the gateway's authenticated side (the notification setting and
-	// confirming a changed certificate): one at a time.
+	// confirming a changed certificate): one at a time. syslogMu covers changes of the syslog
+	// retention (they delete what no longer fits).
 	verifyMu  sync.Mutex
 	exportMu  sync.Mutex
 	anchorMu  sync.Mutex
 	gatewayMu sync.Mutex
+	syslogMu  sync.Mutex
+
+	// chunkSeqs remembers the syslog_chunk record of each sealed chunk found (GET /api/syslog).
+	chunkSeqs chunkSeqCache
 
 	running atomic.Bool
 	runCtx  atomic.Pointer[context.Context] // context passed to Run (cancels detached operations)
@@ -160,18 +177,21 @@ func New(opts Options) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{
-		status:   opts.Status,
-		actions:  opts.Actions,
-		reader:   opts.Reader,
-		verifier: opts.Verifier,
-		exporter: opts.Exporter,
-		version:  version,
-		log:      log,
-		listen:   ap.String(),
-		listenIP: strings.ToLower(ap.Addr().Unmap().String()),
-		static:   static,
-		index:    index,
-		now:      time.Now,
+		status:    opts.Status,
+		actions:   opts.Actions,
+		reader:    opts.Reader,
+		verifier:  opts.Verifier,
+		exporter:  opts.Exporter,
+		syslog:    opts.SyslogReader,
+		syslogCtl: opts.SyslogControl,
+		live:      opts.LiveTraffic,
+		version:   version,
+		log:       log,
+		listen:    ap.String(),
+		listenIP:  strings.ToLower(ap.Addr().Unmap().String()),
+		static:    static,
+		index:     index,
+		now:       time.Now,
 	}
 	s.port.Store(uint32(ap.Port()))
 	s.handler = s.middleware(s.routes())
@@ -479,6 +499,8 @@ func (s *Server) routes() http.Handler {
 	rt.handle(http.MethodGet, "/api/incidents/{id}", s.handleIncident)
 	rt.handle(http.MethodGet, "/api/records", s.handleRecords)
 	rt.handle(http.MethodGet, "/api/syslog", s.handleSyslog)
+	rt.handle(http.MethodPost, "/api/syslog/retention", s.handleSyslogRetention)
+	rt.handle(http.MethodGet, "/api/traffic/live", s.handleLiveTraffic)
 	rt.handle(http.MethodGet, "/api/blobs/{id}", s.handleBlob)
 	rt.handle(http.MethodGet, "/api/blobs/{id}/view", s.handleBlobView)
 	rt.handle(http.MethodPost, "/api/verify", s.handleVerify)

@@ -3,8 +3,10 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -81,8 +83,8 @@ func cmdMongoStatus(args []string) error {
 	} else {
 		fmt.Println("  nothing copied yet")
 	}
-	if m.Records > 0 || m.Blobs > 0 {
-		fmt.Printf("  %d records, %d blobs\n", m.Records, m.Blobs)
+	if m.Records > 0 || m.Blobs > 0 || m.Syslog > 0 {
+		fmt.Printf("  %d records, %d blobs, %d syslog messages\n", m.Records, m.Blobs, m.Syslog)
 	}
 	if m.LastSync != "" {
 		fmt.Println("  last pass:", m.LastSync)
@@ -93,7 +95,8 @@ func cmdMongoStatus(args []string) error {
 	return nil
 }
 
-// cmdMongoVerify compares the MongoDB copy with the ledger record by record (read-only on both).
+// cmdMongoVerify compares the MongoDB copy with the ledger record by record, and its syslog
+// collection with the syslog_chunk records and the syslog store (read-only on all of them).
 func cmdMongoVerify(args []string) error {
 	fs, data := newFlags("mongo verify")
 	asJSON := fs.Bool("json", false, "print the result as JSON")
@@ -105,8 +108,9 @@ func cmdMongoVerify(args []string) error {
 	if err != nil {
 		return err
 	}
+	paths := config.PathsFor(dataDir)
 	st, err := ledger.Open(ledger.Options{
-		Paths:    config.PathsFor(dataDir),
+		Paths:    paths,
 		ReadOnly: true,
 		Logger:   slog.New(slog.DiscardHandler),
 	})
@@ -114,8 +118,16 @@ func cmdMongoVerify(args []string) error {
 		return err
 	}
 	defer st.Close()
+	opts := mongostore.VerifyOptions{URI: mc.URI, Database: mc.Database, Reader: st, PublicKey: st.PublicKey()}
+	// The syslog store, read-only (the service may be writing it): with it the verification also
+	// finds the chunks that the store keeps but the copy lacks.
+	sl, slErr := openSyslogReader(paths.Syslog, config.SyslogConfig{}, slog.New(slog.DiscardHandler))
+	if slErr == nil {
+		defer sl.Close()
+		opts.Syslog = sl
+	}
 	start := time.Now()
-	res, err := mongostore.Verify(background(), mc.URI, mc.Database, st, st.PublicKey())
+	res, err := mongostore.VerifyWith(background(), opts)
 	if err != nil {
 		return err
 	}
@@ -140,6 +152,7 @@ func cmdMongoVerify(args []string) error {
 				res.CopiedUpTo, res.LedgerHead, res.NotCopied)
 		}
 		fmt.Printf("  blobs: %d checked, %d missing, %d corrupt\n", res.BlobsChecked, res.BlobsMissing, res.BlobsCorrupt)
+		printMongoSyslog(os.Stdout, res, slErr)
 		for _, p := range res.Problems {
 			fmt.Println("  PROBLEM:", p)
 		}
@@ -148,4 +161,23 @@ func cmdMongoVerify(args []string) error {
 		return exitCode(2)
 	}
 	return nil
+}
+
+// printMongoSyslog prints the syslog part of a verification of the MongoDB copy: the syslog
+// collection against the ledger's syslog_chunk and syslog_prune records and, when the syslog
+// store could be read (storeErr nil), against the chunks it keeps.
+func printMongoSyslog(w io.Writer, res mongostore.VerifyResult, storeErr error) {
+	fmt.Fprintf(w, "  syslog: %s; %s compared with their syslog_chunk records (each line, its SHA-256 and the message count), %d not matching\n",
+		plural(res.SyslogDocs, "document", "documents"), plural(res.SyslogChunks, "chunk", "chunks"), res.SyslogBad)
+	fmt.Fprintf(w, "          %s of chunks a syslog_prune record deleted, %d of chunks no syslog_chunk record names\n",
+		plural(res.SyslogPruned, "document", "documents"), res.SyslogForged)
+	if storeErr != nil {
+		fmt.Fprintf(w, "          chunks the syslog store keeps but the copy lacks: not checked, the store cannot be read (%v)\n", storeErr)
+		return
+	}
+	fmt.Fprintf(w, "          %s the syslog store keeps but the copy lacks\n", plural(res.SyslogMissing, "chunk", "chunks"))
+	if res.SyslogTrimmed > 0 {
+		fmt.Fprintf(w, "          %s the syslog store keeps whose documents the copy's size limit (syslog.keep_mb) deleted, oldest first\n",
+			plural(res.SyslogTrimmed, "older chunk", "older chunks"))
+	}
 }

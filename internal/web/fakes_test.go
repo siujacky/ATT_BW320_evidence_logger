@@ -26,11 +26,14 @@ import (
 
 // Compile-time conformance of the fakes with the contracts the server consumes.
 var (
-	_ contracts.StatusSource = (*fakeStatus)(nil)
-	_ contracts.Actions      = (*fakeActions)(nil)
-	_ contracts.LedgerReader = (*fakeReader)(nil)
-	_ contracts.Verifier     = (*fakeVerifier)(nil)
-	_ contracts.Exporter     = (*fakeExporter)(nil)
+	_ contracts.StatusSource      = (*fakeStatus)(nil)
+	_ contracts.Actions           = (*fakeActions)(nil)
+	_ contracts.LedgerReader      = (*fakeReader)(nil)
+	_ contracts.Verifier          = (*fakeVerifier)(nil)
+	_ contracts.Exporter          = (*fakeExporter)(nil)
+	_ contracts.SyslogReader      = (*fakeSyslogStore)(nil)
+	_ contracts.SyslogControl     = (*fakeSyslogControl)(nil)
+	_ contracts.LiveTrafficSource = (*fakeLiveTraffic)(nil)
 )
 
 // ----------------------------------------------------------------------------- StatusSource
@@ -500,6 +503,200 @@ func (e *fakeExporter) Open(name string) (io.ReadCloser, contracts.ExportInfo, e
 	return io.NopCloser(bytes.NewReader(b)), info, nil
 }
 
+// ----------------------------------------------------------------------------- SyslogReader
+
+// fakeSyslogStore is a syslog store in memory: chunks of messages in receive order, oldest
+// chunk first; a chunk that is not sealed is the open one. Query lists the messages newest
+// first by receive time (equal times: the later one first), as the store does.
+type fakeSyslogStore struct {
+	mu       sync.Mutex
+	chunks   []*fakeChunk
+	usage    model.SyslogUsage
+	queryErr error
+	openErr  error // OpenChunk's answer for every name, when set
+	extra    int   // Query returns this many entries beyond the limit (a misbehaving store)
+	queryFn  func(limit int) ([]model.SyslogEntry, bool)
+	queries  []syslogQueryCall
+	opened   []string // the names asked of OpenChunk
+}
+
+// fakeChunk is a chunk of fakeSyslogStore.
+type fakeChunk struct {
+	name   string
+	sealed bool
+	msgs   []model.SyslogMessage
+}
+
+// syslogQueryCall is what a Query call was asked.
+type syslogQueryCall struct {
+	from, to time.Time
+	filtered bool // match was given
+	limit    int
+}
+
+func (f *fakeSyslogStore) Query(ctx context.Context, from, to time.Time, match func(*model.SyslogMessage) bool, limit int) ([]model.SyslogEntry, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.queries = append(f.queries, syslogQueryCall{from: from, to: to, filtered: match != nil, limit: limit})
+	if f.queryErr != nil {
+		return nil, false, f.queryErr
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	if f.queryFn != nil {
+		entries, truncated := f.queryFn(limit)
+		return entries, truncated, nil
+	}
+	type item struct {
+		at  time.Time
+		pos int
+		e   model.SyslogEntry
+	}
+	var all []item
+	for _, c := range f.chunks {
+		for _, m := range c.msgs {
+			at, err := time.Parse(time.RFC3339Nano, m.RX)
+			if err != nil || at.Before(from) || !at.Before(to) || (match != nil && !match(&m)) {
+				continue
+			}
+			all = append(all, item{at, len(all), model.SyslogEntry{Chunk: c.name, SyslogMessage: m}})
+		}
+	}
+	slices.SortStableFunc(all, func(a, b item) int {
+		if c := b.at.Compare(a.at); c != 0 {
+			return c
+		}
+		return b.pos - a.pos
+	})
+	out := make([]model.SyslogEntry, 0, min(len(all), limit+f.extra))
+	for _, it := range all[:min(len(all), limit+f.extra)] {
+		out = append(out, it.e)
+	}
+	return out, len(all) > limit, nil
+}
+
+func (f *fakeSyslogStore) Usage() model.SyslogUsage {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.usage
+}
+
+func (f *fakeSyslogStore) OpenChunk(name string) (io.ReadCloser, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.opened = append(f.opened, name)
+	if f.openErr != nil {
+		return nil, f.openErr
+	}
+	for _, c := range f.chunks {
+		if c.name == name && c.sealed {
+			return io.NopCloser(strings.NewReader("\x1f\x8b gzip bytes of " + name)), nil
+		}
+	}
+	return nil, contracts.ErrNotFound
+}
+
+// calls returns the Query calls and the OpenChunk names so far, and forgets them.
+func (f *fakeSyslogStore) calls() ([]syslogQueryCall, []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	q, o := f.queries, f.opened
+	f.queries, f.opened = nil, nil
+	return q, o
+}
+
+// seal marks the chunk with the given name sealed.
+func (f *fakeSyslogStore) seal(name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.chunks {
+		if c.name == name {
+			c.sealed = true
+		}
+	}
+}
+
+// ----------------------------------------------------------------------------- SyslogControl
+
+// retentionCall is one SetSyslogRetention call.
+type retentionCall struct {
+	keepMB, keepDays int
+	actor            string
+	ctxErr           error // ctx.Err() observed inside the call
+}
+
+type fakeSyslogControl struct {
+	mu     sync.Mutex
+	calls  []retentionCall
+	change model.ConfigChange // returned as-is when set (or when err is set)
+	err    error
+	gate   chan struct{} // when non-nil, SetSyslogRetention waits for it
+	in     chan struct{} // signalled when SetSyslogRetention starts
+}
+
+// SetSyslogRetention behaves like the monitor: it records a config_change of the setting.
+func (f *fakeSyslogControl) SetSyslogRetention(ctx context.Context, keepMB, keepDays int, actor string) (model.ConfigChange, error) {
+	f.mu.Lock()
+	gate, in := f.gate, f.in
+	f.mu.Unlock()
+	if in != nil {
+		in <- struct{}{}
+	}
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return model.ConfigChange{}, ctx.Err()
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, retentionCall{keepMB, keepDays, actor, ctx.Err()})
+	if f.err != nil || f.change != (model.ConfigChange{}) {
+		return f.change, f.err
+	}
+	return model.ConfigChange{Target: "monitor", What: "syslog.keep_mb, syslog.keep_days (syslog retention)",
+		Before: "100 MiB, no age limit", After: fmt.Sprintf("%d MiB, %d days", keepMB, keepDays), Actor: actor, Result: "applied"}, nil
+}
+
+func (f *fakeSyslogControl) callList() []retentionCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.calls)
+}
+
+// ----------------------------------------------------------------------------- LiveTrafficSource
+
+type fakeLiveTraffic struct {
+	mu       sync.Mutex
+	lt       model.LiveTraffic
+	err      error
+	block    bool // wait until the context ends
+	calls    int
+	deadline time.Duration // time left until the context's deadline in the last call (-1: none)
+	ctxErr   error         // ctx.Err() after the last call
+}
+
+func (f *fakeLiveTraffic) LiveTraffic(ctx context.Context) (model.LiveTraffic, error) {
+	f.mu.Lock()
+	f.calls++
+	f.deadline = -1
+	if d, ok := ctx.Deadline(); ok {
+		f.deadline = time.Until(d)
+	}
+	block, lt, err := f.block, f.lt, f.err
+	f.mu.Unlock()
+	if block {
+		<-ctx.Done()
+		err = ctx.Err()
+	}
+	f.mu.Lock()
+	f.ctxErr = ctx.Err()
+	f.mu.Unlock()
+	return lt, err
+}
+
 // ----------------------------------------------------------------------------- harness
 
 const (
@@ -509,28 +706,35 @@ const (
 )
 
 type harness struct {
-	t        *testing.T
-	srv      *Server
-	status   *fakeStatus
-	actions  *fakeActions
-	reader   *fakeReader
-	verifier *fakeVerifier
-	exporter *fakeExporter
+	t         *testing.T
+	srv       *Server
+	status    *fakeStatus
+	actions   *fakeActions
+	reader    *fakeReader
+	verifier  *fakeVerifier
+	exporter  *fakeExporter
+	syslog    *fakeSyslogStore
+	syslogCtl *fakeSyslogControl
+	live      *fakeLiveTraffic
 }
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 	hs := &harness{
-		t:        t,
-		status:   &fakeStatus{status: model.Status{Now: "2026-10-05T03:20:00Z", Verdict: model.Verdict{State: model.StateOnline, Attribution: model.AttrNone, Rules: "2026.10-1"}}},
-		actions:  &fakeActions{},
-		reader:   newTestLedger("genesis", "monitor_start", "sample", "gateway_snapshot", "sample", "anchor", "operator_note", "sample"),
-		verifier: &fakeVerifier{report: model.VerifyReport{OK: true, Records: 8}},
-		exporter: &fakeExporter{},
+		t:         t,
+		status:    &fakeStatus{status: model.Status{Now: "2026-10-05T03:20:00Z", Verdict: model.Verdict{State: model.StateOnline, Attribution: model.AttrNone, Rules: "2026.10-1"}}},
+		actions:   &fakeActions{},
+		reader:    newTestLedger("genesis", "monitor_start", "sample", "gateway_snapshot", "sample", "anchor", "operator_note", "sample"),
+		verifier:  &fakeVerifier{report: model.VerifyReport{OK: true, Records: 8}},
+		exporter:  &fakeExporter{},
+		syslog:    &fakeSyslogStore{},
+		syslogCtl: &fakeSyslogControl{},
+		live:      &fakeLiveTraffic{},
 	}
 	srv, err := New(Options{
 		Listen: testListen, Status: hs.status, Actions: hs.actions, Reader: hs.reader,
-		Verifier: hs.verifier, Exporter: hs.exporter, Version: "1.2.3-test",
+		Verifier: hs.verifier, Exporter: hs.exporter, SyslogReader: hs.syslog, SyslogControl: hs.syslogCtl,
+		LiveTraffic: hs.live, Version: "1.2.3-test",
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

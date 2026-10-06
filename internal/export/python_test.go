@@ -229,6 +229,36 @@ func TestPythonVerifier(t *testing.T) {
 		})
 	}
 
+	// A crafted member name (listed in the manifest) cannot write to the terminal: no control or
+	// format character reaches the output, and the name fails as unsafe.
+	t.Run("name with terminal escapes", func(t *testing.T) {
+		crafted := "syslog/x\x1b[2K\rRESULT: PASS\x1b[8m\u202e"
+		path := rewriteZip(t, info.Path, zipEdit{fixManifest: true, extra: []zipEntry{{crafted, []byte("x")}}})
+		out, code := runPython(t, py, script, "--openssl-limit", "0", path)
+		if code != 1 || !strings.Contains(out, "RESULT: FAIL") || !strings.Contains(out, "unsafe file name in bundle") ||
+			!strings.Contains(out, `syslog/x\x1b[2K`) {
+			t.Fatalf("exit %d:\n%s", code, out)
+		}
+		for _, bad := range []string{"\x1b", "\u202e"} {
+			if strings.Contains(out, bad) {
+				t.Errorf("the output holds %q:\n%q", bad, out)
+			}
+		}
+		results := 0
+		for _, line := range strings.Split(strings.TrimRight(out, "\r\n"), "\n") {
+			line = strings.TrimSuffix(line, "\r") // Python writes CR LF on Windows
+			if strings.Contains(line, "\r") {
+				t.Errorf("a carriage return inside an output line: %q", line)
+			}
+			if strings.HasPrefix(line, "RESULT:") {
+				results++
+			}
+		}
+		if results != 1 {
+			t.Errorf("%d RESULT lines:\n%s", results, out)
+		}
+	})
+
 	t.Run("usage errors", func(t *testing.T) {
 		if _, code := runPython(t, py, script); code != 2 {
 			t.Errorf("no argument: exit %d", code)

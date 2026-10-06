@@ -609,26 +609,54 @@ func (m *Monitor) enforceNotificationOff() bool {
 	return m.cfg.Gateway.EnforceNotificationOff
 }
 
-// notificationLoop checks the gateway's outage-redirect setting at startup and every
-// NotificationCheckInterval (authenticated requests: never more often than notifMinInterval).
+// notificationLoop checks the gateway's settings - the outage-redirect setting, then the Syslog
+// setting - at startup and every NotificationCheckInterval (authenticated requests: never more
+// often than notifMinInterval). When this computer's address toward the gateway changes
+// (kickAddressChange) the check runs again within minutes: once notifMinInterval has passed
+// since this run's latest check - after a failed one, once its back-off (notifRetryAfter) has -
+// and never before the startup check, which reads the current settings anyway.
 func (m *Monitor) notificationLoop(ctx context.Context) {
 	next := time.Now().Add(m.notificationStartDelay())
+	var (
+		last    time.Time // when this run's latest check ended (zero: none yet)
+		lastErr error
+		recheck bool // an address change asked for the next check
+	)
 	for {
-		if !sleepUntil(ctx, next, nil) {
+		if !sleepUntil(ctx, next, m.kNotif.ch) {
 			return
+		}
+		if hasReason(m.kNotif.take(), kickAddressChange) && !last.IsZero() {
+			recheck = true
+			early := last.Add(m.notifMinInterval)
+			if lastErr != nil {
+				early = last.Add(m.notifRetryAfter(lastErr))
+			}
+			if early.Before(next) {
+				next = early
+			}
+		}
+		if time.Now().Before(next) {
+			continue // woken early: wait for the (possibly earlier) check time
 		}
 		interval := max(m.set.notifInterval, m.notifMinInterval)
 		if !m.hasAccessCode() {
-			next = time.Now().Add(interval)
+			next, recheck = time.Now().Add(interval), false
 			continue
 		}
+		why := ""
+		if recheck {
+			why = "again after this computer's address toward the gateway changed"
+		}
+		recheck = false
 		var err error
-		m.safely("notification", func() { err = m.checkNotification(ctx) })
+		m.safely("notification", func() { err = m.checkSettings(ctx, why) })
 		if ctx.Err() != nil {
 			return
 		}
 		// Persist the check time now: a restart (even after a crash) must honour the floor.
 		m.writeCache()
+		last, lastErr = time.Now(), err
 		if err != nil {
 			interval = m.notifRetryAfter(err) // retry later, but never sooner than the floor
 		}
@@ -678,10 +706,17 @@ func (m *Monitor) notificationStartDelay() time.Duration {
 	return min(max(wait, 0), m.notifMinInterval)
 }
 
-// checkNotification reads the bbevent setting, records it on first observation or change, and
-// turns it off when EnforceNotificationOff is set. It holds notifMu so that an operator's
-// SetGatewayNotification cannot interleave with the read-then-enforce sequence.
-func (m *Monitor) checkNotification(ctx context.Context) error {
+// checkNotification is the regular settings check (checkSettings).
+func (m *Monitor) checkNotification(ctx context.Context) error { return m.checkSettings(ctx, "") }
+
+// checkSettings checks the gateway's settings: the outage-redirect setting (readNotification)
+// and, after a successful read of it and in the same login session, the Syslog setting
+// (checkSyslogSetting, read only). The returned error is the notification check's: it sets the
+// loop's back-off. A failed read of the Syslog page waits for the next check (Status.Syslog says
+// why), so that it never adds logins. why (may be "") says what asked for the check. It holds
+// notifMu so that an operator's SetGatewayNotification cannot interleave with the
+// read-then-enforce sequence.
+func (m *Monitor) checkSettings(ctx context.Context, why string) error {
 	m.notifMu.Lock()
 	defer m.notifMu.Unlock()
 	if pending := m.pendingCert(); pending != "" {
@@ -692,13 +727,30 @@ func (m *Monitor) checkNotification(ctx context.Context) error {
 				ns.Enabled, ns.Seq, ns.CheckedAt = p.Enabled, p.Seq, p.CheckedAt
 			}
 			m.st.notif = &ns
+			m.st.syslogErr = "the gateway's Syslog setting was not checked: " + errText(err)
 		})
 		return err
 	}
+	read, err := m.readNotification(ctx)
+	switch {
+	case ctx.Err() != nil:
+	case read:
+		m.checkSyslogSetting(ctx, why)
+	default:
+		m.locked(func() {
+			m.st.syslogErr = "the gateway's Syslog setting was not checked: the notification setting, read first in the same login session, could not be read: " + errText(err)
+		})
+	}
+	return err
+}
+
+// readNotification reads the bbevent setting, records it on first observation or change, and
+// turns it off when EnforceNotificationOff is set. read reports whether the setting could be
+// read (err may still report a failure after that). Caller holds notifMu.
+func (m *Monitor) readNotification(ctx context.Context) (read bool, err error) {
 	var (
 		enabled bool
 		raw     []byte
-		err     error
 	)
 	m.withGatewayAuth(func() {
 		nctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
@@ -706,7 +758,7 @@ func (m *Monitor) checkNotification(ctx context.Context) error {
 		enabled, raw, err = m.gw.Notification(nctx)
 	})
 	if ctx.Err() != nil {
-		return ctx.Err()
+		return false, ctx.Err()
 	}
 	now := m.now()
 	if err != nil {
@@ -726,7 +778,7 @@ func (m *Monitor) checkNotification(ctx context.Context) error {
 			m.st.notifNoCode = errText(err)
 		}
 		m.mu.Unlock()
-		return err
+		return false, err
 	}
 	if rec, n, since := m.notifFailLog.ok(); rec {
 		m.log.Info("the gateway notification setting can be read again", "failures", n, "since", since)
@@ -757,7 +809,7 @@ func (m *Monitor) checkNotification(ctx context.Context) error {
 			ev.Before = onOff(prev.Enabled)
 		}
 		if err := record(ev); err != nil {
-			return err
+			return true, err
 		}
 	case !now.Before(recAt.Add(notifConfirmEvery)):
 		// Daily evidence that the setting stayed as recorded (before == after).
@@ -765,7 +817,7 @@ func (m *Monitor) checkNotification(ctx context.Context) error {
 			Detail: fmt.Sprintf("confirmed unchanged: Broadband Status Notification (bbevent) is still %s, as recorded in #%d (read from the gateway's events page; when on, the gateway redirects web browsing to AT&T pages while the WAN is down)",
 				onOff(enabled), prev.Seq)}
 		if err := record(ev); err != nil {
-			return err
+			return true, err
 		}
 	default:
 		m.mu.Lock()
@@ -774,9 +826,9 @@ func (m *Monitor) checkNotification(ctx context.Context) error {
 	}
 	if enabled && m.enforceNotificationOff() {
 		_, err := m.setNotification(ctx, false, "monitor (enforce_notification_off)", nil)
-		return err
+		return true, err
 	}
-	return nil
+	return true, nil
 }
 
 // setNotification changes the gateway setting and records a config_change with the pages

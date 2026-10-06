@@ -1,7 +1,8 @@
 // Package syslogrx receives the gateway's syslog messages (docs/syslog-snmp-traffic.md §3.2): a
 // UDP listener (RFC 5426 transport, port 514 by default) that keeps every datagram from an
 // allowed sender exactly as it arrived, with the time it was read and its sender, until the
-// monitor drains it into a signed syslog record of the evidence ledger.
+// monitor drains it into the syslog store (internal/syslogstore), whose sealed chunks the
+// evidence ledger's syslog_chunk records prove.
 //
 // # Trust
 //
@@ -21,11 +22,16 @@
 // Datagrams from other senders are counted as rejected and never kept (the log names the
 // sender, never the content). From the allowed senders, a datagram larger than
 // Options.MaxMessage (8 KiB), one beyond Options.MaxPerMinute (2,000) in a minute of receive
-// time (UTC calendar minutes, so the records show the cap per minute of their rx times), and one
-// that arrives while Options.MaxPending messages wait to be drained are counted as dropped and
-// not kept. Drain hands both counts over with the messages, so every record says what it lacks.
-// Log entries about these events and about receive errors are rate-limited (one a minute per
-// kind, with the number held back), so a flood cannot fill the event log either.
+// time (UTC calendar minutes, so the records show the cap per minute of their rx times), one
+// whose message would take the minute's messages beyond Options.MaxBytesPerMinute (1 MiB) as
+// the syslog store writes them (JSON lines, in which a control character takes six bytes), and
+// one that arrives while Options.MaxPending messages wait to be drained are counted as dropped
+// and not kept. The byte cap bounds what an allowed sender - or anyone forging its address -
+// can make the store keep, and so the chunks the store seals and the ledger records for them
+// (about one a minute by size at most). Drain hands both counts over with the messages, so the
+// syslog_chunk record of the chunk that takes them says what it lacks. Log entries about these
+// events and about receive errors are rate-limited (one a minute per kind, with the number held
+// back), so a flood cannot fill the event log either.
 //
 // # Messages
 //
@@ -40,7 +46,8 @@
 //	                  "Mmm dd hh:mm:ss" (some devices add a year or a fraction of a second) or
 //	                  ISO 8601 ("2026-10-05T21:30:01Z"); without HOSTNAME when the first word
 //	                  ends like a TAG ("name:" or "name[pid]:")
-//	Format "unknown"  anything else: Msg is the text after a valid PRI, or the whole text
+//	Format "unknown"  anything else: Msg is the text after a valid PRI, or the whole text (left
+//	                  empty when that is exactly Raw, so the datagram is not stored twice)
 //
 // TS is the timestamp as written, App the APP-NAME or the TAG, Msg the message without trailing
 // CR, LF and NUL characters. Control characters are kept (escaping them is the display's job).

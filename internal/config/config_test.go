@@ -117,6 +117,7 @@ func TestSyslogConfig(t *testing.T) {
 		"target":       func(s *SyslogConfig) { s.Port = 70000 },
 		"allow":        func(s *SyslogConfig) { s.Allow = []string{"not-an-ip"} },
 		"flush":        func(s *SyslogConfig) { s.FlushInterval = D(0) },
+		"flushlong":    func(s *SyslogConfig) { s.FlushInterval = D(6 * time.Minute) },
 		"maxperminute": func(s *SyslogConfig) { s.MaxPerMinute = 0 },
 		"keepmb0":      func(s *SyslogConfig) { s.KeepMB = 0 },
 		"keepmbhuge":   func(s *SyslogConfig) { s.KeepMB = MaxSyslogKeepMB + 1 },

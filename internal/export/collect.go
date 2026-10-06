@@ -59,6 +59,10 @@ type collector struct {
 
 	agg aggregator
 
+	// syslog holds the usable syslog_chunk records, in ledger order: the exporter puts their
+	// chunks into the bundle (copySyslogChunks). The report does not use them.
+	syslog []syslogRec
+
 	// range of the record times of the bundle (for the local time zone record)
 	minTS, maxTS time.Time
 
@@ -240,6 +244,9 @@ func (c *collector) line(raw []byte, complete bool) {
 		}
 	}
 	c.aggregate(env, body, ts, tsOK)
+	if body.Type == model.TypeSyslogChunk {
+		c.syslogChunk(body)
+	}
 }
 
 // checkChain verifies genesis, segment_open linkage and seq/prev continuity.

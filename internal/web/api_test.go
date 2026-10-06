@@ -64,6 +64,13 @@ func TestStatusEndpoint(t *testing.T) {
 		!strings.Contains(body, `"gateway":{"enabled":false,"levels":["Error","Informational"]},"gateway_at":"2026-10-05T03:00:00Z","gateway_seq":12,"enforce":false,"state":"off"}`) {
 		t.Errorf("syslog status not encoded as the dashboard reads it: %s", body)
 	}
+	// The syslog store's volume and limits (static/app.js syslogStorePanel).
+	hs.status.status.Syslog.Store = &model.SyslogUsage{Bytes: 39_007_846, Chunks: 412, Messages: 98_765, OpenMessages: 12,
+		Oldest: "2026-10-01T04:15:00.5Z", Newest: "2026-10-05T03:19:58.5Z", KeepMB: 100, KeepDays: 30}
+	if body := hs.get("/api/status").Body.String(); !strings.Contains(body, `"store":{"bytes":39007846,"chunks":412,"messages":98765,"open_messages":12,`+
+		`"oldest":"2026-10-01T04:15:00.5Z","newest":"2026-10-05T03:19:58.5Z","keep_mb":100,"keep_days":30}`) {
+		t.Errorf("syslog store not encoded as the dashboard reads it: %s", body)
+	}
 
 	none := newHarness(t)
 	none.srv.status = nil
@@ -1050,6 +1057,8 @@ func TestJSONShapes(t *testing.T) {
 	decode[IncidentDetail](t, hs.get("/api/incidents/INC-20261005-030000Z"))
 	decode[[]RecordView](t, hs.get("/api/records?limit=2"))
 	decode[model.SyslogList](t, hs.get("/api/syslog"))
+	decode[model.ConfigChange](t, hs.post("/api/syslog/retention", `{"keep_mb":100,"keep_days":7}`))
+	decode[model.LiveTraffic](t, hs.get("/api/traffic/live"))
 	decode[model.VerifyReport](t, hs.post("/api/verify", ""))
 	decode[contracts.ExportInfo](t, hs.post("/api/exports", `{"incident_id":"INC-1"}`))
 	decode[[]contracts.ExportInfo](t, hs.get("/api/exports"))

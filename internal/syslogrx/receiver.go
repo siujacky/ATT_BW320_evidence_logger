@@ -2,6 +2,7 @@ package syslogrx
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -23,6 +24,11 @@ const (
 	DefaultListen       = ":514"
 	DefaultMaxPerMinute = 2000
 	DefaultMaxMessage   = 8 << 10
+	// DefaultMaxBytesPerMinute: the stored lines of a minute's messages (Options.MaxBytesPerMinute)
+	// fill at most one chunk of the syslog store (1 MiB), so the store seals - and the ledger
+	// records - at most about one chunk a minute by size, whatever the datagrams hold. 2,000 of
+	// the gateway's usual messages (a few hundred bytes each as stored) fit.
+	DefaultMaxBytesPerMinute = 1 << 20
 )
 
 const (
@@ -62,6 +68,11 @@ type Options struct {
 	Allowed []netip.Addr
 	// MaxPerMinute caps the messages kept per minute of receive time (default 2000).
 	MaxPerMinute int
+	// MaxBytesPerMinute caps the size of the messages kept per minute of receive time as the
+	// syslog store writes them - each one's json.Marshal line and its line feed - (default
+	// DefaultMaxBytesPerMinute). Escaped control characters make a datagram's line up to about
+	// twelve times its size, so MaxPerMinute alone does not bound what is stored.
+	MaxBytesPerMinute int
 	// MaxMessage is the largest datagram kept, in bytes (default 8192, at most 65527).
 	MaxMessage int
 	// MaxPending caps the messages kept between two Drain calls (default 4 × MaxPerMinute).
@@ -87,14 +98,16 @@ type Receiver struct {
 	pending   []model.SyslogMessage
 	dropped   int       // since the last Drain
 	rejected  int       // since the last Drain
-	minute    time.Time // the minute of receive time that inMinute counts …
-	inMinute  int       // … the messages kept in
-	gates     logGates
+	minute    time.Time // the minute of receive time that inMinute and bytesInMinute count …
+	inMinute  int       // … the messages kept in, and …
+	// bytesInMinute … their size as stored (storedSize).
+	bytesInMinute int
+	gates         logGates
 }
 
 // logGates rate-limit the log entries that a flood or a failing socket would repeat.
 type logGates struct {
-	rejected, tooLarge, overCap, full, transient, failing, panicked gate
+	rejected, tooLarge, overCap, overBytes, full, transient, failing, panicked gate
 }
 
 // New validates o and returns a Receiver. It does not bind the socket (Run does).
@@ -108,6 +121,8 @@ func New(o Options) (*Receiver, error) {
 	switch {
 	case o.MaxPerMinute < 0:
 		return nil, errors.New("syslogrx: MaxPerMinute must not be negative")
+	case o.MaxBytesPerMinute < 0:
+		return nil, errors.New("syslogrx: MaxBytesPerMinute must not be negative")
 	case o.MaxMessage < 0 || o.MaxMessage > maxDatagram:
 		return nil, fmt.Errorf("syslogrx: MaxMessage must be 0 (the default) to %d bytes", maxDatagram)
 	case o.MaxPending < 0:
@@ -115,6 +130,9 @@ func New(o Options) (*Receiver, error) {
 	}
 	if o.MaxPerMinute == 0 {
 		o.MaxPerMinute = DefaultMaxPerMinute
+	}
+	if o.MaxBytesPerMinute == 0 {
+		o.MaxBytesPerMinute = DefaultMaxBytesPerMinute
 	}
 	if o.MaxMessage == 0 {
 		o.MaxMessage = DefaultMaxMessage
@@ -265,6 +283,7 @@ const (
 	rejected            // the sender is not allowed
 	tooLarge            // larger than MaxMessage
 	overCap             // beyond MaxPerMinute in its minute
+	overBytes           // beyond MaxBytesPerMinute in its minute
 	pendingFull         // MaxPending messages wait to be drained
 )
 
@@ -282,7 +301,15 @@ func (r *Receiver) accept(b []byte, from netip.AddrPort) {
 	m, panicked := parseSafe(b)
 	m.RX = now.UTC().Format(time.RFC3339Nano)
 	m.Src = formatSrc(from)
+	size := storedSize(&m)
 	r.mu.Lock()
+	if oc, logIt, held = r.admitBytes(size, now); oc != kept {
+		r.mu.Unlock()
+		if logIt {
+			r.logDiscard(oc, from, len(b), held)
+		}
+		return
+	}
 	r.pending = append(r.pending, m)
 	if panicked != "" {
 		logIt, held = r.gates.panicked.allow(now)
@@ -292,6 +319,16 @@ func (r *Receiver) accept(b []byte, from netip.AddrPort) {
 		r.log.Error("syslog receiver: parsing a datagram failed; it is kept with its exact bytes only",
 			"from", m.Src, "panic", panicked, "suppressed", held)
 	}
+}
+
+// storedSize is the size of m as the syslog store writes it: its json.Marshal line and a line
+// feed.
+func storedSize(m *model.SyslogMessage) int {
+	b, err := json.Marshal(m)
+	if err != nil { // not for a message of strings and numbers
+		return 0
+	}
+	return len(b) + 1
 }
 
 // admit decides what becomes of a datagram of n bytes received at now and counts it; a kept
@@ -309,7 +346,7 @@ func (r *Receiver) admit(n int, allowed bool, now time.Time) (oc outcome, logIt 
 		oc, g = tooLarge, &r.gates.tooLarge
 	default:
 		if minute := now.Truncate(time.Minute); !minute.Equal(r.minute) {
-			r.minute, r.inMinute = minute, 0
+			r.minute, r.inMinute, r.bytesInMinute = minute, 0, 0
 		}
 		switch {
 		case r.inMinute >= r.o.MaxPerMinute:
@@ -325,6 +362,21 @@ func (r *Receiver) admit(n int, allowed bool, now time.Time) (oc outcome, logIt 
 	}
 	logIt, held = g.allow(now)
 	return oc, logIt, held
+}
+
+// admitBytes decides whether a message that admit kept at now, and that takes size bytes as
+// stored, fits the minute admit counted it in (one goroutine receives: the minute is still the
+// same), and counts it: one beyond MaxBytesPerMinute is dropped and no longer counts against
+// MaxPerMinute. Caller holds mu.
+func (r *Receiver) admitBytes(size int, now time.Time) (oc outcome, logIt bool, held int) {
+	if size > r.o.MaxBytesPerMinute-r.bytesInMinute {
+		r.dropped++
+		r.inMinute--
+		logIt, held = r.gates.overBytes.allow(now)
+		return overBytes, logIt, held
+	}
+	r.bytesInMinute += size
+	return kept, false, 0
 }
 
 // formatSrc formats a datagram's sender as "ip:port" ("[ip]:port" for IPv6), an IPv4 address
@@ -345,6 +397,9 @@ func (r *Receiver) logDiscard(oc outcome, from netip.AddrPort, n, held int) {
 	case overCap:
 		r.log.Warn("syslog receiver: more messages in this minute than the limit; counted as dropped, not kept",
 			"limit", r.o.MaxPerMinute, "suppressed", held)
+	case overBytes:
+		r.log.Warn("syslog receiver: the messages of this minute would take more space than the limit; counted as dropped, not kept",
+			"from", formatSrc(from), "bytes", n, "limit_bytes", r.o.MaxBytesPerMinute, "suppressed", held)
 	case pendingFull:
 		r.log.Warn("syslog receiver: too many messages wait to be recorded; counted as dropped, not kept",
 			"limit", r.o.MaxPending, "suppressed", held)

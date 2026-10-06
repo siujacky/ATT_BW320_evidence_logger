@@ -63,6 +63,9 @@ type stateCache struct {
 	// LastClock: the latest clock check with an SNTP answer (a step of this computer's clock
 	// between two runs is measured against it; CLOCK_OFFSET is shown from it).
 	LastClock *clockRef `json:"last_clock,omitempty"`
+	// SyslogSetting: the gateway's Syslog setting as last read and recorded (absent in caches
+	// written before it existed, which no syslog_setting record precedes).
+	SyslogSetting *syslogGwRead `json:"syslog_setting,omitempty"`
 }
 
 // clockRef is a recorded clock check that got an SNTP answer: its seq, ts, the median offset of
@@ -146,6 +149,7 @@ type rebuildState struct {
 	restarts        []restartInfo
 	alarms          map[string]alarmMark
 	lastClock       *clockRef
+	syslogGw        *syslogGwRead // the newest gateway_event syslog_setting
 	points          *pointStore
 	records         int
 	// The limits of the traffic history: the monitor's gap limit and pcSpanLimit.
@@ -174,6 +178,7 @@ func (rb *rebuildState) fromCache(c *stateCache) {
 		rb.alarms = map[string]alarmMark{}
 	}
 	rb.lastClock = c.LastClock
+	rb.syslogGw = c.SyslogSetting
 }
 
 // addRestart remembers a restart from a reboot event (in ledger order).
@@ -283,6 +288,8 @@ func (rb *rebuildState) apply(body model.Body) {
 					}
 				}
 			}
+		case ev.Kind == model.GwEvSyslogSetting:
+			rb.syslogGw = syslogReadFromEvent(ev, body.Seq, body.TS)
 		}
 	case model.TypeClockCheck:
 		var cc model.ClockCheck
@@ -374,9 +381,9 @@ func (rb *rebuildState) collectPoint(body model.Body) {
 }
 
 // rebuild restores incidents, custody facts, the latest snapshots, anchor and notification
-// state, and 7 days of samples, optical readings and traffic from the ledger
-// (docs/PACKAGES.md "internal/monitor"). Failures are logged: the monitor still starts, with
-// whatever could be read.
+// state, the gateway's Syslog setting as last recorded, and 7 days of samples, optical readings
+// and traffic from the ledger (docs/PACKAGES.md "internal/monitor"). Failures are logged: the
+// monitor still starts, with whatever could be read.
 func (m *Monitor) rebuild(now time.Time) {
 	if m.reader == nil {
 		m.log.Warn("no ledger reader: monitor state not rebuilt")
@@ -470,6 +477,7 @@ func (m *Monitor) rebuild(now time.Time) {
 		}
 	}
 	m.st.prevRunClock, m.st.lastClockRef = rb.lastClock, rb.lastClock
+	m.st.syslogGw = rb.syslogGw
 	nPts, nInc := len(rb.points.pts), len(rb.incidents)
 	m.mu.Unlock()
 	m.log.Info("monitor state rebuilt from the ledger", "from_seq", from, "cache", cached, "records_scanned", rb.records,
@@ -603,6 +611,7 @@ func (m *Monitor) cacheSnapshot(fp string) (stateCache, uint64) {
 		}
 		c.Alarms = maps.Clone(m.st.alarms)
 		c.LastClock = m.st.lastClockRef
+		c.SyslogSetting = m.st.syslogGw
 	})
 	return c, gen
 }

@@ -28,7 +28,7 @@ var (
 	ErrClosed = errors.New("mongostore: replicator closed")
 	// ErrIntegrity is wrapped by errors that report a disagreement between the MongoDB copy and
 	// the ledger: a different record at the same seq (never overwritten), a database holding a
-	// copy of another ledger (refused), records or blobs that could not be copied.
+	// copy of another ledger (refused), records, blobs or syslog chunks that could not be copied.
 	ErrIntegrity = errors.New("mongostore: the MongoDB copy disagrees with the ledger")
 )
 
@@ -86,6 +86,11 @@ type Options struct {
 	ConnectTimeout time.Duration // connecting and server selection (default 3s)
 	Logger         *slog.Logger
 	Now            func() time.Time
+
+	// Syslog is the syslog store (nil: no syslog collection). The messages of every chunk that a
+	// copied syslog_chunk record sealed are copied into the syslog collection, and deleted again
+	// when a copied syslog_prune record deletes the chunk (package comment, "Syslog messages").
+	Syslog contracts.SyslogReader
 }
 
 // Replicator copies the ledger into MongoDB. All methods are safe for concurrent use.
@@ -120,6 +125,10 @@ type Replicator struct {
 	passProblems  int    // integrity problems found in the current pass
 	passLast      string // the last of them
 	passBlobFails int    // blobs that could not be read from the ledger in the current pass
+
+	// sys is how far the syslog collection follows the ledger (nil without Options.Syslog).
+	// Guarded by sem.
+	sys *syslogState
 
 	mu sync.Mutex
 	st replState
@@ -162,6 +171,14 @@ type replState struct {
 	health         logGate
 	integrityGate  logGate
 	pendingGate    logGate
+	// The syslog collection: its documents, why its copy waits ("" when it does not), and the last
+	// problem (kept until the whole collection has been checked again without one).
+	syslogDocs        int64
+	syslogErr         string
+	syslogProblem     string
+	syslogGate        logGate
+	syslogProblemGate logGate
+	syslogSkipGate    logGate
 }
 
 // unreachableError marks a failure to reach MongoDB.
@@ -218,14 +235,18 @@ func New(o Options) (*Replicator, error) {
 	if o.Now == nil {
 		o.Now = time.Now
 	}
-	return &Replicator{
+	r := &Replicator{
 		o:         o,
 		log:       o.Logger.With("component", "mongostore"),
 		shown:     RedactURI(o.URI),
 		opTimeout: max(minOpTimeout, 10*o.ConnectTimeout),
 		done:      make(chan struct{}),
 		sem:       make(chan struct{}, 1),
-	}, nil
+	}
+	if o.Syslog != nil {
+		r.sys = &syslogState{savedSeq: -2}
+	}
+	return r, nil
 }
 
 // Run synchronizes until ctx is done (or Close), then returns nil. It never gives up because
@@ -279,6 +300,7 @@ func (r *Replicator) Status() model.MongoStatus {
 		HasData:   r.st.hasData,
 		Records:   r.st.records,
 		Blobs:     r.st.blobs,
+		Syslog:    r.st.syslogDocs,
 	}
 	if r.st.headKnown && r.st.resumeKnown {
 		switch {
@@ -304,8 +326,22 @@ func (r *Replicator) Status() model.MongoStatus {
 	if r.st.pending > 0 {
 		parts = append(parts, fmt.Sprintf("%d blob(s) could not be read from the ledger yet and are read again on later passes (%s)", r.st.pending, r.st.pendingErr))
 	}
+	for _, p := range []string{r.st.syslogErr, r.st.syslogProblem} {
+		if p != "" {
+			parts = append(parts, p)
+		}
+	}
 	s.LastError = strings.Join(parts, "; ")
 	return s
+}
+
+// SyslogDocuments returns the number of documents in the syslog collection as last counted
+// (approximate, at most every 30 s; 0 without Options.Syslog), as Status().Syslog. It does not
+// contact MongoDB.
+func (r *Replicator) SyslogDocuments() int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.st.syslogDocs
 }
 
 // Close stops Run and further passes, and disconnects. It waits for a running pass until ctx is
@@ -394,7 +430,9 @@ func (r *Replicator) syncLocked(ctx context.Context) (copied int, completed bool
 		}
 		r.log.Warn("MongoDB copy changed behind the replicator's back; validating it again", "database", r.o.Database, "why", rs.why)
 	}
-	r.refreshCountsLocked(ctx, copied > 0)
+	// The syslog collection follows the records just copied; it never fails the pass.
+	sysChanged := r.followSyslogLocked(ctx)
+	r.refreshCountsLocked(ctx, copied > 0 || sysChanged)
 	return copied, true, r.passErr()
 }
 
@@ -586,6 +624,9 @@ func (r *Replicator) copyChangedLocked(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if r.sys != nil {
+		r.sys.noteCollection(colls[collSyslog]) // its own state: no reason to validate the copy
+	}
 	if name := changedCollection(r.colls, colls); name != "" {
 		return fmt.Sprintf("the %s collection was dropped or replaced", name), nil
 	}
@@ -663,11 +704,19 @@ func (r *Replicator) opCtx(ctx context.Context) (context.Context, context.Cancel
 	return context.WithTimeout(ctx, r.opTimeout)
 }
 
-// ensureCollectionsLocked creates the collections of the copy and the indexes of records where
-// they are missing, and returns the UUIDs of the collections.
+// ensureCollectionsLocked creates the collections of the copy and the indexes of records (and of
+// syslog) where they are missing, and returns the UUIDs of the collections.
 func (r *Replicator) ensureCollectionsLocked(ctx context.Context) (collIDs, error) {
 	if err := r.ensureIndexesLocked(ctx); err != nil { // creates records
 		return nil, err
+	}
+	if r.sys != nil {
+		r.sys.indexes = false
+		if err := r.ensureSyslogLocked(ctx); err != nil { // creates syslog
+			// The syslog copy waits (it tries again after the records of the pass); the copy of
+			// the records does not.
+			r.syslogWaiting(syslogWaitText(err))
+		}
 	}
 	ids, err := r.collectionIDsLocked(ctx)
 	if err != nil {
@@ -693,13 +742,17 @@ func (r *Replicator) ensureCollectionsLocked(ctx context.Context) (collIDs, erro
 	return ids, nil
 }
 
-// collectionIDsLocked returns the UUIDs of the copy's collections that exist.
+// collectionIDsLocked returns the UUIDs of the copy's collections that exist (and of the syslog
+// collection, with Options.Syslog).
 func (r *Replicator) collectionIDsLocked(ctx context.Context) (collIDs, error) {
 	opCtx, cancel := r.opCtx(ctx)
 	defer cancel()
-	names := make(bson.A, len(copyCollections))
-	for i, n := range copyCollections {
-		names[i] = n
+	names := make(bson.A, 0, len(copyCollections)+1)
+	for _, n := range copyCollections {
+		names = append(names, n)
+	}
+	if r.sys != nil {
+		names = append(names, collSyslog)
 	}
 	specs, err := r.client.Database(r.o.Database).ListCollectionSpecifications(opCtx,
 		bson.D{{Key: "name", Value: bson.D{{Key: "$in", Value: names}}}})
@@ -708,13 +761,18 @@ func (r *Replicator) collectionIDsLocked(ctx context.Context) (collIDs, error) {
 	}
 	ids := collIDs{}
 	for _, s := range specs {
-		id := "none" // a view, or a server without collection UUIDs
-		if s.UUID != nil && s.Type != "view" {
-			id = hex.EncodeToString(s.UUID.Data)
-		}
-		ids[s.Name] = id
+		ids[s.Name] = specID(s)
 	}
 	return ids, nil
+}
+
+// specID returns the UUID (hex) of a collection ("none" for a view, or on a server without
+// collection UUIDs).
+func specID(s mongo.CollectionSpecification) string {
+	if s.UUID != nil && s.Type != "view" {
+		return hex.EncodeToString(s.UUID.Data)
+	}
+	return "none"
 }
 
 // changedCollection returns the first copy collection that recorded names and that has another
@@ -837,6 +895,7 @@ func (r *Replicator) resumeLocked(ctx context.Context) error {
 		r.meta = metaState{}
 		r.clearPending()
 		r.setResume(0, false)
+		r.loadSyslog(nil)
 		return nil
 	}
 	ls, ok := rawInt64(meta, "last_seq")
@@ -849,6 +908,7 @@ func (r *Replicator) resumeLocked(ctx context.Context) error {
 		r.clearPending()
 		r.setResume(0, false) // nothing copied yet
 		r.loadMarkers(meta)
+		r.loadSyslog(meta)
 		return nil
 	}
 	why, stored, err := r.checkResume(ctx, uint64(ls), lh)
@@ -863,6 +923,7 @@ func (r *Replicator) resumeLocked(ctx context.Context) error {
 	r.setTail(uint64(ls), stored)
 	r.loadPending(meta)
 	r.loadMarkers(meta)
+	r.loadSyslog(meta)
 	return nil
 }
 
@@ -938,9 +999,13 @@ func conflictMsg(seq uint64, stored, ledgerH string) string {
 // the next pass re-check the whole copy from seq 0.
 func (r *Replicator) resetMetaLocked(ctx context.Context, old bson.Raw, why string) error {
 	r.integrity(why + "; re-checking the whole copy from seq 0")
+	if r.sys != nil {
+		r.sys.restart(r.colls[collSyslog]) // the syslog records are applied again too
+	}
 	d := bson.D{{Key: "_id", Value: metaID}}
 	d = append(d, r.metaProgress(-1, "", r.o.Now())...)
 	d = append(d, r.metaMarkers()...)
+	d = append(d, r.metaSyslog()...)
 	d = append(d, bson.E{Key: "reset_reason", Value: why})
 	if old != nil && len(old) <= maxPreviousMetaBytes {
 		if prev := withoutKey(old, "previous"); prev != nil {
@@ -956,6 +1021,7 @@ func (r *Replicator) resetMetaLocked(ctx context.Context, old bson.Raw, why stri
 	r.markersDirty = false
 	r.clearPending()
 	r.setResume(0, false)
+	r.syslogSaved()
 	return nil
 }
 
@@ -1194,6 +1260,9 @@ func (r *Replicator) flushLocked(ctx context.Context, batch []item, advance bool
 	}
 	if !advance {
 		return ins.inserted, nil
+	}
+	if r.sys != nil {
+		r.sys.feed(batch) // applied to the syslog collection after the records of the pass
 	}
 	last := batch[len(batch)-1]
 	if err := r.saveMetaLocked(ctx, last, now); err != nil {
@@ -1831,6 +1900,7 @@ func (r *Replicator) saveMetaLocked(ctx context.Context, last item, now time.Tim
 		doc := bson.D{{Key: "_id", Value: metaID}}
 		doc = append(doc, r.metaProgress(seq, last.env.H, now)...)
 		doc = append(doc, r.metaMarkers()...)
+		doc = append(doc, r.metaSyslog()...)
 		if len(r.pending) > 0 {
 			doc = append(doc, bson.E{Key: "pending_blobs", Value: r.pendingDoc()})
 		}
@@ -1843,6 +1913,7 @@ func (r *Replicator) saveMetaLocked(ctx context.Context, last item, now time.Tim
 		}
 		r.meta = metaState{present: true, seq: seq, hash: last.env.H}
 		r.markersDirty = false
+		r.syslogSaved()
 		return nil
 	}
 	if seq <= r.meta.seq {
@@ -1855,6 +1926,7 @@ func (r *Replicator) saveMetaLocked(ctx context.Context, last item, now time.Tim
 	case !r.o.StoreBlobs:
 		set = append(set, bson.E{Key: "store_blobs", Value: false}) // new blobs are stored without content
 	}
+	set = append(set, r.metaSyslog()...)
 	res, err := r.coll(collMeta).UpdateOne(opCtx, r.metaFilter(), r.metaUpdate(set))
 	if err != nil {
 		return fmt.Errorf("save the replication state: %w", err)
@@ -1864,6 +1936,7 @@ func (r *Replicator) saveMetaLocked(ctx context.Context, last item, now time.Tim
 	}
 	r.meta.seq, r.meta.hash = seq, last.env.H
 	r.markersDirty = false
+	r.syslogSaved()
 	return nil
 }
 
@@ -1924,6 +1997,11 @@ func (r *Replicator) refreshCountsLocked(ctx context.Context, force bool) {
 	defer cancel()
 	records, err1 := r.coll(collRecords).EstimatedDocumentCount(cctx)
 	blobs, err2 := r.coll(collBlobs).EstimatedDocumentCount(cctx)
+	syslogDocs, syslogOK := int64(0), false
+	if r.sys != nil {
+		n, err := r.coll(collSyslog).EstimatedDocumentCount(cctx)
+		syslogDocs, syslogOK = n, err == nil
+	}
 	r.countsAt = now
 	r.mu.Lock()
 	if err1 == nil {
@@ -1931,6 +2009,9 @@ func (r *Replicator) refreshCountsLocked(ctx context.Context, force bool) {
 	}
 	if err2 == nil {
 		r.st.blobs = blobs
+	}
+	if syslogOK {
+		r.st.syslogDocs = syslogDocs
 	}
 	r.mu.Unlock()
 }

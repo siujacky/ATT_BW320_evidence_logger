@@ -108,15 +108,18 @@ var parseCases = []parseCase{
 	{"version 0", "<13>0 - - - - - - msg", FormatUnknown, 13, "", "", "", "0 - - - - - - msg"},
 	{"two spaces in the header", "<13>1  - - - - - msg", FormatUnknown, 13, "", "", "", "1  - - - - - msg"},
 
-	// No PRI, or one that is not valid.
-	{"no PRI", "Use the BFG!", FormatUnknown, -1, "", "", "", "Use the BFG!"},
-	{"PRI out of range", "<192>Oct 11 22:14:15 host app: x", FormatUnknown, -1, "", "", "", "<192>Oct 11 22:14:15 host app: x"},
-	{"PRI of four digits", "<0013>Oct 11 22:14:15 host app: x", FormatUnknown, -1, "", "", "", "<0013>Oct 11 22:14:15 host app: x"},
-	{"empty PRI", "<>Oct 11 22:14:15 host app: x", FormatUnknown, -1, "", "", "", "<>Oct 11 22:14:15 host app: x"},
-	{"PRI not closed", "<13", FormatUnknown, -1, "", "", "", "<13"},
-	{"negative PRI", "<-1>x", FormatUnknown, -1, "", "", "", "<-1>x"},
-	{"PRI with a space", "< 13>x", FormatUnknown, -1, "", "", "", "< 13>x"},
-	{"byte-order mark before the PRI", bom + "<13>x", FormatUnknown, -1, "", "", "", bom + "<13>x"},
+	// No PRI, or one that is not valid: the message is the whole text, which Raw holds already
+	// unless line ends were cut off (Msg is not a second copy of the datagram).
+	{"no PRI", "Use the BFG!", FormatUnknown, -1, "", "", "", ""},
+	{"no PRI, line end", "Use the BFG!\r\n", FormatUnknown, -1, "", "", "", "Use the BFG!"},
+	{"PRI out of range", "<192>Oct 11 22:14:15 host app: x", FormatUnknown, -1, "", "", "", ""},
+	{"PRI of four digits", "<0013>Oct 11 22:14:15 host app: x", FormatUnknown, -1, "", "", "", ""},
+	{"empty PRI", "<>Oct 11 22:14:15 host app: x", FormatUnknown, -1, "", "", "", ""},
+	{"PRI not closed", "<13", FormatUnknown, -1, "", "", "", ""},
+	{"negative PRI", "<-1>x", FormatUnknown, -1, "", "", "", ""},
+	{"PRI with a space", "< 13>x", FormatUnknown, -1, "", "", "", ""},
+	{"byte-order mark before the PRI", bom + "<13>x", FormatUnknown, -1, "", "", "", ""},
+	{"control characters without a PRI", strings.Repeat("\x01", 64), FormatUnknown, -1, "", "", "", ""},
 	{"PRI 0", "<0>Oct 11 22:14:15 host app: x", FormatRFC3164, 0, "Oct 11 22:14:15", "host", "app", "x"},
 	{"PRI 191", "<191>Oct 11 22:14:15 host app: x", FormatRFC3164, 191, "Oct 11 22:14:15", "host", "app", "x"},
 	{"PRI with a leading zero", "<013>Oct 11 22:14:15 host app: x", FormatRFC3164, 13, "Oct 11 22:14:15", "host", "app", "x"},

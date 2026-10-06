@@ -24,6 +24,11 @@ const (
 	// CLOCK_OFFSET (warning, critical beyond 5 min): the latest clock check found this computer's
 	// clock off against the internet time servers, and every record time comes from that clock.
 	condClockOffset = "CLOCK_OFFSET"
+	// SYSLOG_RECEIVER_DOWN (warning): syslog is enabled but the receiver does not listen (the
+	// port is in use, ...): the gateway's log messages are not received.
+	condSyslogReceiverDown = "SYSLOG_RECEIVER_DOWN"
+	// SYSLOG_STORE_FAILING (warning): the syslog store fails, so received messages may be lost.
+	condSyslogStoreFailing = "SYSLOG_STORE_FAILING"
 )
 
 // An SNTP offset (median of the answers of the latest clock check that got any) beyond

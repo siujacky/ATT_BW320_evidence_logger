@@ -2,12 +2,9 @@ package model
 
 // Syslog: the gateway's own log messages, received on this computer (docs/syslog-snmp-traffic.md).
 
-// TypeSyslog / SyslogBatch: DEPRECATED (the first phase-1 design kept the messages in the
-// ledger, which can never delete anything). Messages now live in the syslog store, within a size
-// limit, and the ledger holds a syslog_chunk record per sealed chunk; removed once unused.
-const TypeSyslog = "syslog"
-
-// Ledger records of the syslog store (docs/syslog-snmp-traffic.md §3.2).
+// Ledger records of the syslog store (docs/syslog-snmp-traffic.md §3.2). The messages themselves
+// are not in the ledger, which can never delete anything: they live in the syslog store, within a
+// size limit, and the ledger states what every sealed chunk held and when it was deleted.
 const (
 	// TypeSyslogChunk: a chunk of received messages was sealed; it states the chunk's SHA-256.
 	TypeSyslogChunk = "syslog_chunk"
@@ -51,16 +48,6 @@ type SyslogMessage struct {
 	Host     string `json:"host,omitempty"`
 	App      string `json:"app,omitempty"` // RFC 5424 APP-NAME or RFC 3164 TAG
 	Msg      string `json:"msg,omitempty"` // the message part
-}
-
-// SyslogBatch (DEPRECATED, see TypeSyslog) held the messages received from From to To.
-type SyslogBatch struct {
-	From     string          `json:"from"`
-	To       string          `json:"to"`
-	Received int             `json:"received"` // accepted from the allowed senders in the window
-	Dropped  int             `json:"dropped"`  // accepted but over the per-minute cap: not recorded
-	Rejected int             `json:"rejected"` // datagrams from other senders: not recorded
-	Messages []SyslogMessage `json:"messages"`
 }
 
 // SyslogStatus is Status.Syslog: the receiver and the gateway's Syslog setting.
@@ -202,7 +189,7 @@ type LivePoint struct {
 	PCTx  *float64 `json:"pc_tx_mbps,omitempty"`
 }
 
-// SyslogList is returned by GET /api/syslog: the messages of the recorded syslog batches in
+// SyslogList is returned by GET /api/syslog: the messages of the syslog store received in
 // [From, To) that match the filters, newest first.
 type SyslogList struct {
 	From      string        `json:"from"`

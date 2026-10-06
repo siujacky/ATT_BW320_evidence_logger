@@ -207,8 +207,16 @@ func verifyBundleLine(ctx context.Context, path string) string {
 	if !rep.OK {
 		return fmt.Sprintf("FAILED: %d problem(s), first: %s", rep.FailuresTotal, firstFailure(rep))
 	}
-	return fmt.Sprintf("verified OK — %d records, hash chain and Ed25519 signatures intact, report re-computed from the records, %d trusted RFC 3161 time-stamp(s), key %s",
-		rep.Records, trusted, ledger.FormatFingerprint(rep.Fingerprint))
+	sc, err := export.VerifySyslogChunks(path)
+	if err != nil {
+		return "FAILED (syslog chunks): " + err.Error()
+	}
+	chunks := ""
+	if sc.Files > 0 {
+		chunks = fmt.Sprintf(", %d syslog chunk(s) matching their ledger records", sc.Files)
+	}
+	return fmt.Sprintf("verified OK — %d records, hash chain and Ed25519 signatures intact, report re-computed from the records, %d trusted RFC 3161 time-stamp(s)%s, key %s",
+		rep.Records, trusted, chunks, ledger.FormatFingerprint(rep.Fingerprint))
 }
 
 func firstFailure(rep model.VerifyReport) string {

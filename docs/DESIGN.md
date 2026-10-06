@@ -20,6 +20,10 @@ problems are on the provider's side**, with a complete chain of custody:
   changes, operator notes and evidence exports are all ledger records.
 * A **localhost web dashboard** (http://127.0.0.1:8320) shows live status, history,
   incidents, evidence integrity, and builds verifiable evidence bundles.
+* *Supporting evidence* (§18): the household's traffic from the gateway's own counters (an
+  MRTG-style chart and a live flow meter; the gateway offers no SNMP) and the gateway's own syslog
+  messages, kept outside the ledger within a size limit, with the SHA-256 of every chunk of them
+  and every deletion recorded in the ledger.
 
 ## 2. Ground truth about this gateway (observed 2026-10-05, firmware 6.34.7)
 
@@ -72,9 +76,14 @@ problems are on the provider's side**, with a complete chain of custody:
   0.1 dBm**. At setup time: Rx Power −315 (−31.5 dBm) with **Low Alarm = 1 (threshold −295)**
   and **Low Warning = 1 (threshold −292)** — the gateway itself flags the received optical
   level as below spec. This is provider-side evidence and must be prominent.
-* `logs` is the firewall drop log (not a system event log). Diagnostics > Syslog forwards only
-  those *firewall* messages (per the gateway's own help text), so it is not used: it carries no
-  WAN/PON events.
+* `logs` is the firewall drop log (not a system event log). Diagnostics > Syslog (`syslog.ha`,
+  behind the login; controls *Syslog* on/off, *Server IP Address*, *Server Port*, *Log Level*) sends
+  the gateway's log to a syslog server. Earlier notes said it forwards only the firewall messages;
+  which messages this firmware sends is learnt from what arrives once it is set (§18). The page has
+  not been captured yet: the reader is tested on synthetic pages (testdata/gateway/README.md).
+* **No SNMP**: UDP 161 answers "port unreachable" to a read-only SNMP query and none of the 49 pages
+  of the site map has an SNMP setting (AT&T manages the gateway over TR-069). Traffic comes from the
+  `broadbandstatistics` IPv4 counters instead (§18).
 * Pages may be Latin-1 (copyright byte 0xA9). Never assume valid UTF-8; store raw bytes.
 
 ## 3. Threat model and what the evidence proves
@@ -121,6 +130,8 @@ internal/export        evidence bundle (zip) + HTML report; bundle verification
 internal/winsvc        Windows service runner/installer, event log, power events
 internal/ticket        AT&T service-ticket report (HTML, printed to PDF by Edge/Chrome)
 internal/mongostore    MongoDB copy of the ledger + its verifier (§17)
+internal/syslogrx      syslog receiver: UDP, sender filter, size/rate caps, RFC 3164/5424 parsing (§18)
+internal/syslogstore   syslog store: chunk files within syslog.keep_mb / keep_days (§18)
 tools/verify_bundle.py standalone third-party verifier (Python 3 stdlib + optional extras)
 ```
 
@@ -149,6 +160,14 @@ exports/                          evidence bundles produced on request
 quarantine/                       bytes removed during crash recovery (never deleted)
 state/                            caches (incident index, series) — NOT evidence, rebuildable
 logs/service.log                  operational log (rotated) — NOT evidence
+syslog/                           the syslog store (§18), the only evidence that is ever deleted
+                                  (within syslog.keep_mb / keep_days, every deletion recorded):
+syslog/open-<from>.jsonl          the open chunk: one model.SyslogMessage JSON line per message
+syslog/open-<from>.state.json     its dropped/rejected counts
+syslog/syslog-<from>_<to>.jsonl.gz       a sealed chunk (gzip of the open chunk's exact bytes)
+syslog/syslog-<from>_<to>.jsonl.gz.json  its sidecar: an index (its syslog_chunk payload and, once
+                                  recorded, the seq of that record), rebuilt from the chunk when
+                                  missing — NOT evidence
 ```
 ACL (set by `install`): SYSTEM and Administrators full control, Users read & execute — except
 `keys\`, which is SYSTEM + Administrators only (re-asserted at every service start). Machine-scope
@@ -242,7 +261,7 @@ after the newest trusted time-stamp cannot be proven false by any time-stamp (st
 | `sample` | every fast cycle (10 s) | probe results + verdict (§9) |
 | `state_change` | verdict state/cause changes | from, to, at, reasons |
 | `gateway_snapshot` | gateway poll (60 s; 15 s during incidents) | page captures (status, timing, sha256, stored?, TLS cert), parsed sysinfo/broadband/fiber, derived |
-| `gateway_event` | derived transitions; plus a daily `notification_setting` confirmation (before == after, "confirmed unchanged") as evidence the redirect stayed OFF | kind (reboot, firmware_change, wan_ip_change, broadband_state, pon_state, optical_alarm, optical_link_change, counters_reset, cert_pinned, cert_changed, gateway_clock, notification_setting), before/after, evidence |
+| `gateway_event` | derived transitions; plus a daily `notification_setting` confirmation (before == after, "confirmed unchanged") as evidence the redirect stayed OFF; plus a `syslog_setting` for every read of the gateway's Syslog page (§18, housekeeping) | kind (reboot, firmware_change, wan_ip_change, broadband_state, pon_state, optical_alarm, optical_link_change, counters_reset, cert_pinned, cert_changed, gateway_clock, notification_setting, syslog_setting), before/after, evidence (the page read, as a blob) |
 | `service_check` | DNS + HTTP checks (60 s; 15 s during incidents) | DNS results (gateway/ISP/public resolvers, hijack detection; a failed query is retried once, so a resolver can have two results), HTTP results (TLS leaf hash) |
 | `local_link` | at start, on change, every 10 min, at incident open, and re-recorded (unchanged) during incidents or while Wi-Fi is down before the previous record goes stale | interface, type (wifi/ethernet), SSID, BSSID, signal %, RSSI, channel, rates, raw blob |
 | `traceroute` | incident open, every 5 min during, close | target, hops |
@@ -250,7 +269,9 @@ after the newest trusted time-stamp cannot be proven false by any time-stamp (st
 | `clock_jump` | wall vs monotonic divergence > 2 s between cycles; also between runs (first answered SNTP check vs the previous run's last, `between_runs`) | wall delta, mono delta, detail |
 | `incident_open` / `incident_update` / `incident_close` | §10 | incident struct |
 | `anchor` | §11 | TSA url/name, head seq/hash, token sha256 (blob), genTime, serial, policy |
-| `config_change` | gateway or monitor configuration changed | what, before, after, actor, evidence blobs |
+| `config_change` | gateway or monitor configuration changed (incl. the syslog retention, §18) | what, before, after, actor, evidence blobs |
+| `syslog_chunk` | the syslog store sealed a chunk (§18) | `model.SyslogChunk`: name, from/to (receive times of its first and last message), messages, dropped, rejected, bytes and sha256 of the uncompressed content, gz_bytes, reason (size, age, stop, recovered) |
+| `syslog_prune` | the retention limits deleted chunks (§18) | `model.SyslogPrune`: reason ("keep_mb N", "keep_days N" or both), keep_mb, keep_days, deleted [{name, sha256, from, to, messages, gz_bytes}], kept_bytes, kept_chunks |
 | `power_event` | suspend/resume/shutdown notifications | kind |
 | `custody_export` | evidence bundle produced | range, file name, bundle sha256, manifest sha256, prepared_by, notes |
 | `operator_note` | user note (e.g. AT&T ticket number) | text, author |
@@ -291,6 +312,16 @@ radio/rates/state) or, for Ethernet, the default-route adapter name/link speed/s
 
 Clock: SNTP to time.windows.com, time.google.com, pool.ntp.org at start and hourly; the
 gateway's own clock (sysinfo Current Date/Time, local zone) is also compared each snapshot.
+
+Syslog and traffic (§18): the receiver listens all the time; every `syslog.flush_interval` (30 s)
+what it received goes into the syslog store; a chunk is sealed at 1 MiB, at the first flush 5
+minutes after it was opened and at shutdown (each a `syslog_chunk` record), and the store is pruned
+after every seal, at start, on a retention change and, with `keep_days`, at least hourly (each
+deletion a `syslog_prune` record). The gateway's Syslog page is read (authenticated) in the daily
+settings check right after the notification setting, in the same login session, and again when
+this computer's address toward the gateway changes (at most every 10 min). Traffic rates come from
+the counters of the recorded snapshots; the dashboard's flow meter reads `broadbandstatistics` on
+demand only (at most every 5 s whoever asks, unrecorded).
 
 ## 9. Classification rules (normative, `RulesVersion = "2026.10-4"`)
 
@@ -361,8 +392,11 @@ paused until the operator confirms the new certificate), `NO_ACCESS_CODE` (info:
 setting cannot be checked), `ANCHOR_UNTRUSTED` (warning: the newest time-stamps could not be
 chain-verified, so they do not count as proof of time), `EGRESS_NOT_VIA_GATEWAY` (warning: traffic
 bypasses the gateway), `LEDGER_WRITE_FAILING` (critical: records are being refused — the service exits
-so Windows restarts it), `DISK_SPACE_LOW` (warning < 2 GiB, critical < 512 MiB) and `CLOCK_OFFSET`
-(warning > 60 s, critical > 5 min SNTP offset). Optical alarm conditions date from their first report.
+so Windows restarts it), `DISK_SPACE_LOW` (warning < 2 GiB, critical < 512 MiB), `CLOCK_OFFSET`
+(warning > 60 s, critical > 5 min SNTP offset), `SYSLOG_RECEIVER_DOWN` (warning: the syslog receiver
+cannot listen, e.g. another program uses UDP 514) and `SYSLOG_STORE_FAILING` (warning: the syslog
+store fails). Optical alarm conditions date from their first report. Syslog and the flow meter never
+change a verdict (§18).
 
 ## 10. Incidents
 
@@ -459,6 +493,9 @@ Static assets are embedded (`embed.FS`), no external URLs (the UI must work duri
 | POST `/api/gateway/notification` | `{enabled:false}` → set gateway setting (config_change) |
 | POST `/api/gateway/trust-cert` | `{sha256?}` operator confirms the changed gateway TLS certificate they reviewed (refused if a different one is pending); config_change; resumes authenticated operations |
 | POST `/api/anchor` | anchor now |
+| GET `/api/syslog?from=&to=&q=&severity=&limit=` | `model.SyslogList`: the syslog store's messages received in [from, to) (default the 24 h before to; at most 31 days), newest first; q: text in the raw datagram, message, app or host (ignoring case, ≤ 200 characters); severity: 0-7 or a name, keeps that level and the more severe ones; limit 200 (≤ 5000); the list also ends before the message that would take its JSON beyond 16 MiB (`MaxSyslogAnswerBytes`; a control character is a six-byte escape); `truncated` when more matched. Each entry names its `chunk` ("" = the open chunk) and `seq`, the chunk's `syslog_chunk` record (0 while open or not found) |
+| POST `/api/syslog/retention` | `{keep_mb, keep_days?, client?}`, the whole setting (keep_days absent = 0, no age limit) → `SetSyslogRetention` (§18); answers the `model.ConfigChange` |
+| GET `/api/traffic/live` | `model.LiveTraffic`: the flow meter (§18): the newest WAN rates from an on-demand read of the gateway's counters (at most every 5 s whoever asks), this computer's rates and about 15 minutes of history; never recorded |
 
 API details (as implemented): `/api/records` adds `hash_ok` (h == SHA-256(b)) per record, an
 `X-ATT-Monitor-Warning` header for gaps / repeated or out-of-order seqs / hash mismatches among the
@@ -469,13 +506,45 @@ the change but it could not be recorded. Single-flight operations answer 409; co
 ErrRateLimited / ErrUnavailable map to 409 / 429 / 503. Bodies with unpaired UTF-16 surrogate escapes
 are rejected (operator text is recorded exactly as sent or not at all).
 
+Syslog and traffic (as implemented): `/api/syslog` finds each chunk's `syslog_chunk` record with
+bounded ledger scans (records found are cached; a record counts only if its time range covers the
+messages) and reports records whose `h` is not SHA-256(`b`) or whose data does not parse in
+`X-ATT-Monitor-Warning`. The scans read windows from the oldest message listed from each sealed
+chunk to 15 minutes after its newest, joined when less than 2 hours apart into windows of at most
+12 hours, newest first, at most 16 scans and 50,000 records per request: when that budget runs out,
+the messages left without their record are older than those of the windows read in full (the
+newest), and the next request, with the records found remembered, looks further back.
+`/api/syslog/retention` validates the limits (400), runs one change at a time (409) detached from
+the request (2 min), and answers a failure with `{error, change}`: 500
+"applied but could not be recorded" or "in effect, but …" when the limits took effect, 503 when the
+ledger is broken, 504 on a timeout. `/api/traffic/live` has a 10 s deadline tied to the request. A
+feature the monitor does not offer (no syslog store, no retention control, no flow meter) answers 404
+with a JSON error, and the dashboard hides or explains it.
+
+`Status.syslog` (`model.SyslogStatus`): the receiver (enabled, listening, address, error), counters
+since the start (received, stored, dropped, rejected), the newest message, the gateway's Syslog
+setting as last read with its `gateway_event` seq, `state` (ok: the gateway sends to this computer;
+off; elsewhere; unknown; error) with `problem`, and `store` (`model.SyslogUsage`: bytes, chunks,
+messages, open messages, oldest/newest receive time, keep_mb, keep_days). Phase 1 never enforces the
+setting: `enforce` is false and `target` absent. `Series` adds `traffic` (`model.TrafficPoint` per
+bucket: mean and peak WAN download/upload in Mb/s, `at_least`, this computer's rates),
+`traffic_days` (WAN volume per local day, `complete` or not) and `heavy_traffic_mbps` (80, §9).
+
 Dashboard views (hash routes): Overview (status hero with state/cause/attribution and
 reasons; cards Internet / AT&T gateway WAN / Fiber optics (Rx/Tx power vs thresholds and the
-gateway's own alarm flags) / Local link / Evidence integrity; latency chart per target and
-availability strip for 1h/6h/24h/7d; recent incidents), Incidents (list + detail timeline
-with evidence links), Gateway (all parsed fields, DMI table, notification setting), Evidence
-(ledger head, key fingerprint, anchors, verify, exports, notes), Records (raw ledger browser).
-Charts are hand-written inline SVG (no libraries). Light/dark via `prefers-color-scheme`.
+gateway's own alarm flags) / Local link / Evidence integrity / Syslog; the live flow meter (polls
+`/api/traffic/live` every 5 s only while the Overview is shown and the page visible); latency chart
+per target, availability strip, MRTG-style traffic chart with its maximum/average/current legend and
+the daily totals for 1h/6h/24h/7d; recent incidents), Incidents (list + detail timeline with evidence
+links), Gateway (all parsed fields, DMI table, notification setting), Syslog (the gateway's messages
+with search and severity filter, each linked to its chunk's `syslog_chunk` record; a row shows at
+most 500 characters of the text and 100 of the host and the app as shown (an escape counts its
+length), each with at most 16 runs of hidden characters, one element per run, and the exact
+datagram on request; "Load more" doubles the limit up to 5000, and is not offered when an answer
+ended at its size; the store's use and the retention form, which asks first when a change deletes
+messages now and says when the limits saved were already in force), Evidence (ledger head, key
+fingerprint, anchors, verify, exports, notes), Records (raw ledger browser). Charts are
+hand-written inline SVG (no libraries). Light/dark via `prefers-color-scheme`.
 
 ## 13. Evidence bundle, report, verifier
 
@@ -487,6 +556,7 @@ report.json         machine-readable summary + incidents
 ledger/…jsonl       complete daily segments overlapping the range (uncompressed), plus the
                     genesis segment (for the public key) if not already included
 blobs/<id>          every blob referenced by included records (uncompressed exact bytes)
+syslog/<name>       the syslog chunks of the period the syslog store still keeps (exact stored gzip)
 keys/public-key.txt base64 public key + fingerprint
 MANIFEST.sha256     sha256 of every file above
 tools/verify_bundle.py
@@ -530,6 +600,21 @@ Bundles are committed with MoveFileEx without replace: an existing bundle is nev
 segment hashes, blob hashes; Ed25519 signatures when `cryptography` is installed; TSA tokens
 via `openssl ts -verify` when available. `att-monitor verify-bundle <zip>` does all checks.
 
+**Syslog chunks** (§18): a bundle includes, as `syslog/<name>`, the exact stored bytes of every chunk
+named by one of its `syslog_chunk` records whose messages overlap the period, as far as the syslog
+store still keeps it (ledger order, after `blobs/`, listed in MANIFEST.sha256; a chunk the store no
+longer has is left out, one it cannot read is left out with a warning in the log, one whose content
+no longer matches its record is exported as stored, so that verification reports it).
+`export.VerifySyslogChunks` (the `SYSLOG:` line of `att-monitor verify-bundle`, which exits 2 on a
+mismatch) and item 9 of `tools/verify_bundle.py` (version 1.3, the same verdicts) require every
+`syslog/` file to be named by a usable `syslog_chunk` record of the bundle and to gunzip strictly
+(one or more members, nothing after them, bounded output) to content with the record's SHA-256, size
+and line (message) count. Chunks of the period that are not in the bundle are listed, not failed:
+"pruned" when a `syslog_prune` record of the bundle names them, else "absent" (deleted after the
+bundle's records, or unreadable at export); their records still state their SHA-256. REPORT.html,
+report.json, README.txt and keys/public-key.txt do not describe the chunks and are byte-identical with
+or without them (report format unchanged).
+
 ## 14. Windows service and CLI
 
 Service name `ATTMonitor`, display name "AT&T Internet Monitor (evidence logger)",
@@ -540,16 +625,24 @@ Shutdown, PowerEvent (records `power_event`). Event Log source `ATTMonitor`.
 att-monitor setup                                           guided install/update (also run by a double-click):
                                                             asks only for the gateway's Device Access Code
 att-monitor install [--data DIR] [--listen 127.0.0.1:8320]  copy exe to "C:\Program Files\ATT Monitor\",
-                                                            create service + event source + data dir ACL, start
-att-monitor uninstall [--interactive]                       remove service, program, shortcut, Settings entry (data is kept)
+                                                            create service + event source + data dir ACL
+                                                            + syslog firewall rule (§18), start
+att-monitor uninstall [--interactive]                       remove service, program, shortcut, Settings entry,
+                                                            firewall rule (data is kept)
 att-monitor start | stop | status
 att-monitor run [--data DIR]                                foreground (console) mode
 att-monitor service                                         entry point used by the SCM
 att-monitor set-access-code (--file PATH | --stdin)         store DPAPI-encrypted access code
 att-monitor gateway notification [status|on|off]
+att-monitor gateway syslog [status] [--json]                Status.syslog: receiver, store, the gateway's setting
+                                                            (read only in this version; on|off are refused)
 att-monitor gateway trust-cert                              confirm a changed gateway certificate (after AT&T firmware updates)
+att-monitor syslog [--since 24h] [--grep T] [--severity L] [--limit N] [--json]
+                                                            the syslog store's messages (GET /api/syslog), oldest first
+att-monitor syslog retention [--keep-mb N] [--keep-days D] [--yes]
+                                                            show the store's use and limits, or change them
 att-monitor verify [--data DIR]                             verify the full ledger
-att-monitor verify-bundle FILE.zip
+att-monitor verify-bundle FILE.zip                          MANIFEST, REPORT, SYSLOG lines and the ledger verification
 att-monitor export --from YYYY-MM-DD[THH:MM] --to … [--incident ID] [--prepared-by NAME] [--out DIR]
 att-monitor note "text" [--author NAME]
 att-monitor ticket-report [--hours 24] [--out DIR] [customer fields] [--no-pdf]   AT&T service-ticket PDF from a verified bundle
@@ -559,6 +652,19 @@ att-monitor version
 Commands that write to the ledger go through the running service's localhost API; when the
 service is not running they open the ledger directly (the writer lock prevents two writers).
 `password.txt` format: lines `ip:<host>` and `password:<access code>`.
+
+Syslog commands (§18): `syslog` lists through the service only (`/api/syslog` names each chunk's
+record); it prints the newest `--limit` messages of the last `--since` (a duration or `Nd`, at most
+31 days) oldest first, under a heading per chunk naming its `syslog_chunk` record, with control and
+format characters and bytes that are not UTF-8 escaped (`--json` prints the API's answer as it is).
+`syslog retention` shows the use and the limits (from `Status.syslog.store`, or with the service
+stopped from config.json and the store opened read-only); with `--keep-mb` and/or `--keep-days` it
+changes them (a limit left out keeps its value) through `POST /api/syslog/retention`, or with the
+service stopped through `SetSyslogRetention` on the ledger (applied by the service at its start). A
+change that deletes messages now is confirmed first on a console; without one it needs `--yes`.
+`gateway syslog` prints `Status.syslog` and, while the gateway does not send to this computer, how to
+set it by hand. `mongo verify` also prints the syslog part of the verification (§17). The CLI opens the
+syslog store read-only; only the running monitor writes it.
 
 **Guided setup** (`setup`, and a start without arguments from Explorer, detected by the process
 owning its console): without administrator rights it re-starts itself elevated (ShellExecuteEx
@@ -582,6 +688,10 @@ is deleted at the next restart when it is the one running.
 Durations are Go duration strings. Secrets never appear in logs, ledger or exports; the
 config hash recorded in `monitor_start` is computed with secrets removed.
 The `mongo` section configures the MongoDB copy (§17); its URI must not contain credentials.
+The `syslog` section configures the receiver and the store (§18): `enabled` (true), `listen`
+(":514"), `port` (514, what the gateway is to send to), `allow` (further senders), `flush_interval`
+(30s), `max_per_minute` (2000), `keep_mb` (100; 1 to 1,048,576) and `keep_days` (0 = no age limit; at
+most 3650).
 
 ## 16. Engineering rules
 
@@ -648,7 +758,173 @@ can always be rebuilt from the ledger.
   content when it is turned on. Known limit: blob documents deleted one by one (the collection
   kept) are not noticed by the replicator; `mongo verify` reports them, and deleting `meta`
   repairs them.
+* **Syslog.** Given the syslog store (§18), the replicator keeps a collection `syslog`: one document
+  per message line of every sealed chunk (`_id` "<chunk>#<line>", `chunk`, `chunk_seq`, `line`, the
+  exact `raw_line` - which holds the message's text, not stored a second time - and `rx` as a BSON
+  date, `rx_text`, `src`, `severity`, `facility`, `host`, `app` when present; a line that does not
+  decode keeps `raw_line` with `undecoded` and `note`; indexes `{rx:-1}` and `{chunk:1}`). After the
+  records of each pass it applies the copied `syslog_chunk` and `syslog_prune` records strictly in
+  ledger order: a chunk is read from the store and must match its record (size, SHA-256, one
+  LF-terminated line per message) before its documents are written; a prune deletes the chunk's
+  documents. The collection has a size limit of its own, because the store's limit counts gzip bytes
+  and uncompressed documents take far more (tens of times for the gateway's usual lines, hundreds of
+  times for repetitive ones): after a pass that stored documents, and when the limit changes, the
+  documents of the oldest chunks (by name) are deleted while the collection's documents take more
+  than `syslog.keep_mb` MiB as MongoDB counts them (`$collStats` `storageStats.size`, before its own
+  compression; the indexes come on top). The newest chunk is always kept; the chunks stay in the
+  store, so the copy holds the newest messages and the store holds more. Documents are
+  deterministic and never overwritten. A chunk already pruned is skipped (logged); one that does not
+  match is reported; one that cannot be read is retried and after 10 minutes reported and skipped.
+  `meta` adds `syslog_seq` (applied up to), `syslog_collection` (its UUID) and `syslog_trimmed` (the
+  last chunk the size limit deleted); deleting `meta` or dropping the collection re-applies every
+  syslog record. None of this delays or fails the copy of the records. `mongo verify`
+  (`mongostore.VerifyWith` with the store opened read-only) checks that each chunk's documents
+  reproduce its record (lines 1..messages once each, hashing to its SHA-256 and size, every field as
+  the replicator writes it) and reports documents of pruned chunks, documents no `syslog_chunk`
+  record names (forged), chunks the store keeps but the copy lacks (those up to `syslog_trimmed` are
+  only counted), and a syslog collection more than 15 minutes behind.
 * **Configuration.** `mongo {enabled, uri, database, store_blobs, interval}`, enabled by default
   against the local server. The URI must not contain credentials (validation refuses them): the
   configuration is recorded in `monitor_start`/`config_state` and so in evidence bundles. A
   bundle never contains MongoDB data.
+
+## 18. Syslog, retention and traffic
+
+The owner's goals of 2026-10-05 and the plan are in `docs/syslog-snmp-traffic.md`. Phase 1 (this
+section) receives and keeps the gateway's syslog, reads (never changes) the gateway's Syslog setting
+and shows the traffic; phase 2 sets the gateway's Syslog setting automatically. Everything here is
+supporting evidence: `RulesVersion` stays `2026.10-4` and no verdict depends on it.
+
+**Receiver** (`internal/syslogrx`). UDP on `syslog.listen` (":514"). Datagrams are accepted only from
+the gateway's address and `syslog.allow` (an allow list, not authentication: a UDP source address
+can be forged on the home network), at most `max_per_minute` (2000) per UTC minute of receive time,
+8 KiB each, at most 1 MiB of stored lines per UTC minute (the messages' JSON lines as the store
+writes them: escaped control characters make a line up to about twelve times its datagram, so the
+message cap alone does not bound what is stored), and 4 × `max_per_minute` waiting to be stored;
+beyond that they are counted as dropped, and datagrams from other senders as rejected (only the
+sender is logged, never the content). A message keeps the exact datagram (`raw`, or `raw_b64` when it
+is not UTF-8), the sender `ip:port` and the receive time (this computer's clock, RFC 3339 UTC with
+nanoseconds); the RFC 5424 / RFC 3164 fields are parsed as a convenience (`msg` is left out when it
+would be exactly `raw`). The monitor runs the receiver; when it cannot listen it is started again
+after 1 minute, the pause doubling up to 10 minutes (`SYSLOG_RECEIVER_DOWN` meanwhile).
+
+The byte cap bounds what any sender on the home network - forging the gateway's address passes the
+allow list - can make the evidence grow by: the store seals at most about one chunk a minute by
+size, so syslog adds at most about 1,440 `syslog_chunk` records a day and, once the size limit is
+reached, about as many `syslog_prune` records - about 3 MB of ledger a day in the worst case (the
+gateway's usual traffic: a chunk every 5 minutes, well under 1 MB a day).
+
+**Store** (`internal/syslogstore`, `syslog\`, §5). The ledger can never delete anything, so the
+messages are kept here and the ledger holds their proof. Every `flush_interval` (30 s) the monitor
+moves what the receiver received into the store: one `json.Marshal` line per message, each ending in
+a line feed, appended (fsynced) to the open chunk. A chunk is sealed when its content reaches 1 MiB
+(reason `size`), at the first flush at least 5 minutes after it was opened (`age`), at shutdown
+(`stop`), or at the next start when a run left it open (`recovered`): its exact bytes are compressed
+with gzip into `syslog-<from>_<to>.jsonl.gz`, the copy is checked to decompress to the same SHA-256,
+fsynced and renamed into place without replacing anything, and a sidecar index is written. For
+every sealed chunk the monitor appends a `syslog_chunk` record (§7): the SHA-256, size and message
+(line) count of the uncompressed content, the receive times of its first and last message, the
+dropped and rejected counts, the gzip size and the reason. The open chunk is covered by no record
+yet. Every crash point of sealing is repaired at the next start (`Recover`): a partial last line is
+cut off, a leftover open chunk is sealed as `recovered`, a chunk whose gzip was already in place is
+not sealed twice.
+
+**Retention.** After every seal, at start, on a change of the limits and, with an age limit, at
+least hourly, the store deletes whole sealed chunks, oldest first, while the sealed chunks' gzip size
+plus the open chunk's size exceed `syslog.keep_mb` MiB (default 100, 1 to 1,048,576) and, with
+`syslog.keep_days` above 0 (at most 3650), every sealed chunk whose newest message is older than
+that. It never deletes the open chunk. A chunk that a reader holds open (an export, a query, another
+program) is deleted at a later prune; meanwhile it no longer counts against the limit, so no newer
+chunk is deleted in its place. Each deletion is a `syslog_prune` record: the reason ("keep_mb N",
+"keep_days N" or both), the limits, the deleted chunks with their SHA-256, and what is kept. The
+deletion is recorded before it is made: the store chooses the chunks (`PlanPrune`), the monitor
+appends the record, and only then are they deleted (`CommitPrune`); when the ledger refuses the
+record, nothing is deleted and the next flush tries again. A chunk whose file another program holds
+leaves the store at once and its file goes later (should the service stop first, the next start
+finds it as a kept chunk, which a later prune deletes, and records, once more). The ledger therefore
+states which messages existed and when (`syslog_chunk`), and when and why they were deleted
+(`syslog_prune`); a kept chunk verifies against its record.
+
+**Ordering and failures.** Every sealed chunk gets exactly one record, and a chunk's record precedes
+the record of its deletion, whatever fails. The store notes in each chunk's sidecar the seq of its
+`syslog_chunk` record (`MarkRecorded`); a chunk without that note (`Unrecorded`) waits for its record:
+while the ledger refuses records the chunks the store seals by size wait in the store, are recorded
+in order once it takes records again - by the next start at the latest, should the run end first
+(a ledger that reports itself unusable, the restart after 5 minutes of refused records, a crash) -
+and nothing is deleted meanwhile. Nothing is sealed by age or at shutdown while the ledger refuses
+records either, so the open chunk keeps the messages and is sealed as `recovered` by the next start.
+At a start, the chunks found sealed but not noted (one sealed just before a crash, whose record may
+or may not exist; one whose sidecar was rebuilt) are first looked up in the ledger - from a day
+before their first receive time on, by name and SHA-256 - so that none is recorded twice; the others
+are recorded then (late: the record's time-stamp then shows when it was recorded). A chunk a previous
+run left open that the start cannot seal (another program holds its file) is tried again at every
+flush. Store failures show as `SYSLOG_STORE_FAILING` until the next round of store operations
+succeeds (including such a retry). The chunk files are not evidence by themselves (an
+administrator can edit them): the records are. Reading is lenient: a sealed chunk that no longer
+matches its SHA-256 is logged and served as it is, and verification (exports, MongoDB) reports it.
+
+**How much is kept** (`contracts.SyslogControl`, `Monitor.SetSyslogRetention`; the dashboard's Syslog
+page via `POST /api/syslog/retention`, and `att-monitor syslog retention`). Limits outside the ranges
+above are refused. A change is saved (`config.json`), recorded as a `config_change` (target
+`monitor`, what "syslog.keep_mb, syslog.keep_days …", before/after "keep_mb N, keep_days D") and
+applied at once: the store prunes what no longer fits (`syslog_prune`). When the record cannot be
+written the change is undone; setting the limits in force records nothing ("unchanged: already in
+force"); a configuration that cannot be saved applies until the next start (the error is returned
+with the change). With the service stopped the CLI records the change on the ledger and the service
+applies it when it starts. Editing `config.json` takes effect at the next start.
+
+**The gateway's Syslog setting** (phase 1: read only). The daily settings check reads `syslog.ha`
+right after the notification setting, in the same login session, and again when this computer's
+address toward the gateway changes (at most every 10 minutes); also when `syslog.enabled` is false.
+Each read is a `gateway_event` `syslog_setting` with the page as a blob: `after` is "off",
+"on -> <server>:<port>, level <level>", or "unknown" when the page was read but not understood (the
+page is what phase 2 needs). A read that fails is not recorded; `Status.syslog` says why. The state
+compares the setting with this computer's address toward the gateway and `syslog.port`: `ok`,
+`off`, `elsewhere`, `unknown` or `error`. `Gateway.SetSyslog` exists (tested on synthetic pages, it
+never posts a form it does not fully understand) but has no caller. Until phase 2 the owner sets the
+page by hand (README). The setting is read only on that schedule (the check runs at start, within
+`notifMinInterval` = 10 minutes, then daily), so a change made by hand shows in `state` only after
+the next read, while the messages show at once (`received`, `last_at`): the dashboard's card says
+that messages arrived since the read instead of how to set the page.
+
+**Readers.** `GET /api/syslog` reads the open and the sealed chunks overlapping the period, newest
+first with bounded memory (§12); evidence bundles carry the period's chunks (§13); the MongoDB copy
+follows the chunks and prunes (§17). One process writes the store: the running monitor, whose
+ledger lock keeps a second one away. With `syslog.enabled` false the service and, always, the CLI
+open it read-only (a snapshot of the sealed chunks, reading the writer's open chunk as it grows), so
+dashboards, exports and the MongoDB copy still find the chunks kept so far; nothing then deletes
+them. A store that cannot be opened is logged and the service runs without syslog.
+
+**Windows Firewall.** `install` (and `setup`) replace the inbound rule "AT&T Internet Monitor syslog"
+(`netsh advfirewall firewall`, every argument on its own: `dir=in action=allow protocol=UDP
+localport=<port of syslog.listen> remoteip=<gateway.host> program=<installed att-monitor.exe>
+profile=any enable=yes`); with `syslog.enabled` false they remove it, and `uninstall` removes it. A
+failure is reported and the installation goes on. After a change of `gateway.host` or
+`syslog.listen`, install again; senders in `syslog.allow` need their own rule.
+
+**Traffic.** SNMP is not possible (§2). Rates come from the IPv4 Statistics counters
+(`broadbandstatistics`) of consecutive recorded gateway snapshots, at most 5 minutes apart: the byte
+counters are 32 bits wide (a wrap every 4 GiB), and the packet counters tell whether the byte counter
+may have wrapped more than once (`at_least`: the rate is a lower bound); a counter reset (gateway
+restart) leaves the interval unknown. This computer's rates come from the 64-bit octet counters of
+the adapter that reaches the gateway (`GetIfEntry2Ex`, in each local-link reading); the daily volume
+from complete counter deltas. `Series.traffic` holds, per chart bucket, the mean rate and the
+highest interval rate (peak) of each direction, `at_least` and this computer's rates;
+`traffic_days` the volume per local day; `heavy_traffic_mbps` the classifier's threshold (80 Mb/s,
+§9). The dashboard draws them like MRTG: download as a filled area, upload as a line, bits per second
+with automatic units, the peaks marked, the threshold as a dashed line, and the maximum, average and
+current rate of each direction over the range in a legend table.
+
+**Flow meter** (`contracts.LiveTrafficSource`, `Monitor.LiveTraffic`, `GET /api/traffic/live`). An
+unauthenticated read of `broadbandstatistics` on demand, at most one every 5 s after the previous
+read ended, shared by all callers (callers arriving during a read get its outcome); the rates
+against the previous counter reading (a live read, or the newest recorded snapshot) when it is at
+most 2 minutes old; this computer's rates from the newest local-link interval; about 15 minutes of
+history (at most 256 points). Nothing of it is recorded, stored or fed into the monitor's state;
+the dashboard asks only while the Overview is shown and the page visible, so the gateway gets no
+extra request when nobody watches. The evidence comes first: a live read never waits for the
+gateway lock - while a poll, an incident snapshot or the settings check holds it the read is
+skipped (the previous readings come back, with the reason) - it holds the lock for at most 5 s (its
+own timeout, not the gateway timeout), so an evidence snapshot waits at most that long behind it,
+and while the newest recorded snapshot found the gateway unreachable no live read is made at all
+(the next poll that reaches the gateway resumes them).

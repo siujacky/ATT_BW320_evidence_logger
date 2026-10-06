@@ -61,6 +61,13 @@ What is checked:
      describes the ledger records of this bundle and says plainly that its figures were not
      verified; 'att-monitor verify-bundle' recomputes the report from the records and fails if
      any figure differs.
+  9. Syslog chunks (syslog/<name>: the gateway's syslog messages as the monitoring computer's
+     syslog store kept them, gzip, one JSON message per line): each must be named by a
+     syslog_chunk record of this bundle, decompress, and match the SHA-256, size and message
+     (line) count of the uncompressed content that record states. Chunks of the period
+     (report.json) that are not in the bundle are listed in the notes, not failed: deleted by the
+     store's retention limit (a syslog_prune record of this bundle names them) or no longer kept
+     at export; their records still state their SHA-256.
 
 Exit code: 0 = every check that ran passed, 1 = at least one check failed, 2 = usage or I/O error.
 """
@@ -83,9 +90,10 @@ import tempfile
 import time
 import unicodedata
 import zipfile
+import zlib
 from array import array
 
-VERSION = "1.2"
+VERSION = "1.3"
 ZERO_HASH = "0" * 64
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 SEGMENT_RE = re.compile(r"^ledger/(ledger-[0-9]{4}-[0-9]{2}-[0-9]{2})\.jsonl$")
@@ -148,14 +156,37 @@ def one_line(text, limit=400):
     return text if len(text) <= limit else text[:limit] + "..."
 
 
+def terminal_text(text):
+    """text as it may be printed: every control, format or other non-printing character (Unicode
+    category C) is shown as an escape such as \\x1b or \\u202e. Names and values taken from a bundle
+    can therefore not move the cursor, erase or hide lines (a forged "RESULT: PASS") or reorder the
+    output, whatever check prints them."""
+    out = []
+    for ch in str(text):
+        if unicodedata.category(ch)[0] != "C":
+            out.append(ch)
+            continue
+        o = ord(ch)
+        out.append("\\x%02x" % o if o < 0x100 else "\\u%04x" % o if o < 0x10000 else "\\U%08x" % o)
+    return "".join(out)
+
+
 # ---------------------------------------------------------------------------- bundle access
 
 
+# Control, format, private-use and surrogate characters (Unicode category C less the unassigned
+# code points, as the Go verifier's unicode.C): never part of a name att-monitor writes.
+UNSAFE_NAME_CATEGORIES = ("Cc", "Cf", "Co", "Cs")
+
+
 def safe_name(name):
-    """True for a relative, forward-slash path without '..' or drive letters."""
+    """True for a relative, forward-slash path without '..', drive letters, or control, format or
+    other non-printing characters."""
     if not name or "\\" in name or "\x00" in name or name.startswith("/"):
         return False
     if re.match(r"^[A-Za-z]:", name):
+        return False
+    if any(unicodedata.category(ch) in UNSAFE_NAME_CATEGORIES for ch in name):
         return False
     parts = name.split("/")
     return all(p not in ("", ".", "..") for p in parts)
@@ -825,8 +856,9 @@ def _is_int(v):
 
 def check_ledger(src, res, args):
     """Checks the ledger segments (items 2-6). Returns what report.json must describe: the
-    number of lines, the last parsed record (seq, h) and each segment's (sha256, lines)."""
-    facts = {"lines": 0, "last": None, "segments": {}}
+    number of lines, the last parsed record (seq, h) and each segment's (sha256, lines); and the
+    syslog_chunk and syslog_prune records (seq, type, data, where) for item 9."""
+    facts = {"lines": 0, "last": None, "segments": {}, "syslog": []}
     seg_paths = sorted(n for n in src.names if SEGMENT_RE.match(n))
     if not seg_paths:
         res.fail("no ledger segments (ledger/ledger-YYYY-MM-DD.jsonl) in bundle")
@@ -1014,6 +1046,8 @@ def check_ledger(src, res, args):
                 anchors.append((where, seq, adata, rec_idx))
                 if isinstance(adata.get("token_sha256"), str):
                     token_refs.add(adata["token_sha256"])
+            elif typ in ("syslog_chunk", "syslog_prune"):
+                facts["syslog"].append((seq, typ, body.get("data"), where))
             if seq in seq_hash:
                 res.fail("%s: duplicate seq" % where)
             seq_hash[seq] = env["h"]
@@ -1782,6 +1816,284 @@ def check_record_times(res, times, seg_names, trust):
                          "re-run with --openssl-limit -1 to use all of them" % trust["unverified"])
 
 
+# ---------------------------------------------------------------------------- 9. syslog chunks
+
+# The checks of the att-monitor verifier (internal/export syslog.go): the same records are usable
+# and the same chunks count as chunks of the period; chunk files are read as strictly (one or more
+# gzip members and nothing after them), so every file a gzip writer produces, and every damaged or
+# altered one, gets the same verdict.
+
+SYSLOG_DIR = "syslog/"
+MAX_CHUNK_CONTENT = 1 << 30  # largest uncompressed chunk content that is verified
+GZ_STEP = 1 << 16
+CHUNK_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+DEVICE_NAMES = ("CON", "PRN", "AUX", "NUL")
+MAX_LISTED_CHUNKS = 10
+# The fields of syslog_chunk and syslog_prune records, by type: a record with a field of another
+# type cannot be used (as the Go verifier cannot decode it).
+CHUNK_FIELDS = (("name", "from", "to", "sha256", "reason"), ("messages", "dropped", "rejected", "bytes", "gz_bytes"))
+PRUNE_FIELDS = (("reason",), ("keep_mb", "keep_days", "kept_bytes", "kept_chunks"))
+PRUNED_CHUNK_FIELDS = (("name", "sha256", "from", "to"), ("messages", "gz_bytes"))
+
+
+class ChunkTooLarge(Exception):
+    """The uncompressed content of a chunk file is larger than the limit it is read with."""
+
+
+def chunk_name_ok(name):
+    """True for a chunk name the exporter puts into a bundle (syslog/<name>): one plain path
+    element of letters, digits, '.', '_' and '-' starting with a letter or digit, at most 200
+    bytes, without '..', not ending with '.' and not a Windows device name."""
+    if not isinstance(name, str) or len(name) > 200 or not CHUNK_NAME.fullmatch(name):
+        return False
+    if ".." in name or name.endswith("."):
+        return False
+    base = name.split(".", 1)[0].upper()
+    if base in DEVICE_NAMES:
+        return False
+    return not (len(base) == 4 and base[:3] in ("COM", "LPT") and base[3] in "0123456789")
+
+
+def _go_int(v):
+    """An integer a Go int/int64 field accepts."""
+    return _is_int(v) and -(1 << 63) <= v < (1 << 63)
+
+
+def _field_problem(d, fields):
+    """Why the JSON object d does not have fields = (string fields, integer fields) of those types
+    (absent or null is fine), or ""."""
+    strs, ints = fields
+    for k in strs:
+        if d.get(k) is not None and not isinstance(d.get(k), str):
+            return "%s is not a string" % k
+    for k in ints:
+        if d.get(k) is not None and not _go_int(d.get(k)):
+            return "%s is not an integer" % k
+    return ""
+
+
+def chunk_record(data):
+    """The chunk a syslog_chunk record states: (dict, None), or (None, why the record cannot be
+    used). The record must state a plain chunk name, a SHA-256, and a size and message count of
+    at least 0; from/to (receive times of its first and last message) only place it in time."""
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        return None, "its data is not a JSON object"
+    problem = _field_problem(data, CHUNK_FIELDS)
+    if problem:
+        return None, problem
+    name = data.get("name") or ""
+    sha = (data.get("sha256") or "").lower()
+    nbytes, msgs = data.get("bytes") or 0, data.get("messages") or 0
+    if not chunk_name_ok(name):
+        return None, "its chunk name %r is not a plain file name" % one_line(name, 80)
+    if not HEX64.fullmatch(sha):
+        return None, "its sha256 %r is not a SHA-256" % one_line(data.get("sha256") or "", 80)
+    if nbytes < 0 or msgs < 0:
+        return None, "it states a negative size or message count"
+    return {"name": name, "sha256": sha, "bytes": nbytes, "messages": msgs,
+            "from": parse_ts_ns(data.get("from")), "to": parse_ts_ns(data.get("to"))}, None
+
+
+def pruned_refs(data):
+    """The chunks a syslog_prune record names, [(name, sha256 or "")], or None when the record
+    cannot be used."""
+    if data is None:
+        return []
+    if not isinstance(data, dict) or _field_problem(data, PRUNE_FIELDS):
+        return None
+    deleted = data.get("deleted")
+    if deleted is None:
+        return []
+    if not isinstance(deleted, list):
+        return None
+    out = []
+    for e in deleted:
+        if e is None:
+            e = {}
+        if not isinstance(e, dict) or _field_problem(e, PRUNED_CHUNK_FIELDS):
+            return None
+        out.append((e.get("name") or "", (e.get("sha256") or "").lower()))
+    return out
+
+
+def gunzip_digest(f, limit):
+    """(SHA-256 hex, bytes, lines) of the uncompressed content of a chunk file read from f: gzip,
+    one or more members and nothing after them. Raises ValueError when it is not valid gzip and
+    ChunkTooLarge when its content is larger than limit bytes."""
+    h = hashlib.sha256()
+    size = lines = 0
+    d = None  # the decompressor of the current gzip member
+    data = b""
+    started = False
+    while True:
+        if not data:
+            data = f.read(GZ_STEP)
+            if not data:
+                break
+            started = True
+        if d is None:
+            d = zlib.decompressobj(31)  # gzip: header, and the trailer's CRC-32 and size, are checked
+        try:
+            out = d.decompress(data, GZ_STEP)
+            while True:
+                size += len(out)
+                if size > limit:
+                    raise ChunkTooLarge()
+                h.update(out)
+                lines += out.count(b"\n")
+                if d.eof or d.unconsumed_tail or len(out) < GZ_STEP:
+                    break
+                out = d.decompress(b"", GZ_STEP)  # output the decompressor still holds
+        except zlib.error as e:
+            raise ValueError("it is not a valid gzip file: %s" % e)
+        if d.eof:
+            data, d = d.unused_data, None
+        else:
+            data = d.unconsumed_tail
+    if not started:
+        raise ValueError("it is not a valid gzip file: it is empty")
+    if d is not None:
+        raise ValueError("it is not a valid gzip file: it ends inside a gzip member (truncated)")
+    return h.hexdigest(), size, lines
+
+
+def chunk_diff(digest, rec):
+    """How a chunk's content (SHA-256, bytes, lines) differs from a record ("" = it matches)."""
+    sha, size, lines = digest
+    out = []
+    if sha != rec["sha256"]:
+        out.append("its SHA-256 is %s, the record states %s" % (sha, rec["sha256"]))
+    if size != rec["bytes"]:
+        out.append("it holds %d bytes, the record states %d" % (size, rec["bytes"]))
+    if lines != rec["messages"]:
+        out.append("it holds %d messages (lines), the record states %d" % (lines, rec["messages"]))
+    return "; ".join(out)
+
+
+def match_chunk(src, path, cands):
+    """What is wrong with the chunk file at path, or "" when it is gzip whose content has the
+    SHA-256, size and line count one of the syslog_chunk records that name it (cands) states."""
+    largest = max(cands, key=lambda r: r["bytes"])
+    limit = min(largest["bytes"], MAX_CHUNK_CONTENT)
+    try:
+        with src._open(path) as f:
+            digest = gunzip_digest(f, limit)
+    except ChunkTooLarge:
+        if limit < MAX_CHUNK_CONTENT:
+            return "uncompressed it is larger than the %d bytes its syslog_chunk record (seq %d) states" % (
+                largest["bytes"], largest["seq"])
+        return "uncompressed it is larger than %d bytes, more than a chunk can hold" % limit
+    except ValueError as e:
+        return str(e)
+    except (OSError, EOFError, zipfile.BadZipFile, zlib.error) as e:
+        return "it cannot be read: %s" % e
+    for rec in cands:
+        if not chunk_diff(digest, rec):
+            return ""
+    last = cands[-1]
+    return "it is not what its syslog_chunk record (seq %d) states: %s" % (last["seq"], chunk_diff(digest, last))
+
+
+def report_period(src):
+    """The period [from, to) report.json states, in nanoseconds, or None."""
+    if "report.json" not in src.nameset:
+        return None
+    try:
+        doc = json.loads(src.read("report.json").decode("utf-8", "replace"))
+    except (ValueError, OSError, EOFError, zipfile.BadZipFile, zlib.error):
+        return None
+    p = doc.get("period") if isinstance(doc, dict) else None
+    if not isinstance(p, dict):
+        return None
+    start, end = parse_ts_ns(p.get("from")), parse_ts_ns(p.get("to"))
+    if start is None or end is None or start >= end:
+        return None
+    return start, end
+
+
+def listing(names):
+    shown = ", ".join(names[:MAX_LISTED_CHUNKS])
+    if len(names) > MAX_LISTED_CHUNKS:
+        shown += " and %d more" % (len(names) - MAX_LISTED_CHUNKS)
+    return shown
+
+
+def check_syslog(src, res, facts):
+    """Checks the syslog chunks (item 9): every syslog/<name> against the syslog_chunk records
+    that name it; the chunks of the period that are not in the bundle are listed."""
+    files = sorted(n[len(SYSLOG_DIR):] for n in src.names if n.startswith(SYSLOG_DIR))
+    recs, pruned = [], []
+    for seq, typ, data, where in facts["syslog"]:
+        if typ == "syslog_chunk":
+            rec, why = chunk_record(data)
+            if rec is None:
+                res.note("%s: the syslog_chunk record cannot be used: %s" % (where, why))
+                continue
+            rec["seq"] = seq
+            recs.append(rec)
+        else:
+            refs = pruned_refs(data)
+            if refs is None:
+                res.note("%s: the syslog_prune record cannot be used: its data cannot be read" % where)
+                continue
+            pruned.extend(refs)
+    if not recs and not files:
+        res.say("Syslog chunks", "none in this bundle")
+        return
+    by_name = {}
+    for rec in recs:
+        by_name.setdefault(rec["name"], []).append(rec)
+    bad = 0
+    for name in files:
+        path = SYSLOG_DIR + name
+        cands = by_name.get(name)
+        problem = match_chunk(src, path, cands) if cands else "no syslog_chunk record in this bundle names it"
+        if problem:
+            res.fail("%s: %s" % (path, problem))
+            bad += 1
+
+    period = report_period(src)
+    if period is None and recs:
+        res.note("report.json states no usable period: every syslog_chunk record of this bundle counts as one of the period")
+    of_period = 0
+    deleted, absent, listed = [], [], set()
+    for rec in recs:
+        if period is not None and not (rec["from"] is not None and rec["to"] is not None and
+                                       rec["from"] < period[1] and rec["to"] >= period[0]):
+            continue
+        of_period += 1
+        name = rec["name"]
+        if SYSLOG_DIR + name in src.nameset or name in listed:
+            continue
+        listed.add(name)
+        label = "%s (syslog_chunk seq %d)" % (name, rec["seq"])
+        if any(n == name and (not sha or sha == rec["sha256"]) for n, sha in pruned):
+            deleted.append(label)
+        else:
+            absent.append(label)
+    if deleted:
+        res.note("%d syslog chunk(s) of the period are not in this bundle because the syslog store's retention limit deleted "
+                 "them (a syslog_prune record names them; their SHA-256 stays in their syslog_chunk records): %s"
+                 % (len(deleted), listing(deleted)))
+    if absent:
+        res.note("%d syslog chunk(s) of the period are not in this bundle and no syslog_prune record in it names them (deleted "
+                 "after the records of this bundle, or not readable at export; their SHA-256 stays in their syslog_chunk "
+                 "records): %s" % (len(absent), listing(absent)))
+
+    if bad:
+        text = "FAILED (%d of %d chunk file(s) are not what a syslog_chunk record states)" % (bad, len(files))
+    elif files:
+        text = "OK (%d chunk file(s), each matching its syslog_chunk record: SHA-256, size and message count)" % len(files)
+    else:
+        text = "OK (no chunk files in this bundle)"
+    if deleted or absent:
+        text += ("; of the %d chunk(s) of the period, %d deleted by the retention limit and %d not in the bundle (see the notes)"
+                 % (of_period, len(deleted), len(absent)))
+    res.say("Syslog chunks", text)
+
+
 # ---------------------------------------------------------------------------- main
 
 
@@ -1791,7 +2103,7 @@ def inspect_token(path):
     try:
         info = parse_token(data)
     except TokenError as e:
-        print("cannot parse token: %s" % e)
+        print(terminal_text("cannot parse token: %s" % e))
         return 1
     info["file_sha256"] = sha256_hex(data)
     print(json.dumps(info, indent=2, sort_keys=True))
@@ -1825,39 +2137,43 @@ def main(argv=None):
     try:
         src = Source(args.bundle)
     except (OSError, zipfile.BadZipFile) as e:
-        print("cannot open bundle %s: %s" % (args.bundle, e))
+        print(terminal_text("cannot open bundle %s: %s" % (args.bundle, e)))
         return 2
     res = Results()
     try:
         check_manifest(src, res)
         facts = check_ledger(src, res, args)
         check_report(src, res, facts)
+        check_syslog(src, res, facts)
     finally:
         src.close()
 
-    print("att-monitor evidence bundle verification (verify_bundle.py %s, Python %s)" % (VERSION, sys.version.split()[0]))
-    print("Bundle: %s" % args.bundle)
+    def out(line):
+        print(terminal_text(line))
+
+    out("att-monitor evidence bundle verification (verify_bundle.py %s, Python %s)" % (VERSION, sys.version.split()[0]))
+    out("Bundle: %s" % args.bundle)
     for line in res.lines:
-        print(line)
+        out(line)
     if res.notes:
-        print("Notes:")
+        out("Notes:")
         for n in res.notes:
-            print("  - " + n)
+            out("  - " + n)
     if res.warnings:
-        print("Warnings (not checked):")
+        out("Warnings (not checked):")
         for w in res.warnings:
-            print("  - " + w)
-    print("REPORT.html and report.json were NOT verified by this script: it checks the ledger records, which are the evidence. "
-          "Use 'att-monitor verify-bundle' to verify the report's figures.")
+            out("  - " + w)
+    out("REPORT.html and report.json were NOT verified by this script: it checks the ledger records, which are the evidence. "
+        "Use 'att-monitor verify-bundle' to verify the report's figures.")
     if res.failures:
-        print("FAILURES (%d):" % len(res.failures))
+        out("FAILURES (%d):" % len(res.failures))
         for f in res.failures[:args.max_failures]:
-            print("  - " + f)
+            out("  - " + f)
         if len(res.failures) > args.max_failures:
-            print("  ... %d more" % (len(res.failures) - args.max_failures))
-        print("RESULT: FAIL")
+            out("  ... %d more" % (len(res.failures) - args.max_failures))
+        out("RESULT: FAIL")
         return 1
-    print("RESULT: PASS" + (" (with warnings)" if res.warnings else ""))
+    out("RESULT: PASS" + (" (with warnings)" if res.warnings else ""))
     return 0
 
 

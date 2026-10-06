@@ -32,14 +32,17 @@ var months = [...]string{"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug",
 // Parse describes the syslog datagram b (the formats are listed in the package comment). Raw is
 // b when it is valid UTF-8, RawB64 (standard base64) otherwise: the exact bytes, never trimmed
 // or rewritten. The parsed fields are a convenience taken from them; in a datagram that is not
-// valid UTF-8 they show U+FFFD in place of the invalid bytes. RX and Src are left for the
-// caller. Parse never panics.
+// valid UTF-8 they show U+FFFD in place of the invalid bytes. A Msg that would be exactly Raw (a
+// datagram without a PRI) is left empty: Raw holds it, and the message is not stored twice.
+// RX and Src are left for the caller. Parse never panics.
 func Parse(b []byte) model.SyslogMessage {
 	m, text := rawMessage(b)
 	text = strings.TrimRight(text, "\r\n\x00")
 	pri, rest, ok := cutPRI(text)
 	if !ok {
-		m.Msg = text
+		if text != m.Raw {
+			m.Msg = text
+		}
 		return m
 	}
 	facility, severity := pri/8, pri%8

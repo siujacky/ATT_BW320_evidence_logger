@@ -93,11 +93,17 @@ func ParseBroadband(body []byte) (*model.BroadbandStatus, error)
 func ParseFiber(body []byte) (*model.FiberStatus, error)
 func ParseLAN(body []byte) (*model.LANStatus, error)
 func ParseNotification(body []byte) (enabled bool, err error)
+func ParseSyslog(body []byte) (model.SyslogSetting, error) // Diagnostics > Syslog, controls found by their labels
+var ErrSyslogPage error // the Syslog page is not understood (Syslog returns the page with it; SetSyslog posts nothing)
 func IsLoginPage(body []byte) bool
 func SessionsFull(body []byte) bool
 func Derive(s *model.GatewaySnapshot, fetchedAt time.Time, loc *time.Location) model.GatewayDerived
+// Client.Syslog reads the Syslog page (authenticated, read-only); Client.SetSyslog changes only its
+// syslog controls, reads the page back and fails unless it shows the target. SetSyslog has no
+// caller in phase 1 (docs/syslog-snmp-traffic.md).
 ```
-Fixtures: `testdata/gateway/*.html` (sanitized real pages, see README there).
+Fixtures: `testdata/gateway/*.html` (sanitized real pages, see README there; the `syslog_*.html`
+pages are synthetic until the real page is captured).
 
 ## internal/probe
 ```go
@@ -107,6 +113,8 @@ func New(opts Options) *Prober   // implements contracts.Prober
 func ParseNetshWLAN(out []byte, iface string) (model.LocalLink, error)
 func DetectDNSHijack(name string, answers []string, gatewayIP string) (bool, string)
 func ICMPStatusName(code uint32) string
+// LocalLink also fills RxBytes/TxBytes: the 64-bit octet counters (GetIfEntry2Ex) of the adapter
+// that reaches the gateway, for this computer's traffic rates (docs/DESIGN.md §18).
 ```
 
 ## internal/monitor
@@ -130,11 +138,21 @@ type Options struct {
     Now        func() time.Time
     Logger     *slog.Logger
     MongoStatus func() model.MongoStatus  // optional: Status().Mongo (called without the lock)
+    // The gateway's syslog (docs/DESIGN.md §18): the receiver the monitor runs, and the store it
+    // writes, recording syslog_chunk / syslog_prune. The pipeline runs only with both and
+    // Config.Syslog.Enabled; nil: none. A store with syslogstore.Store's bookkeeping methods
+    // (MarkRecorded, Unrecorded, PlanPrune, CommitPrune, CancelPrune) keeps the records complete
+    // across restarts; another gets that bookkeeping in memory only.
+    Syslog      contracts.SyslogReceiver
+    SyslogStore contracts.SyslogStore
 }
 func New(opts Options) (*Monitor, error)
 func (m *Monitor) Run(ctx context.Context) error // writes monitor_start … monitor_stop
 func (m *Monitor) PowerEvent(kind string)        // from the service control handler
-// *Monitor implements contracts.StatusSource and contracts.Actions.
+func (m *Monitor) SetSyslogRetention(ctx context.Context, keepMB, keepDays int, actor string) (model.ConfigChange, error)
+func (m *Monitor) LiveTraffic(ctx context.Context) (model.LiveTraffic, error) // the flow meter, unrecorded
+// *Monitor implements contracts.StatusSource, contracts.Actions, contracts.SyslogControl and
+// contracts.LiveTrafficSource.
 
 type ClassifyInput struct {
     Cycle      []model.ProbeResult     // this cycle
@@ -167,12 +185,21 @@ type Options struct {
     Reader   contracts.LedgerReader
     Verifier contracts.Verifier
     Exporter contracts.Exporter
+    // Optional (nil: the endpoint answers 404 with a JSON error; the dashboard hides or explains it):
+    SyslogReader  contracts.SyslogReader      // GET /api/syslog (entries linked to syslog_chunk records via Reader)
+    SyslogControl contracts.SyslogControl     // POST /api/syslog/retention
+    LiveTraffic   contracts.LiveTrafficSource // GET /api/traffic/live
     Version  string
     Logger   *slog.Logger
 }
 func New(opts Options) (*Server, error)
 func (s *Server) Handler() http.Handler
 func (s *Server) Run(ctx context.Context) error   // listen until ctx is done (graceful shutdown)
+type SyslogRetentionRequest struct { KeepMB *int; KeepDays *int; Client string } // keep_mb required; keep_days absent = 0
+const DefaultSyslogLimit = 200; const MaxSyslogLimit = 5000                    // GET /api/syslog limit
+const MaxSyslogAnswerBytes = 16 << 20 // GET /api/syslog also ends its list before the message that would take its JSON beyond this
+const DefaultSyslogSpan = 24 * time.Hour; const MaxSyslogSpan = 31 * 24 * time.Hour
+const WarningHeader = "X-ATT-Monitor-Warning"
 ```
 
 ## internal/export
@@ -183,6 +210,7 @@ type Options struct {
     Verifier      contracts.Verifier       // verification result goes into README/REPORT
     Actions       contracts.Actions        // RecordExport (custody_export + anchor); may be nil (CLI offline)
     TokenVerifier contracts.TokenVerifier  // per-anchor CMS/chain check shown in the report (optional)
+    Syslog        contracts.SyslogReader   // optional: the period's kept chunks go into the bundle as syslog/<name>
     ExtraFiles    map[string][]byte        // extra bundle files, e.g. "keys/tsa-roots.pem" (in MANIFEST)
     Software      model.SoftwareInfo
     Now           func() time.Time
@@ -191,9 +219,17 @@ type Options struct {
 func New(opts Options) *Exporter          // implements contracts.Exporter
 func OpenBundle(path string) (*Bundle, error) // *Bundle implements contracts.LedgerReader; Close()
 func VerifyManifest(path string) error                    // manifest + layout + report check
-func VerifyReport(path string) (ReportCheck, error)      // re-derives report.json/REPORT.html/README.txt from the records
+func VerifyReport(path string) (*ReportCheck, error)     // re-derives report.json/REPORT.html/README.txt from the records
 var ErrReportMismatch error; const DefaultFullVerifyTimeout = 4 * time.Minute // Options.FullVerifyTimeout
-// assets/verify_bundle.py is embedded and copied into every bundle as tools/verify_bundle.py.
+// VerifySyslogChunks checks every syslog/<name> of a bundle against its syslog_chunk record
+// (SHA-256, size and line count of the gunzipped content) and lists the period's chunks that are
+// not in it (pruned per a syslog_prune record, or absent): not failures. A mismatch wraps
+// ErrSyslogMismatch and still returns the check.
+func VerifySyslogChunks(path string) (*SyslogCheck, error)
+type SyslogCheck struct { Records, OfPeriod, Files, Verified int; Pruned, Absent, Problems, Notes []string } // OK(), Summary()
+var ErrSyslogMismatch error
+// assets/verify_bundle.py is embedded and copied into every bundle as tools/verify_bundle.py (item 9:
+// the same syslog chunk checks, the same verdicts).
 ```
 
 ## internal/winsvc
@@ -233,24 +269,101 @@ type Options struct {
     ConnectTimeout time.Duration          // connect / server selection (3 s)
     Logger         *slog.Logger
     Now            func() time.Time
+    Syslog         contracts.SyslogReader // optional: the "syslog" collection follows syslog_chunk / syslog_prune
 }
 func New(o Options) (*Replicator, error)                          // validates; MongoDB may be down
 func (r *Replicator) Run(ctx context.Context) error                // until ctx is done; nil then
 func (r *Replicator) SyncOnce(ctx context.Context) (copied int, err error)
 func (r *Replicator) Status() model.MongoStatus                    // never blocks on MongoDB
+func (r *Replicator) SyslogDocuments() int64                       // cached count of the syslog collection
 func (r *Replicator) Close(ctx context.Context) error
 type VerifyResult struct {
     Records, Checked, Missing, Mismatched, BadHash int
     BlobsChecked, BlobsMissing, BlobsCorrupt     int
+    SyslogDocs, SyslogChunks, SyslogBad, SyslogPruned, SyslogForged, SyslogMissing int // the syslog collection
+    SyslogTrimmed int // chunks the store keeps whose documents the collection's size limit deleted (not a problem)
     LedgerHead uint64; CopiedUpTo int64 /* -1: nothing copied */; NotCopied int // the copy's extent
     Problems []string; OK bool
 }
 var ErrClosed error // SyncOnce after Close
 func Verify(ctx context.Context, uri, database string, r contracts.LedgerReader, pub ed25519.PublicKey) (VerifyResult, error)
+type VerifyOptions struct { URI, Database string; Reader contracts.LedgerReader; PublicKey ed25519.PublicKey; Syslog contracts.SyslogReader }
+func VerifyWith(ctx context.Context, o VerifyOptions) (VerifyResult, error) // with Syslog: also chunks the copy lacks
 func RedactURI(uri string) string
 ```
 Live tests run only with `ATTMON_MONGO=1`, against `mongodb://127.0.0.1:27017`, in a throw-away
 database (`attmonitor_test_<random>`) that each test drops.
 
+## internal/syslogrx
+The receiver of the gateway's syslog (docs/DESIGN.md §18). Stdlib only.
+```go
+const DefaultListen = ":514"; const DefaultMaxPerMinute = 2000; const DefaultMaxMessage = 8 << 10
+const DefaultMaxBytesPerMinute = 1 << 20
+type Options struct {
+    Listen            string        // UDP "host:port" (":514"; "127.0.0.1:0" in tests); the host must be an IP
+    Allowed           []netip.Addr  // accepted senders (SetAllowed replaces them)
+    MaxPerMinute      int           // per UTC minute of receive time (2000)
+    MaxBytesPerMinute int           // the stored size (JSON lines) of a minute's messages (1 MiB)
+    MaxMessage        int           // bytes (8192, at most 65527)
+    MaxPending        int           // kept between two Drain calls (4 × MaxPerMinute)
+    Now               func() time.Time
+    Logger            *slog.Logger
+}
+func New(o Options) (*Receiver, error)  // implements contracts.SyslogReceiver; binds nothing (Run does)
+func Parse(b []byte) model.SyslogMessage // RFC 5424 / RFC 3164 / unknown; Raw or RawB64 is the exact datagram
+```
+Tests bind only `127.0.0.1:0`, never port 514.
+
+## internal/syslogstore
+The syslog store: chunk files within a size (and optional age) limit (docs/DESIGN.md §18). It never
+writes the ledger: the monitor records what it seals and deletes.
+```go
+const DefaultKeepMB = 100; const DefaultChunkBytes = 1 << 20; const DefaultChunkAge = 5 * time.Minute
+var ErrReadOnly, ErrClosed error
+type Options struct {
+    Dir              string        // config.Paths.Syslog
+    KeepMB, KeepDays int           // retention limits (0 MB → 100; clamped to the config's limits)
+    ChunkBytes       int64         // seal at this content size (1 MiB)
+    ChunkAge         time.Duration // Seal seals at this age (5 min)
+    ReadOnly         bool          // index and read only (the CLI; another process may write)
+    Now              func() time.Time
+    Logger           *slog.Logger
+}
+func New(o Options) (*Store, error) // implements contracts.SyslogStore (and SyslogReader)
+func (s *Store) Close() error                   // releases the open chunk's file without sealing it
+func (s *Store) Chunks() []model.SyslogChunk    // the sealed chunks kept, oldest first
+// The writer's bookkeeping of its records (the monitor uses them when the store has them):
+func (s *Store) MarkRecorded(name string, seq uint64) error // the chunk's syslog_chunk record (kept in its sidecar)
+func (s *Store) Unrecorded() []model.SyslogChunk            // sealed chunks without a noted record, oldest first
+func (s *Store) PlanPrune(now time.Time) ([]model.SyslogChunkRef, error) // choose, delete nothing yet
+func (s *Store) CommitPrune() ([]model.SyslogChunkRef, error)            // delete what PlanPrune chose
+func (s *Store) CancelPrune()                                            // keep it (its record was refused)
+```
+One writer (the monitor; its ledger lock keeps a second one away), any number of readers.
+
+## Syslog and traffic contracts
+Defined in `internal/model/syslog.go`, `internal/contracts` and `internal/config` (docs/DESIGN.md §18):
+```go
+contracts.SyslogReceiver    // Run, Drain, SetAllowed, Listening (syslogrx.Receiver)
+contracts.SyslogReader      // Query(ctx, from, to, match, limit), Usage, OpenChunk (syslogstore.Store)
+contracts.SyslogStore       // SyslogReader + Recover, Append, Seal, Prune, SetRetention (syslogstore.Store)
+contracts.SyslogControl     // SetSyslogRetention (monitor.Monitor)
+contracts.LiveTrafficSource // LiveTraffic (monitor.Monitor)
+contracts.Gateway           // + Syslog, SetSyslog (gateway.Client)
+model.TypeSyslogChunk / TypeSyslogPrune, model.SyslogChunk / SyslogPrune / SyslogChunkRef,
+model.SyslogMessage / SyslogEntry / SyslogList / SyslogUsage / SyslogStatus / SyslogSetting / SyslogTarget,
+model.TrafficPoint / TrafficDay / LiveTraffic / LivePoint, model.GwEvSyslogSetting
+config.SyslogConfig {Enabled, Listen, Port, Allow, FlushInterval, MaxPerMinute, KeepMB, KeepDays}
+config.MinSyslogKeepMB, MaxSyslogKeepMB, MaxSyslogKeepDays; config.Paths.Syslog
+```
+
 ## cmd/att-monitor
-CLI and wiring (docs/DESIGN.md §14). Written last, during integration.
+CLI and wiring (docs/DESIGN.md §14). Written last, during integration. `openStack` opens the ledger,
+then the syslog store: in the service and console modes with `syslog.enabled` a writable
+`syslogstore.Store` and a `syslogrx.Receiver` (allowed: the gateway and `syslog.allow`) for
+`monitor.Options.Syslog` / `SyslogStore`; otherwise (the CLI, or syslog off) the store read-only.
+The same store is `web.Options.SyslogReader`, `export.Options.Syslog` and
+`mongostore.Options.Syslog`; the monitor is `web.Options.SyslogControl` and `LiveTraffic`. A store
+that cannot be opened is logged and left out (never a typed nil in an interface). `install` sets up
+the Windows Firewall rule of the receiver (`netsh`, through a replaceable runner so tests never run
+it) and `uninstall` removes it.

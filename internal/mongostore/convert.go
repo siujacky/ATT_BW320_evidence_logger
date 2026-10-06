@@ -25,6 +25,7 @@ const (
 	collRecords   = "records"
 	collBlobs     = "blobs"
 	collIncidents = "incidents"
+	collSyslog    = "syslog"
 	collMeta      = "meta"
 	metaID        = "replication"
 )

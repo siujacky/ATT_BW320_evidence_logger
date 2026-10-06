@@ -45,6 +45,21 @@ type VerifyResult struct {
 	BlobsChecked int `json:"blobs_checked"`
 	BlobsMissing int `json:"blobs_missing"`
 	BlobsCorrupt int `json:"blobs_corrupt"`
+	// The syslog collection: SyslogDocs documents; SyslogChunks chunks whose documents were
+	// compared with their syslog_chunk record, of which SyslogBad do not reproduce it (lines
+	// missing, repeated or altered, or documents whose other fields do not match their line);
+	// SyslogPruned documents of chunks that a copied syslog_prune record deleted; SyslogForged
+	// documents of chunks that no syslog_chunk record names; SyslogMissing chunks that the syslog
+	// store still holds but the copy lacks, and SyslogTrimmed such chunks older than every chunk
+	// the copy holds, whose documents the copy's size limit deleted (not a problem; both only
+	// checked when VerifyWith is given the store).
+	SyslogDocs    int `json:"syslog_docs"`
+	SyslogChunks  int `json:"syslog_chunks"`
+	SyslogBad     int `json:"syslog_bad"`
+	SyslogPruned  int `json:"syslog_pruned"`
+	SyslogForged  int `json:"syslog_forged"`
+	SyslogMissing int `json:"syslog_missing"`
+	SyslogTrimmed int `json:"syslog_trimmed"`
 	// Where the copy ends: LedgerHead is the newest seq of the ledger, CopiedUpTo the newest seq
 	// up to which the copy was compared (its replication state's, or its newest record matching
 	// the ledger; -1 when there is none), NotCopied the number of ledger records after it. While
@@ -69,8 +84,38 @@ type VerifyResult struct {
 // inconsistent replication state, a database without any record, and a copy that lacks more than
 // a quarter of an hour of the newest ledger records. VerifyResult also says where the copy ends.
 //
+// It also checks the syslog collection against the ledger's syslog_chunk and syslog_prune
+// records: the documents of every chunk, their lines in order (each with its line feed), must
+// hash to the record's SHA-256 and count to its Messages, and every other field must be exactly
+// what the replicator writes for the line; documents of chunks that a syslog_prune record deleted
+// (once the copy has applied it), documents of chunks that no syslog_chunk record names (forged),
+// and a syslog collection that lags the copied records by more than a quarter of an hour are
+// reported. Chunks that the syslog store still holds but the copy lacks can only be found with
+// the store: see VerifyWith.
+//
 // r must be the complete ledger (from genesis). Verify only reads MongoDB (and the ledger).
 func Verify(ctx context.Context, uri, database string, r contracts.LedgerReader, pub ed25519.PublicKey) (VerifyResult, error) {
+	return VerifyWith(ctx, VerifyOptions{URI: uri, Database: database, Reader: r, PublicKey: pub})
+}
+
+// VerifyOptions configures VerifyWith.
+type VerifyOptions struct {
+	URI      string                 // MongoDB connection string ("" → DefaultURI)
+	Database string                 // database name ("" → DefaultDatabase)
+	Reader   contracts.LedgerReader // the complete ledger, from genesis (required)
+	// PublicKey is the ledger key (nil: signatures are not checked).
+	PublicKey ed25519.PublicKey
+	// Syslog is the syslog store (nil: the syslog collection is checked against the ledger only).
+	// With it, chunks that the store still holds but the copy lacks are reported as missing
+	// (VerifyResult.SyslogMissing), and a chunk whose documents do not hash to its record names
+	// the lines that differ from the store's copy.
+	Syslog contracts.SyslogReader
+}
+
+// VerifyWith is Verify with options; it also reads the syslog store when VerifyOptions.Syslog is
+// set (and only reads it).
+func VerifyWith(ctx context.Context, o VerifyOptions) (VerifyResult, error) {
+	uri, database, r, pub := o.URI, o.Database, o.Reader, o.PublicKey
 	if r == nil {
 		return VerifyResult{}, errors.New("mongostore: Verify needs the ledger reader")
 	}
@@ -113,6 +158,9 @@ func Verify(ctx context.Context, uri, database string, r contracts.LedgerReader,
 		blobRefs:   map[string]uint64{},
 		pending:    map[string]bool{},
 		incidents:  map[string][]uint64{},
+		store:      o.Syslog,
+		chunks:     map[string]chunkRec{},
+		pruned:     map[string]uint64{},
 	}
 	return v.run()
 }
@@ -136,6 +184,11 @@ type verifier struct {
 	blobRefs   map[string]uint64
 	pending    map[string]bool     // blobs the replication state lists as waiting for a retry
 	incidents  map[string][]uint64 // incident id -> seqs of its records, ascending
+
+	store      contracts.SyslogReader // the syslog store (nil: not checked against it)
+	chunks     map[string]chunkRec    // syslog_chunk records by chunk name (the first naming it)
+	pruned     map[string]uint64      // chunk name -> the first syslog_prune record deleting it
+	syslogRecs []syslogRecTS          // syslog_chunk and syslog_prune records, ascending
 }
 
 type seqRange struct{ from, to uint64 }
@@ -174,6 +227,9 @@ func (v *verifier) run() (VerifyResult, error) {
 		return v.res, err
 	}
 	if err := v.checkIncidents(newest); err != nil {
+		return v.res, err
+	}
+	if err := v.checkSyslog(meta, newest); err != nil {
 		return v.res, err
 	}
 	noCopy := v.res.Records == 0
@@ -344,8 +400,9 @@ func (v *verifier) records() error {
 	return nil
 }
 
-// noteLedger remembers a ledger record: its seq, its blobs and its incident.
+// noteLedger remembers a ledger record: its seq, its blobs, its incident and its syslog chunks.
 func (v *verifier) noteLedger(seq uint64, body model.Body) {
+	v.noteSyslog(seq, body)
 	if n := len(v.ledger); n > 0 && v.ledger[n-1].to+1 == seq {
 		v.ledger[n-1].to = seq
 	} else {

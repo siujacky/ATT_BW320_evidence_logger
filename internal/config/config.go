@@ -153,8 +153,10 @@ type SyslogConfig struct {
 	Port int `json:"port"`
 	// Allow lists further senders (IP addresses) accepted besides the gateway.
 	Allow []string `json:"allow,omitempty"`
-	// FlushInterval is how often received messages are written to the ledger (one record per
-	// batch); MaxPerMinute caps the messages recorded per minute (the rest are counted).
+	// FlushInterval is how often received messages are written to the syslog store (at most
+	// MaxSyslogFlushInterval, so a chunk is sealed, and its syslog_chunk record written, within
+	// minutes of its newest message); MaxPerMinute caps the messages kept per minute (the rest
+	// are counted as dropped).
 	FlushInterval Duration `json:"flush_interval"`
 	MaxPerMinute  int      `json:"max_per_minute"`
 	// KeepMB limits the syslog store: the oldest chunks are deleted once the stored messages
@@ -466,8 +468,8 @@ func validateSyslog(s SyslogConfig) []string {
 			break
 		}
 	}
-	if s.FlushInterval.Duration < time.Second {
-		errs = append(errs, "syslog.flush_interval must be >= 1s")
+	if s.FlushInterval.Duration < time.Second || s.FlushInterval.Duration > MaxSyslogFlushInterval {
+		errs = append(errs, "syslog.flush_interval must be 1s to "+MaxSyslogFlushInterval.String())
 	}
 	if s.MaxPerMinute < 1 {
 		errs = append(errs, "syslog.max_per_minute must be >= 1")
@@ -486,6 +488,8 @@ const (
 	MinSyslogKeepMB   = 1
 	MaxSyslogKeepMB   = 1 << 20 // 1 TiB
 	MaxSyslogKeepDays = 3650
+	// MaxSyslogFlushInterval bounds syslog.flush_interval.
+	MaxSyslogFlushInterval = 5 * time.Minute
 )
 
 // validMongoDatabase applies MongoDB's database name rules on Windows.

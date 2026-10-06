@@ -226,14 +226,15 @@ func paramsFromReport(b *Bundle, r *report) (*buildParams, error) {
 	return p, nil
 }
 
-// isGeneratedPath: a bundle file the exporter writes itself (not an extra file).
+// isGeneratedPath: a bundle file the exporter writes itself (not an extra file). The syslog
+// chunks are not described by the report (VerifySyslogChunks checks them).
 func isGeneratedPath(name string) bool {
 	for _, g := range generatedFiles {
 		if name == g {
 			return true
 		}
 	}
-	return strings.HasPrefix(name, "ledger/") || strings.HasPrefix(name, "blobs/")
+	return strings.HasPrefix(name, "ledger/") || strings.HasPrefix(name, "blobs/") || strings.HasPrefix(name, syslogDir)
 }
 
 // statedTokenVerifier answers for each anchor token what the token verifier answered at export,

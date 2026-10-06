@@ -4,15 +4,17 @@ package web
 //
 //	ATTMON_WEB_DEMO=1 go test ./internal/web/ -run TestDemoServer -timeout 0 -v
 //
-// serves the UI with demo data on http://127.0.0.1:8399/ for ATTMON_WEB_DEMO_SECONDS
-// (default 1800). Demo-only endpoints (outside the security middleware, test code only):
+// serves the UI with demo data on http://127.0.0.1:8399/ (ATTMON_WEB_DEMO_LISTEN, e.g.
+// 127.0.0.1:0 for a free port, which the log names) for ATTMON_WEB_DEMO_SECONDS (default
+// 1800). Demo-only endpoints (outside the security middleware, test code only):
 // /demo/state?s=outage|online switches between a healthy line and a live AT&T fiber outage,
 // /demo/vpn starts a live VPN period (rules 2026.10-4 LOCAL_ROUTE), /demo/stale shows a monitor
 // that records no cycle, /demo/dnsretry a lost AT&T resolver query and its retry, /demo/clock
 // the CLOCK_OFFSET condition, /demo/cert makes the gateway present a changed certificate,
 // /demo/noaccess and /demo/anchoruntrusted show those conditions, /demo/syslog?state=... the
-// gateway syslog card's other states, /demo/quit stops the server
-// (see TestDemoServer for the others). ATTMON_WEB_DEMO_STATE=outage starts in outage mode;
+// gateway syslog card's other states, /demo/syslogflood a flood of datagrams of control
+// characters, /demo/live?state=... the flow meter's, /demo/quit stops
+// the server (see TestDemoServer for the others). ATTMON_WEB_DEMO_STATE=outage starts in outage mode;
 // ATTMON_WEB_DEMO_HOSTILE=1 appends "<img src=x onerror=alert(1)>" to every remote-controlled
 // string (gateway values, DNS answers, TSA names, notes, ...) to check that all of it is
 // rendered as text.
@@ -23,6 +25,7 @@ package web
 import (
 	"archive/zip"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
@@ -50,6 +53,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"attmonitor/internal/config"
 	"attmonitor/internal/contracts"
@@ -57,11 +61,14 @@ import (
 )
 
 var (
-	_ contracts.StatusSource = (*demoWorld)(nil)
-	_ contracts.Actions      = (*demoWorld)(nil)
-	_ contracts.LedgerReader = (*demoWorld)(nil)
-	_ contracts.Verifier     = (*demoWorld)(nil)
-	_ contracts.Exporter     = (*demoWorld)(nil)
+	_ contracts.StatusSource      = (*demoWorld)(nil)
+	_ contracts.Actions           = (*demoWorld)(nil)
+	_ contracts.LedgerReader      = (*demoWorld)(nil)
+	_ contracts.Verifier          = (*demoWorld)(nil)
+	_ contracts.Exporter          = (*demoWorld)(nil)
+	_ contracts.SyslogReader      = (*demoWorld)(nil)
+	_ contracts.SyslogControl     = (*demoWorld)(nil)
+	_ contracts.LiveTrafficSource = (*demoWorld)(nil)
 )
 
 const (
@@ -208,9 +215,31 @@ type demoWorld struct {
 	syslogLast     *model.SyslogMessage
 	syslogCheck    model.Ref
 	syslogState    string
+	// The syslog store: the sealed chunks, oldest first, each with its syslog_chunk record; the
+	// open chunk; the retention limits (syslog.keep_mb, keep_days); chunks named so far.
+	syslogChunks     []*demoChunk
+	syslogOpen       *demoChunk
+	keepMB, keepDays int
+	syslogChunkNames int
 
 	// burstFrom/burstTo: a big download whose WAN rates are "at least" (traffic, §3.3).
 	burstFrom, burstTo time.Time
+	// liveState is the flow meter's state (LiveTraffic): "" (the line's traffic now), "atleast"
+	// (a big download: the gateway's 32-bit counter may have wrapped), "error" (the newest read
+	// of the counters failed), "first" (one reading so far: no rate yet) or "unavailable".
+	liveState string
+}
+
+// demoChunk is a chunk of the demo's syslog store: the messages in the order they were
+// appended and, once sealed, the gzip file and its syslog_chunk record.
+type demoChunk struct {
+	name     string
+	opened   time.Time // when its first message was appended
+	msgs     []model.SyslogMessage
+	rejected int
+	gz       []byte
+	seq      uint64
+	data     model.SyslogChunk // what its record states
 }
 
 type demoSegment struct {
@@ -239,6 +268,8 @@ func newDemoWorldWith(now time.Time, hostile string) *demoWorld {
 		prevOf:     map[string]model.Ref{},
 		sampled:    map[int64]bool{},
 		hostile:    hostile,
+		keepMB:     config.Default().Syslog.KeepMB,
+		keepDays:   config.Default().Syslog.KeepDays,
 	}
 	h, m := time.Hour, time.Minute
 	// The AT&T resolver fails in five consecutive checks (an incident: rules 2026.10-4 need the
@@ -372,12 +403,13 @@ var hostileKeep = map[string]bool{
 	"tls_cert_sha256": true, "fingerprint": true, "blob": true, "blobs": true, "bundle_sha256": true,
 	"manifest_sha256": true, "config_sha256": true, "exe_sha256": true, "public_key": true,
 	"prev_segment_sha256": true, "removed_sha256": true, "hash": true, "nonce": true, "file_name": true,
+	"chunk": true, // a syslog chunk's file name, which links a message to its syslog_chunk record
 
 	"ts": true, "t": true, "at": true, "since": true, "now": true, "opened": true, "closed": true,
 	"recovered_at": true, "gateway_restarts": true, "started": true, "created": true, "fetched_at": true,
 	"gen_time": true, "checked_at": true, "first_ts": true, "last_ts": true, "genesis_ts": true, "head_ts": true,
 	"last_anchor_time": true, "from": true, "to": true, "boot_time_estimate": true, "mod_time": true, "boot_time": true,
-	"rx": true, "last_at": true, "gateway_at": true, "day": true,
+	"rx": true, "last_at": true, "gateway_at": true, "day": true, "oldest": true, "newest": true,
 
 	"state": true, "cause": true, "causes": true, "attribution": true, "type": true, "kind": true, "role": true,
 	"code": true, "severity": true, "rules": true, "from_state": true, "to_state": true, "from_cause": true,
@@ -1275,15 +1307,17 @@ func (w *demoWorld) buildLedger() {
 			add(t.Add(50*time.Second), 6, func(ts time.Time) { w.anchorLocked(ts, "periodic") })
 		}
 	}
-	// A service restart two days ago (Windows update) and the suspend/resume gap.
+	// A service restart two days ago (Windows update) and the suspend/resume gap. At the stop the
+	// syslog store seals its open chunk.
 	restart := w.created.Add(-2*24*time.Hour - 3*time.Hour - 7*time.Minute)
+	add(restart, 0, func(ts time.Time) { w.sealSyslogLocked(ts, "stop", true) })
 	add(restart, 0, func(ts time.Time) {
 		w.appendLocked(ts, model.TypeMonitorStop, model.MonitorStop{Reason: "system shutdown", UptimeSec: int64(ts.Sub(g).Seconds())})
 	})
 	add(restart.Add(95*time.Second), 0, func(ts time.Time) {
 		w.appendLocked(ts, model.TypeMonitorStart, model.MonitorStart{Software: soft, Host: host, ConfigSHA256: demoConfigSHA, Mode: "service", PrevHead: w.headLocked(), GapSeconds: 95, PrevStopped: true})
 	})
-	// The gateway's syslog (docs/syslog-snmp-traffic.md §3.2) as the monitor records it: a batch
+	// The gateway's syslog (docs/syslog-snmp-traffic.md §3.2) as the monitor keeps it: a batch
 	// of everyday messages every 2 hours on the older days, every 4 minutes over the last day and
 	// every 3 minutes over the last half hour; the incidents add their own (addEventRecords).
 	// Nothing reaches this computer while it sleeps or its link is down, or while the gateway
@@ -1291,7 +1325,7 @@ func (w *demoWorld) buildLedger() {
 	w.syslogSince = restart.Add(95 * time.Second)
 	for t := g.Add(30 * time.Minute).Truncate(time.Minute); t.Before(end); {
 		if !w.syslogQuietAt(t) {
-			add(t.Add(42*time.Second), 8, func(ts time.Time) {
+			w.addSyslogBatch(add, t.Add(42*time.Second), func(ts time.Time) {
 				rejected := 0
 				if noise(ts, 89) > 0.93 {
 					rejected = 1 // a datagram from another device on the home network
@@ -1312,7 +1346,7 @@ func (w *demoWorld) buildLedger() {
 			t = t.Add(3 * time.Minute)
 		}
 	}
-	add(w.created.Add(-47*time.Minute), 8, func(ts time.Time) { w.appendSyslogLocked(ts, 0, oddSyslog(ts)...) })
+	w.addSyslogBatch(add, w.created.Add(-47*time.Minute), func(ts time.Time) { w.appendSyslogLocked(ts, 0, oddSyslog(ts)...) })
 	// The daily check of the gateway's Syslog page (read-only in this version), from each start.
 	for t := g.Add(3 * time.Minute); t.Before(restart); t = t.Add(24 * time.Hour) {
 		if !inGap(t) {
@@ -1331,6 +1365,8 @@ func (w *demoWorld) buildLedger() {
 			add(e.to, 0, func(ts time.Time) {
 				w.appendLocked(ts, model.TypePowerEvent, model.PowerEvent{Kind: "resume_automatic"})
 			})
+			// The chunk left open across the sleep is sealed at the first check after the resume.
+			add(e.to.Add(30*time.Second), 8, func(ts time.Time) { w.sealSyslogLocked(ts, "age", false) })
 			continue
 		}
 		w.addEventRecords(e, add)
@@ -1498,7 +1534,7 @@ func (w *demoWorld) addEventRecords(e *demoEvent, add func(time.Time, int, func(
 	}
 	// The gateway's own messages about the event, as this computer received them.
 	for _, b := range eventSyslog(e) {
-		add(b.at, 8, func(ts time.Time) { w.appendSyslogLocked(ts, 0, eventMessages(b.kind, ts)...) })
+		w.addSyslogBatch(add, b.at, func(ts time.Time) { w.appendSyslogLocked(ts, 0, eventMessages(b.kind, ts)...) })
 	}
 	fiber := e.cause == model.CauseFiberLinkDown || e.cause == model.CauseWANDown
 	outage := e.state == model.StateISPOutage
@@ -1726,19 +1762,304 @@ func demoSyslog(rx time.Time, fac, sev int, app, text string, rfc5424 bool) mode
 	return m
 }
 
-// appendSyslogLocked records a batch of messages received before ts (oldest first), as the
-// monitor does, rejected counting the datagrams of other senders.
+// demoChunkAge is how old the open chunk of the syslog store gets before it is sealed.
+const demoChunkAge = 5 * time.Minute
+
+// addSyslogBatch schedules a batch of syslog messages drained from the receiver at at, and the
+// monitor's check of the open chunk's age demoChunkAge later (it checks every flush interval;
+// not while the computer sleeps, and not after the end of the demo's history).
+func (w *demoWorld) addSyslogBatch(add func(time.Time, int, func(time.Time)), at time.Time, batch func(ts time.Time)) {
+	add(at, 8, batch)
+	if check := at.Add(demoChunkAge + 20*time.Second); check.Before(w.created.Add(-5 * time.Second)) {
+		add(check, 8, func(ts time.Time) {
+			if !w.gapAt(ts) {
+				w.sealSyslogLocked(ts, "age", false)
+			}
+		})
+	}
+}
+
+// gapAt reports whether the monitor was not running at t (the computer slept).
+func (w *demoWorld) gapAt(t time.Time) bool {
+	return slices.ContainsFunc(w.events, func(e *demoEvent) bool { return e.gap && e.covers(t) })
+}
+
+// appendSyslogLocked passes messages received before ts (oldest first) to the syslog store, as
+// the monitor does when it drains the receiver; rejected counts the datagrams of other senders.
+// An open chunk demoChunkAge old is sealed first.
 func (w *demoWorld) appendSyslogLocked(ts time.Time, rejected int, msgs ...model.SyslogMessage) {
 	if len(msgs) == 0 {
 		return
 	}
-	w.appendLocked(ts, model.TypeSyslog, model.SyslogBatch{From: msgs[0].RX, To: ts.UTC().Format(time.RFC3339Nano),
-		Received: len(msgs), Rejected: rejected, Messages: msgs})
+	w.sealSyslogLocked(ts, "age", false)
+	c := w.syslogOpen
+	if c == nil {
+		w.syslogChunkNames++
+		c = &demoChunk{name: fmt.Sprintf("syslog-%s-%04d.jsonl.gz", ts.UTC().Format("20060102T150405Z"), w.syslogChunkNames), opened: ts}
+		w.syslogOpen = c
+	}
+	c.msgs = append(c.msgs, msgs...)
+	c.rejected += rejected
 	if !ts.Before(w.syslogSince) {
 		w.syslogReceived += int64(len(msgs))
 	}
 	last := msgs[len(msgs)-1]
 	w.syslogLast = &last
+}
+
+// demoChunkLines is the content of a chunk file: one message per line, in the order received.
+func demoChunkLines(msgs []model.SyslogMessage) []byte {
+	var b bytes.Buffer
+	for _, m := range msgs {
+		line, err := json.Marshal(m)
+		if err != nil {
+			panic(err)
+		}
+		b.Write(append(line, '\n'))
+	}
+	return b.Bytes()
+}
+
+// rxSpan returns the earliest and the latest receive time of msgs.
+func rxSpan(msgs []model.SyslogMessage) (first, last string) {
+	var lo, hi time.Time
+	for _, m := range msgs {
+		t, err := time.Parse(time.RFC3339Nano, m.RX)
+		if err != nil {
+			continue
+		}
+		if lo.IsZero() || t.Before(lo) {
+			lo, first = t, m.RX
+		}
+		if hi.IsZero() || t.After(hi) {
+			hi, last = t, m.RX
+		}
+	}
+	return first, last
+}
+
+// sealSyslogLocked seals the open chunk when it is demoChunkAge old, or (force) whenever it holds
+// anything, as the syslog store does: the chunk file is compressed and its syslog_chunk record
+// states the SHA-256 of its content; then the oldest chunks beyond the limits are deleted.
+func (w *demoWorld) sealSyslogLocked(now time.Time, reason string, force bool) {
+	c := w.syslogOpen
+	if c == nil || (!force && now.Sub(c.opened) < demoChunkAge) {
+		return
+	}
+	w.syslogOpen = nil
+	raw := demoChunkLines(c.msgs)
+	sum := sha256.Sum256(raw)
+	var gz bytes.Buffer
+	zw := gzip.NewWriter(&gz)
+	zw.Write(raw)
+	zw.Close()
+	c.gz = gz.Bytes()
+	first, last := rxSpan(c.msgs)
+	c.data = model.SyslogChunk{Name: c.name, From: first, To: last, Messages: len(c.msgs), Rejected: c.rejected,
+		Bytes: int64(len(raw)), SHA256: hex.EncodeToString(sum[:]), GzBytes: int64(len(c.gz)), Reason: reason}
+	c.seq = w.appendLocked(now, model.TypeSyslogChunk, c.data).Seq
+	w.syslogChunks = append(w.syslogChunks, c)
+	w.pruneSyslogLocked(now)
+}
+
+// pruneSyslogLocked deletes the oldest sealed chunks while the store holds more than keepMB MiB,
+// or (keepDays > 0) while their newest message is older than keepDays, and records a
+// syslog_prune record naming them.
+func (w *demoWorld) pruneSyslogLocked(now time.Time) {
+	u := w.syslogUsageLocked()
+	total, limit := u.Bytes, int64(w.keepMB)<<20
+	var p model.SyslogPrune
+	for len(w.syslogChunks) > 0 {
+		c := w.syslogChunks[0]
+		to, _ := time.Parse(time.RFC3339Nano, c.data.To)
+		reason := ""
+		switch {
+		case total > limit:
+			reason = fmt.Sprintf("keep_mb %d", w.keepMB)
+		case w.keepDays > 0 && now.Sub(to) > time.Duration(w.keepDays)*24*time.Hour:
+			reason = fmt.Sprintf("keep_days %d", w.keepDays)
+		}
+		if reason == "" {
+			break
+		}
+		if p.Reason == "" {
+			p.Reason = reason
+		}
+		p.Deleted = append(p.Deleted, model.SyslogChunkRef{Name: c.name, SHA256: c.data.SHA256, From: c.data.From, To: c.data.To,
+			Messages: c.data.Messages, GzBytes: c.data.GzBytes})
+		total -= int64(len(c.gz))
+		w.syslogChunks = w.syslogChunks[1:]
+	}
+	if len(p.Deleted) == 0 {
+		return
+	}
+	u = w.syslogUsageLocked()
+	p.KeepMB, p.KeepDays, p.KeptBytes, p.KeptChunks = w.keepMB, w.keepDays, u.Bytes, u.Chunks
+	w.appendLocked(now, model.TypeSyslogPrune, p)
+}
+
+// syslogUsageLocked is the store's volume and limits (SyslogReader.Usage).
+func (w *demoWorld) syslogUsageLocked() model.SyslogUsage {
+	u := model.SyslogUsage{KeepMB: w.keepMB, KeepDays: w.keepDays}
+	for _, c := range w.syslogChunks {
+		u.Bytes += int64(len(c.gz))
+		u.Chunks++
+		u.Messages += int64(len(c.msgs))
+	}
+	if len(w.syslogChunks) > 0 {
+		u.Oldest, u.Newest = w.syslogChunks[0].data.From, w.syslogChunks[len(w.syslogChunks)-1].data.To
+	}
+	if o := w.syslogOpen; o != nil {
+		u.Bytes += int64(len(demoChunkLines(o.msgs)))
+		u.OpenMessages = len(o.msgs)
+		u.Messages += int64(len(o.msgs))
+		first, last := rxSpan(o.msgs)
+		if u.Oldest == "" {
+			u.Oldest = first
+		}
+		u.Newest = last
+	}
+	return u
+}
+
+// Usage reports the syslog store's volume and limits (contracts.SyslogReader).
+func (w *demoWorld) Usage() model.SyslogUsage {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.syslogUsageLocked()
+}
+
+// Query lists the stored messages received in [from, to) that match, newest first, as the
+// syslog store does (contracts.SyslogReader).
+func (w *demoWorld) Query(ctx context.Context, from, to time.Time, match func(*model.SyslogMessage) bool, limit int) ([]model.SyslogEntry, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	type item struct {
+		at  time.Time
+		pos int
+		e   model.SyslogEntry
+	}
+	var all []item
+	w.mu.Lock()
+	chunks := slices.Clone(w.syslogChunks)
+	if w.syslogOpen != nil {
+		chunks = append(chunks, w.syslogOpen)
+	}
+	for _, c := range chunks {
+		for _, m := range c.msgs {
+			at, err := time.Parse(time.RFC3339Nano, m.RX)
+			if err != nil || at.Before(from) || !at.Before(to) || (match != nil && !match(&m)) {
+				continue
+			}
+			all = append(all, item{at, len(all), model.SyslogEntry{Chunk: c.name, SyslogMessage: m}})
+		}
+	}
+	w.mu.Unlock()
+	slices.SortStableFunc(all, func(a, b item) int {
+		if c := b.at.Compare(a.at); c != 0 {
+			return c
+		}
+		return b.pos - a.pos
+	})
+	out := make([]model.SyslogEntry, 0, min(len(all), limit))
+	for _, it := range all[:min(len(all), limit)] {
+		out = append(out, it.e)
+	}
+	return hostileCopy(w.hostile, out), len(all) > limit, nil
+}
+
+// OpenChunk returns the gzip file of a sealed chunk (contracts.SyslogReader).
+func (w *demoWorld) OpenChunk(name string) (io.ReadCloser, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, c := range w.syslogChunks {
+		if c.name == name {
+			return io.NopCloser(bytes.NewReader(c.gz)), nil
+		}
+	}
+	return nil, fmt.Errorf("syslog chunk %s: %w", name, contracts.ErrNotFound)
+}
+
+// retentionWords words a syslog retention setting as the demo monitor records it.
+func retentionWords(keepMB, keepDays int) string {
+	if keepDays > 0 {
+		return fmt.Sprintf("%d MiB, %d days", keepMB, keepDays)
+	}
+	return fmt.Sprintf("%d MiB, no age limit", keepMB)
+}
+
+// SetSyslogRetention changes how much syslog is kept, as the monitor does: the setting is
+// recorded as a config_change and applied at once, deleting what no longer fits (syslog_prune).
+// The limits in force change, record and delete nothing ("unchanged: already in force").
+func (w *demoWorld) SetSyslogRetention(ctx context.Context, keepMB, keepDays int, actor string) (model.ConfigChange, error) {
+	select {
+	case <-time.After(300 * time.Millisecond): // saving the configuration, deleting chunks
+	case <-ctx.Done():
+		return model.ConfigChange{}, ctx.Err()
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	now := time.Now()
+	cc := model.ConfigChange{Target: "monitor", What: "syslog.keep_mb, syslog.keep_days (how much gateway syslog is kept)",
+		Before: retentionWords(w.keepMB, w.keepDays), After: retentionWords(keepMB, keepDays), Actor: actor, Result: "applied"}
+	if keepMB == w.keepMB && keepDays == w.keepDays {
+		cc.Result = "unchanged: already in force"
+		return cc, nil
+	}
+	w.keepMB, w.keepDays = keepMB, keepDays
+	w.appendLocked(now, model.TypeConfigChange, cc)
+	w.pruneSyslogLocked(now)
+	return cc, nil
+}
+
+// demoLiveInterval is how often the demo's flow meter reads the gateway's counters.
+const demoLiveInterval = 5 * time.Second
+
+// LiveTraffic is the flow meter (contracts.LiveTrafficSource): the newest rates and those of the
+// last 15 minutes, from the simulated traffic of each minute with the jitter of a 5-second
+// reading; liveState shows its other states.
+func (w *demoWorld) LiveTraffic(ctx context.Context) (model.LiveTraffic, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	last := time.Now().Truncate(demoLiveInterval)
+	rate := func(v float64) *float64 {
+		v = math.Round(v*1000) / 1000
+		return &v
+	}
+	reading := func(t time.Time) model.LivePoint {
+		tr := w.trafficMinute(t.Truncate(time.Minute))
+		p := model.LivePoint{T: t.UTC().Format(time.RFC3339Nano)}
+		if tr.wan {
+			rx, tx := tr.rx*(0.7+0.6*noise(t, 130)), tr.tx*(0.8+0.4*noise(t, 131))
+			if w.liveState == "atleast" {
+				rx, tx = 700+260*noise(t, 132), 36+8*noise(t, 133)
+			}
+			p.WANRx, p.WANTx = rate(rx), rate(tx)
+		}
+		if tr.pc {
+			p.PCRx, p.PCTx = rate(tr.pcRx*(0.7+0.6*noise(t, 134))), rate(tr.pcTx*(0.8+0.4*noise(t, 135)))
+		}
+		return p
+	}
+	lt := model.LiveTraffic{IntervalS: demoLiveInterval.Seconds()}
+	switch w.liveState {
+	case "unavailable":
+		return model.LiveTraffic{}, fmt.Errorf("the gateway's counters cannot be read: %w", contracts.ErrUnavailable)
+	case "first": // one reading: a rate needs two
+		return hostileCopy(w.hostile, model.LiveTraffic{At: last.UTC().Format(time.RFC3339Nano)}), nil
+	}
+	for t := last.Add(-15*time.Minute + demoLiveInterval); !t.After(last); t = t.Add(demoLiveInterval) {
+		lt.History = append(lt.History, reading(t))
+	}
+	if w.liveState == "error" { // the newest read failed: the rates are the reading before
+		lt.History = lt.History[:len(lt.History)-1]
+		lt.Err = "gateway " + demoGateway + ": GET /cgi-bin/broadbandstatistics.ha: context deadline exceeded (Client.Timeout exceeded while awaiting headers)"
+	}
+	newest := lt.History[len(lt.History)-1]
+	lt.At, lt.WANRx, lt.WANTx, lt.PCRx, lt.PCTx = newest.T, newest.WANRx, newest.WANTx, newest.PCRx, newest.PCTx
+	lt.AtLeast = w.liveState == "atleast"
+	return hostileCopy(w.hostile, lt), nil
 }
 
 // syslogQuietAt reports whether no syslog message reaches this computer at t: the monitor is
@@ -1813,6 +2134,23 @@ func oddSyslog(ts time.Time) []model.SyslogMessage {
 			" LEN=60 TOS=0x00 PREC=0x00 TTL=50 ID=54321 DF PROTO=TCP SPT=44532 DPT=23 WINDOW=64240 RES=0x00 SYN URGP=0 OPT (020405B40402080A3C5D1A2B0000000001030307) payload="+
 			strings.Repeat("QUFBQUFBQUFBQUFB", 12), false),
 	}
+}
+
+// floodSyslog stores n datagrams of 8 KiB of control characters, received in the last minute
+// from the gateway's address, as a sender that floods it would make them, and seals their
+// chunk: the newest messages of the Syslog page, more than one answer holds.
+func (w *demoWorld) floodSyslog(n int) {
+	now := time.Now()
+	flood := strings.Repeat("\x01", 8192)
+	msgs := make([]model.SyslogMessage, 0, n)
+	for i := 0; i < n; i++ {
+		msgs = append(msgs, model.SyslogMessage{RX: now.Add(-time.Minute + time.Duration(i)*time.Millisecond).UTC().Format(time.RFC3339Nano),
+			Src: demoGateway + ":514", Raw: flood, Format: "unknown", Msg: flood})
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.appendSyslogLocked(now, 0, msgs...)
+	w.sealSyslogLocked(now, "size", true)
 }
 
 // demoSyslogAt is a batch of the gateway's messages about an event, recorded at at.
@@ -1890,8 +2228,9 @@ func (w *demoWorld) syslogCheckLocked(ts time.Time) {
 }
 
 // syslogStatusLocked is Status.Syslog: the receiver listening, its counters since the service
-// started, the newest message and the gateway's Syslog setting as last read. /demo/syslog shows
-// the other states the dashboard words (syslogState).
+// started, the newest message, the gateway's Syslog setting as last read and the syslog store's
+// volume. /demo/syslog shows the other states the dashboard words (syslogState; "nostore": a
+// monitor without a store).
 func (w *demoWorld) syslogStatusLocked() *model.SyslogStatus {
 	if w.syslogState == "none" {
 		return nil
@@ -1899,15 +2238,29 @@ func (w *demoWorld) syslogStatusLocked() *model.SyslogStatus {
 	sl := &model.SyslogStatus{Enabled: true, Listening: true, Listen: "0.0.0.0:514", Received: w.syslogReceived, Recorded: w.syslogReceived,
 		Rejected: 7, State: "ok", GatewayAt: w.syslogCheck.TS, GatewaySeq: w.syslogCheck.Seq,
 		Gateway: &model.SyslogSetting{Enabled: true, Server: "192.168.1.71", Port: 514, Level: "Informational", Levels: demoSyslogLevels}}
+	if w.syslogState != "nostore" {
+		u := w.syslogUsageLocked()
+		sl.Store = &u
+	}
 	if m := w.syslogLast; m != nil {
 		sl.LastAt, sl.Last = m.RX, m.Raw
 		if sl.Last == "" {
 			sl.Last = m.Msg
 		}
+		if len(sl.Last) > 200 { // shortened as the monitor does (maxSyslogLast)
+			cut := 200
+			for cut > 0 && !utf8.RuneStart(sl.Last[cut]) {
+				cut--
+			}
+			sl.Last = sl.Last[:cut] + "…"
+		}
 	}
 	switch w.syslogState {
-	case "off":
+	case "off": // messages arrive although the setting read says off: it was set by hand since
 		sl.State, sl.Gateway = "off", &model.SyslogSetting{Levels: demoSyslogLevels}
+	case "offquiet": // off, and nothing received since the service started
+		sl.State, sl.Gateway = "off", &model.SyslogSetting{Levels: demoSyslogLevels}
+		sl.Received, sl.Recorded, sl.LastAt, sl.Last = 0, 0, "", ""
 	case "elsewhere":
 		sl.State, sl.Gateway = "elsewhere", &model.SyslogSetting{Enabled: true, Server: "192.168.1.20", Port: 1514, Level: "Debug", Levels: demoSyslogLevels}
 	case "error":
@@ -2814,7 +3167,15 @@ const demoHost = "127.0.0.1:8399"
 
 func newDemoServer(t *testing.T, w *demoWorld, logger *slog.Logger) *Server {
 	t.Helper()
-	srv, err := New(Options{Listen: demoHost, Status: w, Actions: w, Reader: w, Verifier: w, Exporter: w, Version: "demo", Logger: logger})
+	return newDemoServerOn(t, w, demoHost, logger)
+}
+
+// newDemoServerOn serves w as the monitor, its ledger, syslog store and flow meter, for the
+// dashboard on listen.
+func newDemoServerOn(t *testing.T, w *demoWorld, listen string, logger *slog.Logger) *Server {
+	t.Helper()
+	srv, err := New(Options{Listen: listen, Status: w, Actions: w, Reader: w, Verifier: w, Exporter: w,
+		SyslogReader: w, SyslogControl: w, LiveTraffic: w, Version: "demo", Logger: logger})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3044,7 +3405,43 @@ func TestDemoWorldEndpoints(t *testing.T) {
 		}
 		prevRX = rx
 	}
-	isRecord("syslog batch", sl.Messages[0].Seq, model.TypeSyslog)
+	// The newest messages are in the open chunk, which has no record yet; every other message
+	// names the syslog_chunk record of its chunk, whose period covers it.
+	w.mu.Lock()
+	open := w.syslogOpen.name
+	w.mu.Unlock()
+	if m := sl.Messages[0]; m.Chunk != open || m.Seq != 0 {
+		t.Errorf("newest message: chunk %q seq %d, want the open chunk %s without a record", m.Chunk, m.Seq, open)
+	}
+	linked := 0
+	for _, m := range sl.Messages {
+		if m.Chunk == open {
+			continue
+		}
+		if m.Seq == 0 {
+			t.Errorf("message of the sealed chunk %s without its record: %+v", m.Chunk, m)
+			continue
+		}
+		linked++
+		var rec []RecordView
+		strict(ok(demoGet(t, h, "GET", "/api/records?limit=1&from_seq="+strconv.FormatUint(m.Seq, 10), ""), 200), &rec)
+		var c struct {
+			Data model.SyslogChunk `json:"data"`
+		}
+		if len(rec) != 1 || rec[0].Type != model.TypeSyslogChunk || json.Unmarshal(rec[0].Body, &c) != nil || c.Data.Name != m.Chunk ||
+			c.Data.SHA256 == "" || c.Data.Messages == 0 {
+			t.Fatalf("message %+v: record %+v", m, rec)
+		}
+		rx, _ := time.Parse(time.RFC3339Nano, m.RX)
+		first, err1 := time.Parse(time.RFC3339Nano, c.Data.From)
+		last, err2 := time.Parse(time.RFC3339Nano, c.Data.To)
+		if err1 != nil || err2 != nil || rx.Before(first) || rx.After(last) {
+			t.Errorf("message received %s, outside its chunk record's period %s .. %s", m.RX, c.Data.From, c.Data.To)
+		}
+	}
+	if linked == 0 {
+		t.Error("no message names its chunk's record")
+	}
 	window := func(inc model.Incident, extra string) model.SyslogList {
 		t.Helper()
 		opened, err1 := time.Parse(time.RFC3339Nano, inc.Opened)
@@ -3068,10 +3465,16 @@ func TestDemoWorldEndpoints(t *testing.T) {
 	for _, inc := range incs {
 		byCause[inc.Cause] = inc
 	}
-	fiberLog := msgs(window(byCause[model.CauseFiberLinkDown], ""))
+	fiberWin := window(byCause[model.CauseFiberLinkDown], "")
+	fiberLog := msgs(fiberWin)
 	for _, want := range []string{"ponlinkd: PON link state O5 -> O1 (loss of signal)", "ponlinkd: PON link state O1 -> O5 (operation)"} {
 		if !slices.Contains(fiberLog, want) {
 			t.Errorf("the fiber outage's syslog lacks %q: %q", want, fiberLog)
+		}
+	}
+	for _, m := range fiberWin.Messages { // sealed within minutes, hours ago
+		if m.Seq == 0 {
+			t.Errorf("the fiber outage's message %q names no chunk record", m.Msg)
 		}
 	}
 	if crit := msgs(window(byCause[model.CauseFiberLinkDown], "&severity=crit")); len(crit) != 2 {
@@ -3215,6 +3618,75 @@ func TestDemoWorldEndpoints(t *testing.T) {
 	if len(incs) != 9 || incs[0].Open {
 		t.Fatalf("incidents after recovery: %d", len(incs))
 	}
+	// The flow meter (docs/syslog-snmp-traffic.md §3.3): the newest rates and the readings of the
+	// last 15 minutes, oldest first; its other states.
+	var lt model.LiveTraffic
+	strict(ok(demoGet(t, h, "GET", "/api/traffic/live", ""), 200), &lt)
+	if lt.At == "" || lt.WANRx == nil || lt.WANTx == nil || lt.PCRx == nil || lt.IntervalS != 5 || len(lt.History) != 180 || lt.AtLeast || lt.Err != "" ||
+		lt.History[len(lt.History)-1].T != lt.At {
+		t.Errorf("flow meter: %+v (%d readings)", lt, len(lt.History))
+	}
+	for state, check := range map[string]func(model.LiveTraffic) bool{
+		"atleast": func(lt model.LiveTraffic) bool { return lt.AtLeast && lt.WANRx != nil && *lt.WANRx >= 700 },
+		"error":   func(lt model.LiveTraffic) bool { return lt.Err != "" && lt.WANRx != nil && len(lt.History) == 179 },
+		"first":   func(lt model.LiveTraffic) bool { return lt.At != "" && lt.WANRx == nil && len(lt.History) == 0 },
+	} {
+		w.mu.Lock()
+		w.liveState = state
+		w.mu.Unlock()
+		strict(ok(demoGet(t, h, "GET", "/api/traffic/live", ""), 200), &lt)
+		if !check(lt) {
+			t.Errorf("flow meter %s: %+v", state, lt)
+		}
+	}
+	w.mu.Lock()
+	w.liveState = "unavailable"
+	w.mu.Unlock()
+	ok(demoGet(t, h, "GET", "/api/traffic/live", ""), 503)
+	w.mu.Lock()
+	w.liveState = ""
+	w.mu.Unlock()
+
+	// How much syslog is kept: the operator's choice is recorded and applied at once; the chunks
+	// older than the age limit are deleted, and the deletion is recorded with their SHA-256.
+	strict(ok(demoGet(t, h, "POST", "/api/syslog/retention", `{"keep_mb":50,"keep_days":3}`), 200), &cc)
+	if cc.Before != "100 MiB, no age limit" || cc.After != "50 MiB, 3 days" || cc.Actor != "operator via web" || cc.Result != "applied" {
+		t.Errorf("retention change = %+v", cc)
+	}
+	strict(ok(demoGet(t, h, "GET", "/api/status", ""), 200), &st)
+	if u := st.Syslog.Store; u == nil || u.KeepMB != 50 || u.KeepDays != 3 || u.Chunks == 0 || u.Bytes == 0 {
+		t.Errorf("syslog store after the change: %+v", u)
+	} else if oldest, err := time.Parse(time.RFC3339Nano, u.Oldest); err != nil || time.Since(oldest) > 3*24*time.Hour+time.Hour {
+		t.Errorf("oldest message kept: %s", u.Oldest)
+	}
+	var pruned []RecordView
+	strict(ok(demoGet(t, h, "GET", "/api/records?type=syslog_prune&limit=5", ""), 200), &pruned)
+	var pr struct {
+		Data model.SyslogPrune `json:"data"`
+	}
+	if len(pruned) != 1 || json.Unmarshal(pruned[0].Body, &pr) != nil || pr.Data.Reason != "keep_days 3" || len(pr.Data.Deleted) == 0 ||
+		pr.Data.KeepMB != 50 || pr.Data.KeepDays != 3 || pr.Data.Deleted[0].SHA256 == "" {
+		t.Errorf("syslog_prune: %+v", pr.Data)
+	}
+	strict(ok(demoGet(t, h, "GET", "/api/syslog?limit=5000&from="+time.Now().Add(-7*24*time.Hour).UTC().Format(time.RFC3339), ""), 200), &sl)
+	for _, m := range sl.Messages {
+		if rx, _ := time.Parse(time.RFC3339Nano, m.RX); time.Since(rx) > 3*24*time.Hour+time.Hour {
+			t.Fatalf("message kept beyond the age limit: %+v", m)
+		}
+	}
+	// The limits in force again: nothing changes, nothing is recorded.
+	w.mu.Lock()
+	records := len(w.envs)
+	w.mu.Unlock()
+	strict(ok(demoGet(t, h, "POST", "/api/syslog/retention", `{"keep_mb":50,"keep_days":3}`), 200), &cc)
+	w.mu.Lock()
+	added := len(w.envs) - records
+	w.mu.Unlock()
+	if cc.Result != "unchanged: already in force" || added != 0 {
+		t.Errorf("the limits in force saved again: %+v, %d records added", cc, added)
+	}
+	ok(demoGet(t, h, "POST", "/api/syslog/retention", `{"keep_mb":0}`), 400)
+
 	strict(ok(demoGet(t, h, "POST", "/api/verify", ""), 200), &rep)
 	if !rep.OK {
 		t.Fatalf("ledger does not verify after actions: %+v", rep.Failures)
@@ -3241,7 +3713,16 @@ func TestDemoServer(t *testing.T) {
 		w.setOutage(true)
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	srv := newDemoServer(t, w, logger)
+	listen := demoHost
+	if v := os.Getenv("ATTMON_WEB_DEMO_LISTEN"); v != "" {
+		listen = v
+	}
+	ln, err := net.Listen("tcp", listen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String() // the port bound, which the Host allow-list follows
+	srv := newDemoServerOn(t, w, addr, logger)
 	ctx, cancel := context.WithTimeout(context.Background(), dur)
 	defer cancel()
 
@@ -3352,11 +3833,33 @@ func TestDemoServer(t *testing.T) {
 		w.mu.Unlock()
 		fmt.Fprintln(rw, "ok")
 	})
-	// /demo/syslog?state=off|elsewhere|error|unknown|enforce|nolisten|disabled|none shows the
-	// gateway syslog card in that state (no state: the gateway sends here).
+	// /demo/syslogflood?n=300 stores n datagrams of 8 KiB of control characters as the newest
+	// messages (more than one answer of GET /api/syslog holds).
+	mux.HandleFunc("/demo/syslogflood", func(rw http.ResponseWriter, r *http.Request) {
+		n := 300
+		if v := r.URL.Query().Get("n"); v != "" {
+			var err error
+			if n, err = strconv.Atoi(v); err != nil || n < 1 || n > MaxSyslogLimit {
+				http.Error(rw, "bad n", http.StatusBadRequest)
+				return
+			}
+		}
+		w.floodSyslog(n)
+		fmt.Fprintln(rw, "ok")
+	})
+	// /demo/syslog?state=off|offquiet|elsewhere|error|unknown|enforce|nolisten|disabled|nostore|none
+	// shows the gateway syslog card in that state (no state: the gateway sends here).
 	mux.HandleFunc("/demo/syslog", func(rw http.ResponseWriter, r *http.Request) {
 		w.mu.Lock()
 		w.syslogState = r.URL.Query().Get("state")
+		w.mu.Unlock()
+		fmt.Fprintln(rw, "ok")
+	})
+	// /demo/live?state=atleast|error|first|unavailable shows the flow meter in that state (no
+	// state: the line's traffic now).
+	mux.HandleFunc("/demo/live", func(rw http.ResponseWriter, r *http.Request) {
+		w.mu.Lock()
+		w.liveState = r.URL.Query().Get("state")
 		w.mu.Unlock()
 		fmt.Fprintln(rw, "ok")
 	})
@@ -3375,13 +3878,9 @@ func TestDemoServer(t *testing.T) {
 		cancel()
 	})
 	mux.Handle("/", srv.Handler())
-	ln, err := net.Listen("tcp", demoHost)
-	if err != nil {
-		t.Fatal(err)
-	}
 	hs := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	go hs.Serve(ln)
-	t.Logf("demo dashboard on http://%s/ for %v (GET /demo/quit to stop)", demoHost, dur)
+	t.Logf("demo dashboard on http://%s/ for %v (GET /demo/quit to stop)", addr, dur)
 	<-ctx.Done()
 	shCtx, stop := context.WithTimeout(context.Background(), 2*time.Second)
 	defer stop()
