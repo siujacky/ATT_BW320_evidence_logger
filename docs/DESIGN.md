@@ -537,9 +537,11 @@ LocalSystem, automatic start, recovery: restart after 10 s / 30 s / 60 s. Accept
 Shutdown, PowerEvent (records `power_event`). Event Log source `ATTMonitor`.
 
 ```
+att-monitor setup                                           guided install/update (also run by a double-click):
+                                                            asks only for the gateway's Device Access Code
 att-monitor install [--data DIR] [--listen 127.0.0.1:8320]  copy exe to "C:\Program Files\ATT Monitor\",
                                                             create service + event source + data dir ACL, start
-att-monitor uninstall                                       remove service (data is kept)
+att-monitor uninstall [--interactive]                       remove service, program, shortcut, Settings entry (data is kept)
 att-monitor start | stop | status
 att-monitor run [--data DIR]                                foreground (console) mode
 att-monitor service                                         entry point used by the SCM
@@ -557,6 +559,23 @@ att-monitor version
 Commands that write to the ledger go through the running service's localhost API; when the
 service is not running they open the ledger directly (the writer lock prevents two writers).
 `password.txt` format: lines `ip:<host>` and `password:<access code>`.
+
+**Guided setup** (`setup`, and a start without arguments from Explorer, detected by the process
+owning its console): without administrator rights it re-starts itself elevated (ShellExecuteEx
+"runas", UAC prompt) in a window of its own and waits. The elevated part identifies the gateway
+(sysinfo, no login), asks for the Device Access Code with console echo off, and checks it with a
+read-only authenticated request (the events page, as `gateway notification status`) through one
+gateway client, so the client's login policy applies across attempts: one attempt per minute
+(setup waits) and none after three rejections within an hour (setup offers to install without the
+code). The check trusts the certificate on first use only for itself, or uses the service's pin on
+an update; nothing is saved from it. A code that cannot be checked (gateway unreachable, sessions
+full) is stored unchecked. It then runs the same install/upgrade as `install`, which also adds
+the program to Settings > Apps (HKLM `SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\ATTMonitor`,
+uninstall string `att-monitor.exe uninstall --interactive`) and a Start menu shortcut to the
+dashboard. Back without administrator rights, setup shows the version, the dashboard address and
+the evidence key from `/api/status` and opens the dashboard in the user's browser.
+`uninstall --interactive` asks for confirmation and elevation itself; the installed program file
+is deleted at the next restart when it is the one running.
 
 ## 15. Configuration (`config.json`, see `internal/config`)
 

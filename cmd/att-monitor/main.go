@@ -20,8 +20,10 @@ var (
 const usageText = `att-monitor — AT&T Internet Monitor (evidence logger)
 
 Usage:
+  att-monitor setup                            guided install: asks for the gateway's Device Access Code
+                                               (also what a double-click on att-monitor.exe runs)
   att-monitor install [--data DIR] [--listen 127.0.0.1:8320] [--access-code-file PATH] [--bootstrap DIR]
-  att-monitor uninstall
+  att-monitor uninstall [--interactive]
   att-monitor start | stop | status
   att-monitor run [--data DIR]                 run in the foreground (console mode)
   att-monitor set-access-code (--file PATH | --stdin) [--data DIR]
@@ -62,6 +64,10 @@ func run(args []string) error {
 		if isService() {
 			return cmdService(nil)
 		}
+		if setupWanted() {
+			// Started from Explorer (a double-click): the guided setup.
+			return cmdSetup(nil)
+		}
 		fmt.Print(usageText)
 		return nil
 	}
@@ -71,6 +77,8 @@ func run(args []string) error {
 		return cmdService(rest)
 	case "run":
 		return cmdRun(rest)
+	case "setup":
+		return cmdSetup(rest)
 	case "install":
 		return cmdInstall(rest)
 	case "uninstall":

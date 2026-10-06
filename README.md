@@ -90,6 +90,28 @@ flowchart LR
 
 ## Install
 
+### Quick install (no build tools needed)
+
+1. On the PC that is connected to your AT&T gateway, download **`ATT-Monitor-Setup-<version>.exe`** from
+   the [latest release](https://github.com/siujacky/ATT_BW320_evidence_logger/releases/latest).
+2. Double-click it. The program is not code-signed, so Windows may say it protected your PC: choose
+   **More info → Run anyway**. Then choose **Yes** when Windows asks for administrator permission.
+3. Type the **Device Access Code** printed on the label of your AT&T gateway (not the Wi-Fi password).
+   What you type is not shown.
+
+Setup checks the code with the gateway (a read-only login), installs and starts the service, shows your
+**evidence key** and opens the dashboard. Write the key down or email it to yourself: it identifies your
+evidence. If the code is mistyped, setup asks again; the gateway allows one login attempt per minute, so
+it waits when needed, and after three rejections it stops trying for an hour, so the gateway's login is
+never locked.
+
+Running the same file again updates the program; press Enter at the code prompt to keep the stored
+code. The dashboard is also in the Start menu ("AT&T Internet Monitor"). To uninstall, open Settings →
+Apps → Installed apps → *AT&T Internet Monitor (evidence logger)* → Uninstall. Your evidence in
+`C:\ProgramData\ATTMonitor` is kept.
+
+### Build from source
+
 1. Get the code and build it:
 
    ```powershell
@@ -121,9 +143,13 @@ flowchart LR
    If you saved gateway pages before installing (setup-time evidence), pass the folder with
    `--bootstrap DIR`; it is imported into the ledger as the first record after genesis.
 
-**Upgrade:** build a newer version and run `install` again (elevated). The service stops, the program
-is replaced and the service restarts; the ledger continues. **Uninstall:** `att-monitor uninstall`
-removes the service and keeps the evidence in `C:\ProgramData\ATTMonitor`.
+You can also double-click `bin\att-monitor.exe`, or run `att-monitor setup`, for the guided setup
+described above.
+
+**Upgrade:** build a newer version and run `install` (or `setup`) again, elevated. The service stops,
+the program is replaced and the service restarts; the ledger continues. **Uninstall:** Settings → Apps,
+or `att-monitor uninstall`. Either way the service, the program, its Start menu shortcut and its
+Settings entry are removed, and the evidence in `C:\ProgramData\ATTMonitor` is kept.
 
 ## The gateway's outage "hijack" redirect
 
@@ -270,8 +296,10 @@ it step by step; [docs/DESIGN.md](docs/DESIGN.md) is the full specification and
 ## Commands
 
 ```text
+att-monitor setup                                 guided install (what a double-click runs): asks only for
+                                                  the gateway's Device Access Code
 att-monitor install [--data DIR] [--listen 127.0.0.1:8320] [--access-code-file PATH] [--bootstrap DIR]
-att-monitor uninstall | start | stop | status
+att-monitor uninstall [--interactive] | start | stop | status
 att-monitor run [--data DIR]                      run in the foreground (console mode)
 att-monitor set-access-code (--file PATH | --stdin)
 att-monitor gateway notification [status|on|off]
