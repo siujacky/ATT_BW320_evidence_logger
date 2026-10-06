@@ -276,6 +276,11 @@ type SyslogStore interface {
 // fits, recorded as syslog_prune) and returns the change.
 type SyslogControl interface {
 	SetSyslogRetention(ctx context.Context, keepMB, keepDays int, actor string) (model.ConfigChange, error)
+	// SetGatewaySyslog is the operator's choice for the gateway's Syslog page: enabled sets it
+	// to send to this computer (and keeps it so: gateway.enforce_syslog true), disabled switches
+	// it off on the gateway and stops enforcing. Both are read back from the gateway and recorded
+	// (gateway_event syslog_setting with the pages before and after, config_change).
+	SetGatewaySyslog(ctx context.Context, enabled bool, actor string) (model.ConfigChange, error)
 }
 
 // LiveTrafficSource gives the dashboard's flow meter (implemented by monitor.Monitor): each call

@@ -3886,3 +3886,8 @@ func TestDemoServer(t *testing.T) {
 	defer stop()
 	hs.Shutdown(shCtx)
 }
+
+// SetGatewaySyslog: phase 2 of docs/syslog-snmp-traffic.md gives the demo its behaviour.
+func (w *demoWorld) SetGatewaySyslog(ctx context.Context, enabled bool, actor string) (model.ConfigChange, error) {
+	return model.ConfigChange{}, errors.New("demo: not available")
+}

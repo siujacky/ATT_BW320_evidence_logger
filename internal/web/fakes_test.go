@@ -811,3 +811,8 @@ func wantJSONError(t *testing.T, rec *httptest.ResponseRecorder, code int) strin
 	}
 	return e.Error
 }
+
+// SetGatewaySyslog: phase 2 of docs/syslog-snmp-traffic.md gives the fake its behaviour.
+func (f *fakeSyslogControl) SetGatewaySyslog(ctx context.Context, enabled bool, actor string) (model.ConfigChange, error) {
+	return model.ConfigChange{}, errors.New("not configured in this test")
+}

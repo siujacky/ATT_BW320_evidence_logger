@@ -71,9 +71,15 @@ type GatewayConfig struct {
 	// PendingCertSHA256 is a changed gateway certificate seen but not yet confirmed by the operator.
 	// While set, status pages are still read (evidence continuity) but no authenticated request is
 	// sent (an impostor could otherwise collect MD5(access code + nonce)).
-	PendingCertSHA256         string   `json:"pending_cert_sha256,omitempty"`
-	AccessCodeProtected       string   `json:"access_code_protected,omitempty"` // base64 DPAPI blob
-	EnforceNotificationOff    bool     `json:"enforce_notification_off"`
+	PendingCertSHA256      string `json:"pending_cert_sha256,omitempty"`
+	AccessCodeProtected    string `json:"access_code_protected,omitempty"` // base64 DPAPI blob
+	EnforceNotificationOff bool   `json:"enforce_notification_off"`
+	// EnforceSyslog keeps the gateway's Syslog page set to send its log to this computer
+	// (docs/syslog-snmp-traffic.md phase 2): on, this computer's address, syslog.port, and
+	// SyslogLevel - when empty, the level already set while syslog is on, else an option named
+	// like "Informational", else the most detailed option that is not "Debug".
+	EnforceSyslog             bool     `json:"enforce_syslog"`
+	SyslogLevel               string   `json:"syslog_level,omitempty"`
 	NotificationCheckInterval Duration `json:"notification_check_interval"`
 	PollInterval              Duration `json:"poll_interval"`
 	IncidentPollInterval      Duration `json:"incident_poll_interval"`
@@ -206,6 +212,7 @@ func Default() *Config {
 			Host:                      "192.168.1.254",
 			Scheme:                    "https",
 			EnforceNotificationOff:    true,
+			EnforceSyslog:             true,
 			NotificationCheckInterval: D(24 * time.Hour),
 			PollInterval:              D(60 * time.Second),
 			IncidentPollInterval:      D(15 * time.Second),
