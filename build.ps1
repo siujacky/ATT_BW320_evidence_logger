@@ -9,7 +9,7 @@
 param(
   [switch]$SkipTests,
   [switch]$Install,
-  [string]$Version = "1.3.0"
+  [string]$Version = "1.4.0"
 )
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot

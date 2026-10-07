@@ -547,7 +547,7 @@ func TestDashboardGatewaySyslogBlocked(t *testing.T) {
 			w.syslogState = "pending" // kept, but read as off: att-monitor cannot set it now
 			w.mu.Unlock()
 			rep := runDashboard(t, w, "overview")
-			for _, view := range []string{"overview", "syslog"} {
+			for _, view := range []string{"overview syslog", "syslog"} {
 				v := rep.Views[view]
 				for _, b := range []string{sendButton, stopButton} {
 					if s := buttonState(v, b); s != "disabled" {

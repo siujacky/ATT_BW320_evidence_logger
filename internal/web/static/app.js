@@ -194,8 +194,13 @@
   const SYSLOG_KEEP_MB_MAX = 1048576;
   const SYSLOG_KEEP_DAYS_MAX = 3650;
   const MIB = 1048576;
-  // The flow meter asks for a reading this often while the Overview is shown (GET /api/traffic/live).
+  // The flow meter asks for a reading this often while the Overview's Traffic card or its details
+  // are on screen (GET /api/traffic/live).
   const LIVE_REFRESH_MS = 5000;
+  // The Overview's Network card reads its figures (the last 24 hours of the gateway's firewall and
+  // of the connections) this often: they change slowly, and the Network page shows them minute by
+  // minute.
+  const NET_SUMMARY_MS = 5 * 60000;
   // The Network page (docs/syslog-map-graphic.md): its periods (range= of /api/network/*, each
   // ending now), how often it reads its data again while shown, the longest period the server
   // reads, the table rows asked for (the most an answer holds), the longest device key the
@@ -226,6 +231,11 @@
     view: null,
   };
   if (!RANGES.some(([v]) => v === app.range)) app.range = '24h';
+
+  // seriesCache holds the newest series read of each range (GET /api/series), {ser, at}: the
+  // Overview's strip and sparklines and a details modal's charts of the same range share one read,
+  // rather than each downloading it every minute.
+  const seriesCache = Object.create(null);
 
   // ------------------------------------------------------------------ DOM helpers
 
@@ -297,23 +307,24 @@
   }
 
   /** placeChildren makes kids (as add() takes them) the children of el, in order, leaving where
-   *  it is every node that is already in its place: replace() would take a part a view keeps
-   *  (the flow meter, the gateway syslog card) out of the page and put it back, which loses the
-   *  keyboard focus in it and can make a screen reader announce its live region again. A node
-   *  that goes is replaced where it was. */
+   *  it is every node of el that stays: replace() would take a part a view keeps (the flow meter,
+   *  the gateway syslog card, the incident link of the status card, a chart) out of the page and
+   *  put it back, which loses the keyboard focus in it and can make a screen reader announce its
+   *  live region again. The nodes that go are removed first and the new ones are put around those
+   *  that stay, so that a node that stays is never moved for another's sake (as when a line
+   *  before it appears or goes): only kept nodes whose order changed move. */
   function placeChildren(el, ...kids) {
     const want = [];
     for (const k of kids.flat(Infinity)) {
       if (k == null || k === false || k === '') continue;
       want.push(k instanceof Node ? k : document.createTextNode(String(k)));
     }
+    const stays = new Set(want);
+    for (const c of Array.from(el.childNodes)) if (!stays.has(c)) el.removeChild(c);
     want.forEach((k, i) => {
       const cur = el.childNodes[i];
-      if (cur === k) return;
-      if (cur && !want.includes(cur)) cur.replaceWith(k);
-      else el.insertBefore(k, cur || null);
+      if (cur !== k) el.insertBefore(k, cur || null);
     });
-    while (el.childNodes.length > want.length) el.removeChild(el.lastChild);
     return el;
   }
 
@@ -330,10 +341,20 @@
     try { window.localStorage.setItem('attmon.' + key, value); } catch (_) { /* private mode */ }
   }
 
+  /** announce says msg to a screen reader: in the live region of the topmost modal dialog open
+   *  (the Overview's details, a confirmation), else in the page's (#live). A modal dialog makes the
+   *  rest of the page inert, and an inert live region is never read. */
   function announce(msg) {
-    const live = document.getElementById('live');
+    const open = document.querySelectorAll('dialog[open]');
+    const top = open.length ? open[open.length - 1] : null;
+    const live = (top && top.querySelector('[data-announce]')) || document.getElementById('live');
     live.textContent = '';
     window.setTimeout(() => { live.textContent = msg; }, 60);
+  }
+
+  /** announcer is a modal dialog's own polite live region for announce(). */
+  function announcer() {
+    return h('p', { class: 'sr-only', 'aria-live': 'polite', 'aria-atomic': 'true', 'data-announce': '' });
   }
 
   // ------------------------------------------------------------------ formatting
@@ -434,6 +455,16 @@
     const f = Math.pow(10, digits);
     if (p > 0 && p * f < 1) return '< ' + (1 / f).toFixed(digits) + ' %';
     return (Math.floor(p * f) / f).toFixed(digits) + ' %';
+  }
+
+  /** lossText writes a packet loss in percent rounded to a tenth, as the loss chart's tooltip
+   *  does: fmtPct truncates (so as never to overstate availability), which would understate a
+   *  loss; one too small for a tenth is "< 0.1 %", never 0. */
+  function lossText(p) {
+    if (p == null || !isFinite(p)) return '—';
+    if (p <= 0) return '0 %';
+    if (p < 0.1) return '< 0.1 %';
+    return (Math.round(p * 10) / 10).toFixed(1) + ' %';
   }
 
   function fmtBytes(n) {
@@ -781,11 +812,6 @@
     return h('section', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', null, title)), ...body);
   }
 
-  function cardWithLink(title, href, linkText, ...body) {
-    return h('section', { class: 'card' },
-      h('div', { class: 'card-head' }, h('h2', null, title), h('a', { href, class: 'small' }, linkText)), ...body);
-  }
-
   /** table builds a simple table; cols: [{label, num, cls}], rows: arrays of cell content.
    *  opts.stack: on narrow screens each row becomes a stacked label/value block. */
   function table(cols, rows, opts) {
@@ -823,28 +849,30 @@
    *  Verdict.inputs) as links, so that every classification can be traced and recomputed. */
   function verdictInputs(inp) {
     if (!inp || typeof inp !== 'object') return null;
-    const seqLink = (seq, label) => h('a', { href: recordsLink(seq) }, (label ? label + ' ' : '') + '#' + seq);
-    const part = (seq, label, none) => (Number(seq) > 0
-      ? seqLink(seq, label)
+    // Each link is keyed by what it names (data-fk), not by its record: when a newer record takes
+    // its place, keepFocus gives the keyboard focus to the link that names the newer one.
+    const seqLink = (seq, label, key) => h('a', { href: recordsLink(seq), 'data-fk': 'inputs:' + key }, (label ? label + ' ' : '') + '#' + seq);
+    const part = (seq, label, none, key) => (Number(seq) > 0
+      ? seqLink(seq, label, key)
       : h('span', { class: 'muted', title: 'none, or older than the classifier accepts' }, none));
     const n = Number(inp.window_cycles);
     const out = [
-      part(inp.snapshot_seq, 'gateway snapshot', 'no fresh gateway snapshot'), ' · ',
-      part(inp.service_check_seq, 'DNS & web check', 'no fresh DNS & web check'),
+      part(inp.snapshot_seq, 'gateway snapshot', 'no fresh gateway snapshot', 'snapshot'), ' · ',
+      part(inp.service_check_seq, 'DNS & web check', 'no fresh DNS & web check', 'service'),
     ];
     // Rules 2026.10-4: a resolver failure counts only when the check before showed it too.
     if (Number(inp.prev_service_check_seq) > 0) {
       out.push(h('span', { title: 'A DNS resolver counts as failing only when two consecutive checks show the same failure.' },
-        ' (compared with the previous ', seqLink(inp.prev_service_check_seq, 'DNS & web check'), ')'));
+        ' (compared with the previous ', seqLink(inp.prev_service_check_seq, 'DNS & web check', 'prev-service'), ')'));
     }
-    out.push(' · ', part(inp.local_link_seq, 'local link', 'no fresh local-link reading'));
+    out.push(' · ', part(inp.local_link_seq, 'local link', 'no fresh local-link reading', 'link'));
     // Rules 2026.10-4: DEGRADED is AT&T's only when the household's own WAN traffic, from the
     // gateway's counters in two snapshots, stayed below 80 Mb/s.
     const from = Number(inp.traffic_from_seq);
     const to = Number(inp.traffic_to_seq);
     if (from > 0 || to > 0) {
       out.push(' · ', h('span', { title: 'The household’s own WAN traffic, from the gateway’s counters in these two snapshots.' },
-        'WAN traffic: gateway snapshots ', from > 0 ? seqLink(from) : '?', ' → ', to > 0 ? seqLink(to) : '?'));
+        'WAN traffic: gateway snapshots ', from > 0 ? seqLink(from, '', 'traffic-from') : '?', ' → ', to > 0 ? seqLink(to, '', 'traffic-to') : '?'));
     }
     out.push(' · ', 'window of ' + fmtInt(n) + ' cycle' + (n === 1 ? '' : 's'));
     return out;
@@ -921,6 +949,9 @@
     } catch (e) {
       app.statusError = e;
       updateChrome();
+      // The banner that says so (#conn) is hidden behind a modal and inert under it: the view
+      // says it where the reader is (the Overview's details).
+      if (app.view && app.view.alive && app.view.onStatusError) app.view.onStatusError(e);
     } finally {
       statusInFlight = false;
     }
@@ -957,7 +988,7 @@
   // ------------------------------------------------------------------ router
 
   const ROUTES = [
-    [/^\/$/, 'overview', (c, m, q, ctx) => renderOverview(c, ctx)],
+    [/^\/$/, 'overview', (c, m, q, ctx) => renderOverview(c, ctx, q)],
     [/^\/incidents$/, 'incidents', (c, m, q, ctx) => renderIncidents(c, q, ctx)],
     [/^\/incidents\/([^/]+)$/, 'incidents', (c, m, q, ctx) => renderIncident(c, safeDecode(m[1]), ctx)],
     [/^\/gateway$/, 'gateway', (c, m, q, ctx) => renderGateway(c, ctx)],
@@ -980,11 +1011,20 @@
     return { path, query: new URLSearchParams(qi >= 0 ? raw.slice(qi + 1) : '') };
   }
 
+  /** newViewCtx makes the context of a view (or of the Overview's details modal): what it does
+   *  on a status update (onStatus) and when the status could not be read (onStatusError), on a
+   *  change of only the address's query (onQuery: it handles the change in place and returns
+   *  true, or returns false to have the view rendered again), the path and address it shows, and
+   *  what ends with it (cleanup, interval; dispose runs them). */
   function newViewCtx() {
     const cleanups = [];
     const ctx = {
       alive: true,
       onStatus: null,
+      onStatusError: null,
+      onQuery: null,
+      path: '',
+      hash: '',
       cleanup(fn) { cleanups.push(fn); },
       interval(fn, ms) {
         const id = window.setInterval(fn, ms);
@@ -993,6 +1033,7 @@
       dispose() {
         ctx.alive = false;
         ctx.onStatus = null;
+        ctx.onStatusError = null;
         for (const fn of cleanups.splice(0)) {
           try { fn(); } catch (_) { /* ignore */ }
         }
@@ -1005,8 +1046,22 @@
 
   function route() {
     const { path, query } = parseHash();
+    // A view may handle a change of only its address's query in place: the Overview opens and
+    // closes a card's details (#/?detail=<key>), which must neither render the page again nor
+    // take the reader's place on it. An address the view already shows is its own doing (it
+    // went back in the history, or replaced the address): nothing changes.
+    const cur = app.view;
+    if (cur && cur.alive && cur.onQuery && cur.path === path) {
+      if (cur.hash === window.location.hash) return;
+      if (cur.onQuery(query)) {
+        cur.hash = window.location.hash;
+        return;
+      }
+    }
     if (app.view) app.view.dispose();
     const ctx = newViewCtx();
+    ctx.path = path;
+    ctx.hash = window.location.hash;
     app.view = ctx;
     const container = h('div', { class: 'stack' });
     document.getElementById('view').replaceChildren(container);
@@ -1040,71 +1095,277 @@
 
   // ------------------------------------------------------------------ overview
 
-  function renderOverview(c, ctx) {
-    const hero = h('section', { class: 'card hero tone-none', 'aria-label': 'Current status' },
-      icon('none', 'hero-icon'), h('div', null, h('p', { class: 'loading' }, 'Loading status…')));
+  // The Overview's summary cards, in their order (docs/overview-redesign.md §2); the status card
+  // above them opens "status".
+  const CARD_KEYS = ['internet', 'gateway', 'fiber', 'traffic', 'link', 'network', 'syslog', 'evidence', 'monitor'];
+
+  /** DETAILS says what each card of the Overview shows and opens (docs/overview-redesign.md
+   *  §2-§3): title is the card's title and its details' heading; summary(ov, st) returns {tone,
+   *  chip, body, context}: the card's status chip ([tone, label]: no tooltip, which could not
+   *  show under the card's button - a reason the chip stands for is a line of the card) and
+   *  content, and the icon and the line of context of its details; mount(ov, m) builds the
+   *  details in m.body and returns {update(st)}, which follows every status update while they are
+   *  open. An address that names a card not listed here (#/?detail=<unknown>) opens nothing. */
+  const DETAILS = dict({
+    status: { title: 'Status & availability', summary: summaryStatus, mount: detailsStatus },
+    internet: { title: 'Internet', summary: summaryInternet, mount: detailsInternet },
+    gateway: { title: 'AT&T gateway', summary: summaryGateway, mount: detailsGateway },
+    fiber: { title: 'Fiber optics', summary: summaryFiber, mount: detailsFiber },
+    traffic: { title: 'Traffic', summary: summaryTraffic, mount: detailsTraffic },
+    link: { title: 'This PC’s link', summary: summaryLink, mount: detailsLink },
+    network: { title: 'Network', summary: summaryNetwork, mount: detailsNetwork },
+    syslog: { title: 'Gateway syslog', summary: summarySyslog, mount: detailsSyslog },
+    evidence: { title: 'Evidence', summary: summaryEvidence, mount: detailsEvidence },
+    monitor: { title: 'Monitor & clock', summary: summaryMonitor, mount: detailsMonitor },
+  });
+
+  /** renderOverview shows the Overview as a summary dashboard (docs/overview-redesign.md): the
+   *  conditions, the status card, the six key numbers, the nine summary cards and the recent
+   *  incidents. Each card opens its details in a modal (detailModal), which the address names
+   *  (#/?detail=<key>, query: a link or a reload opens it). The summary reads the status (every
+   *  10 s), the last 24 hours of the series (every minute while the page is visible: the strip
+   *  and the sparklines), the flow meter (every 5 s, only while the Traffic card or its details
+   *  are on screen) and the Network card's figures (every 5 minutes); the details read what they
+   *  show besides the status themselves, while they are open. A hidden page is not drawn; shown
+   *  again, it reads at once what it missed meanwhile. */
+  function renderOverview(c, ctx, query) {
+    const ov = {
+      ctx,
+      series: null, // GET /api/series?range=24h: the strip and the sparklines (seriesErr: why not)
+      seriesErr: null,
+      seriesAt: 0, // when the series was read (Date.now()); 0: not yet
+      seriesBusy: false,
+      live: null, // the flow meter's newest reading, {lt, failure}, or {unavailable} without one
+      net: null, // the Network card's figures (loadNetSummary)
+      netAt: 0, // when they were read
+      netBusy: false,
+      recent: null, // the lines of the recent incidents shown (loadRecentIncidents)
+      recentToken: 0,
+      incId: null, // the incident in progress the status names ('' none; null: no status yet)
+      cards: Object.create(null), // key -> {el, btn, paint(st)}, the status card's key "status"
+      onScreen: typeof IntersectionObserver !== 'function', // the Traffic card is on screen
+      detail: null,
+      flow: null,
+    };
     const conditions = h('div', { class: 'conditions' });
     const tiles = h('section', { 'aria-label': 'Availability statistics' });
-    const cards = h('div', { class: 'grid' });
-    const flow = flowMeter(ctx);
-    const syslog = syslogPanel(ctx, true);
-    const charts = h('section', { 'aria-labelledby': 'history-h' });
-    const recent = h('section', { class: 'card', 'aria-labelledby': 'recent-h' });
-    c.append(h('h1', { class: 'sr-only' }, 'Overview'), hero, conditions, tiles, cards, charts, recent);
+    const open = (key) => ov.detail.open(key, 'click');
+    ov.cards.status = statusCard(ov, open);
+    for (const key of CARD_KEYS) ov.cards[key] = summaryCard(ov, key, open);
+    const recent = h('section', { class: 'card recent', 'aria-labelledby': 'recent-h' },
+      h('div', { class: 'card-head' }, h('h2', { id: 'recent-h' }, 'Recent incidents')), h('p', { class: 'loading' }, 'Loading…'));
+    c.append(h('h1', { class: 'sr-only' }, 'Overview'), conditions, ov.cards.status.el, tiles,
+      h('div', { class: 'sum-grid' }, CARD_KEYS.map((k) => ov.cards[k].el)), recent);
+    ov.detail = detailModal(c, ov);
+    ov.flow = flowMeter(ctx, {
+      wanted: () => (ov.detail.key ? ov.detail.key === 'traffic' : ov.onScreen),
+      onReading(live) {
+        ov.live = live;
+        paintCard(ov, 'traffic');
+      },
+    });
+    watchTrafficCard(ov);
 
-    const update = (st) => {
-      fillHero(hero, st);
+    const paint = (st) => {
       fillAlerts(conditions, st, null);
       fillTiles(tiles, st);
-      fillCards(cards, st, flow, syslog);
+      paintCards(ov);
+      ov.detail.update(st);
+      followIncident(ov, recent, st);
     };
-    ctx.onStatus = update;
-    if (app.status) update(app.status);
-    setupCharts(charts, ctx);
-    loadRecentIncidents(recent, ctx);
-    ctx.interval(() => { if (!document.hidden) loadRecentIncidents(recent, ctx); }, SERIES_REFRESH_MS);
+    // A hidden page is not drawn: it is drawn with the status read as soon as it is shown again
+    // (init's visibilitychange), not every 10 s for nobody.
+    ctx.onStatus = (st) => { if (!document.hidden) paint(st); };
+    ctx.onStatusError = (err) => ov.detail.stale(err);
+    ctx.onQuery = (q) => ov.detail.sync(q);
+    if (app.status) paint(app.status);
+    else paintCards(ov);
+    loadSeries24(ov);
+    loadNetSummary(ov);
+    loadRecentIncidents(recent, ov);
+    ctx.interval(() => {
+      if (document.hidden) return;
+      loadSeries24(ov);
+      loadRecentIncidents(recent, ov);
+    }, SERIES_REFRESH_MS);
+    ctx.interval(() => { if (!document.hidden && !(ov.net && ov.net.none)) loadNetSummary(ov); }, NET_SUMMARY_MS);
+    // Back from a hidden tab, what the minute's reads skipped meanwhile is read at once: the
+    // strip, the sparklines and the recent incidents must not show an older day than the status
+    // beside them.
+    const onVisible = () => {
+      if (document.hidden) return;
+      if (Date.now() - ov.seriesAt >= SERIES_REFRESH_MS) {
+        loadSeries24(ov);
+        loadRecentIncidents(recent, ov);
+      }
+      if (!(ov.net && ov.net.none) && Date.now() - ov.netAt >= NET_SUMMARY_MS) loadNetSummary(ov);
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    ctx.cleanup(() => document.removeEventListener('visibilitychange', onVisible));
+    ov.detail.sync(query); // the details the address names
   }
 
-  function fillHero(el, st) {
-    const v = st.verdict || {};
-    const si = stateInfo(v.state);
-    const unknown = !v.state || v.state === 'UNKNOWN';
-    const ls = st.last_sample;
-    el.className = 'card hero tone-' + si.tone;
-    const body = h('div', { class: 'hero-body' },
-      h('p', { class: 'eyebrow' }, 'Internet status now'),
-      h('h2', { class: 'hero-title' }, statusHeadline(st)));
-    // An UNKNOWN verdict attributes nothing to anyone.
-    if (!unknown && ATTR_LONG[v.attribution]) body.append(h('p', { class: 'hero-attr' }, ATTR_LONG[v.attribution]));
-    if (st.since && !unknown) {
-      body.append(h('p', { class: 'hero-since' }, 'In this state since ', timeEl(st.since), ' (' + sinceText(st.since, st.now) + ')'));
+  /** followIncident follows the incident in progress the status names: when one opens or closes,
+   *  the recent incidents are read again at once (not at the next minute), so that they never
+   *  contradict the status card; meanwhile an open one's duration follows the status. */
+  function followIncident(ov, el, st) {
+    const id = st.active_incident && st.active_incident.id ? String(st.active_incident.id) : '';
+    // At the first status the page reads them already.
+    if (ov.incId !== null && id !== ov.incId) loadRecentIncidents(el, ov);
+    ov.incId = id;
+    for (const line of ov.recent || []) {
+      if (line.inc.open) replace(line.dur, keepUnits(incidentDuration(line.inc, st.now)));
     }
-    if (statusStale(st)) {
-      body.append(h('p', { class: 'hero-since' }, 'The last measurement recorded was taken ', timeEl(ls.started),
-        ' (' + sinceText(ls.started, st.now) + ' ago). What this page shows from it is not the current state.'));
-    }
-    if (v.reasons && v.reasons.length) {
-      body.append(h('ul', { class: 'reasons', 'aria-label': 'Why' }, v.reasons.map((r) => h('li', null, r))));
-    }
-    if (v.inputs) body.append(h('p', { class: 'hero-meta' }, 'Classified from: ', verdictInputs(v.inputs)));
-    if (st.active_incident) body.append(activeIncidentBanner(st.active_incident, st.now));
-    const mon = st.monitor || {};
-    const age = ls && !statusStale(st) ? ageSeconds(ls.started, st.now) : null; // a stale status says it above
-    body.append(h('p', { class: 'hero-meta' },
-      'Classifier rules ', h('code', null, v.rules || '—'),
-      ls ? [' · last measurement ', timeEl(ls.started, F.time), age != null && age > 120 ? ' (' + fmtDur(age) + ' ago)' : null] : null,
-      mon.mode ? [' · monitor running as ', mon.mode, ' for ', fmtDur(mon.uptime_s)] : null));
-    replace(el, icon(si.tone, 'hero-icon'), body);
   }
 
-  function activeIncidentBanner(inc, now) {
-    const si = stateInfo(inc.state);
-    return h('div', { class: 'banner tone-' + si.tone },
-      icon(si.tone),
-      h('div', { class: 'banner-body' },
-        h('p', { class: 'banner-title' }, 'Incident in progress: ', inc.id),
-        h('p', null, headline(inc), ' — open for ', sinceText(inc.opened, now), ' (since ', timeEl(inc.opened), ').'),
-        h('p', null, h('a', { href: '#/incidents/' + encodeURIComponent(inc.id) }, 'Open the incident and its evidence'))));
+  /** watchTrafficCard tells the flow meter whether the Traffic card is on screen: it asks for
+   *  readings only while the card or its details are (IntersectionObserver). A browser without the
+   *  observer is taken to show the card. */
+  function watchTrafficCard(ov) {
+    if (typeof IntersectionObserver !== 'function') return;
+    const io = new IntersectionObserver((entries) => {
+      for (const en of entries) ov.onScreen = en.isIntersecting;
+      ov.flow.wake();
+    });
+    io.observe(ov.cards.traffic.el);
+    ov.ctx.cleanup(() => io.disconnect());
+  }
+
+  /** paintCards draws the status card and every summary card from the newest status. */
+  function paintCards(ov) {
+    ov.cards.status.paint(app.status);
+    for (const key of CARD_KEYS) paintCard(ov, key);
+  }
+
+  /** paintCard draws one summary card again (new data of its own: a reading, a series). */
+  function paintCard(ov, key) {
+    if (ov.ctx.alive && ov.cards[key]) ov.cards[key].paint(app.status);
+  }
+
+  /** loadSeries24 reads the last 24 hours of the series for the status card's strip and the
+   *  cards' sparklines (one read at a time). Its probe labels name the probes everywhere
+   *  (app.series); a details modal's charts of the same range take it from seriesCache. */
+  async function loadSeries24(ov) {
+    if (ov.seriesBusy) return;
+    ov.seriesBusy = true;
+    try {
+      const ser = await api('/api/series?range=24h');
+      if (!ov.ctx.alive) return;
+      const firstLabels = !app.series;
+      ov.series = ser && typeof ser === 'object' ? ser : null;
+      ov.seriesErr = null;
+      ov.seriesAt = Date.now();
+      if (ov.series) {
+        app.series = ov.series;
+        seriesCache['24h'] = { ser: ov.series, at: ov.seriesAt };
+      }
+      if (firstLabels && app.status && ov.ctx.onStatus) ov.ctx.onStatus(app.status); // probe labels come with the series
+      else paintCards(ov);
+    } catch (e) {
+      if (!ov.ctx.alive) return;
+      ov.seriesErr = e;
+      paintCards(ov);
+    } finally {
+      ov.seriesBusy = false;
+    }
+  }
+
+  /** loadNetSummary reads the Network card's figures: the last 24 hours of the gateway's
+   *  firewall (its five heaviest outbound rows only: the card shows totals) and of the connections
+   *  (one row: the card names the most used organisations), which the server keeps for the
+   *  period. A monitor without the Network page answers 404 to both: the card says so (none), and
+   *  is not asked again. The details of the Network card, when open, show them too. */
+  async function loadNetSummary(ov) {
+    if (ov.netBusy) return;
+    ov.netBusy = true;
+    const read = (path) => api(path).then((d) => ({ d: d && typeof d === 'object' ? d : {} }), (err) => ({ err }));
+    try {
+      const [fw, conn] = await Promise.all([read('/api/network/firewall?range=24h&limit=5'), read('/api/network/connections?range=24h&limit=1')]);
+      if (!ov.ctx.alive) return;
+      const gone = (x) => !!(x.err && x.err.status === 404);
+      ov.net = { fw: fw.d || null, fwErr: fw.err || null, conn: conn.d || null, connErr: conn.err || null, none: gone(fw) && gone(conn) };
+      ov.netAt = Date.now();
+      paintCard(ov, 'network');
+      if (ov.detail.key === 'network') ov.detail.update(app.status);
+    } finally {
+      ov.netBusy = false;
+    }
+  }
+
+  /** statusHero is the status as the classifier words it, in the details "Status & availability":
+   *  the state, its attribution and since when, the reasons, the records it was classified from,
+   *  the incident in progress and the monitor. update(st) draws it again for every status but
+   *  keeps its links (the records, the incident's) while they are the same, so that a status
+   *  update neither moves the keyboard focus from one to a copy of it (a screen reader would
+   *  announce it again every 10 s) nor takes a text selection in them away. Returns
+   *  {el, update(st)}. */
+  function statusHero() {
+    const el = h('section', { class: 'card hero tone-none', 'aria-label': 'Current status' }, h('p', { class: 'loading' }, 'Loading status…'));
+    const body = h('div', { class: 'hero-body' });
+    let inputsKey = null;
+    let inputs = null;
+    let incId = null;
+    let banner = null;
+    return {
+      el,
+      update(st) {
+        const v = st.verdict || {};
+        const si = stateInfo(v.state);
+        const unknown = !v.state || v.state === 'UNKNOWN';
+        const ls = st.last_sample;
+        const ik = JSON.stringify(v.inputs || null);
+        if (ik !== inputsKey) {
+          inputsKey = ik;
+          inputs = v.inputs ? h('p', { class: 'hero-meta' }, 'Classified from: ', verdictInputs(v.inputs)) : null;
+        }
+        const inc = st.active_incident && st.active_incident.id ? st.active_incident : null;
+        if ((inc ? String(inc.id) : '') !== incId) {
+          incId = inc ? String(inc.id) : '';
+          banner = inc ? incidentBanner(inc.id) : null;
+        }
+        if (banner) banner.update(inc, st.now);
+        const mon = st.monitor || {};
+        const age = ls && !statusStale(st) ? ageSeconds(ls.started, st.now) : null; // a stale status says it above
+        placeChildren(body,
+          h('p', { class: 'eyebrow' }, 'Internet status now'),
+          h('h2', { class: 'hero-title' }, statusHeadline(st)),
+          // An UNKNOWN verdict attributes nothing to anyone.
+          !unknown && ATTR_LONG[v.attribution] ? h('p', { class: 'hero-attr' }, ATTR_LONG[v.attribution]) : null,
+          st.since && !unknown ? h('p', { class: 'hero-since' }, 'In this state since ', timeEl(st.since), ' (' + sinceText(st.since, st.now) + ')') : null,
+          statusStale(st) ? h('p', { class: 'hero-since' }, 'The last measurement recorded was taken ', timeEl(ls.started),
+            ' (' + sinceText(ls.started, st.now) + ' ago). What this page shows from it is not the current state.') : null,
+          v.reasons && v.reasons.length ? h('ul', { class: 'reasons', 'aria-label': 'Why' }, v.reasons.map((r) => h('li', null, r))) : null,
+          inputs,
+          banner ? banner.el : null,
+          h('p', { class: 'hero-meta' },
+            'Classifier rules ', h('code', null, v.rules || '—'),
+            ls ? [' · last measurement ', timeEl(ls.started, F.time), age != null && age > 120 ? ' (' + fmtDur(age) + ' ago)' : null] : null,
+            mon.mode ? [' · monitor running as ', mon.mode, ' for ', fmtDur(mon.uptime_s)] : null));
+        el.className = 'card hero tone-' + si.tone;
+        placeChildren(el, icon(si.tone, 'hero-icon'), body);
+      },
+    };
+  }
+
+  /** incidentBanner is the banner of the incident in progress (id) in the details "Status &
+   *  availability": update(inc, now) words its state and how long it has been open, and leaves
+   *  its link where it is. Returns {el, update(inc, now)}. */
+  function incidentBanner(id) {
+    const title = h('p', { class: 'banner-title' });
+    const what = h('p');
+    const body = h('div', { class: 'banner-body' }, title, what,
+      h('p', null, h('a', { href: '#/incidents/' + encodeURIComponent(id), 'data-fk': 'status:incident' }, 'Open the incident and its evidence')));
+    const el = h('div', { class: 'banner' }, body);
+    return {
+      el,
+      update(inc, now) {
+        const si = stateInfo(inc.state);
+        el.className = 'banner tone-' + si.tone;
+        placeChildren(el, icon(si.tone), body);
+        replace(title, 'Incident in progress: ', inc.id);
+        replace(what, headline(inc), ' — open for ', sinceText(inc.opened, now), ' (since ', timeEl(inc.opened), ').');
+      },
+    };
   }
 
   function severityRank(sev) {
@@ -1224,7 +1485,7 @@
         evidenceLink('Check the time-stamps on the Evidence page')));
     }
     if (cnd.code === 'EGRESS_NOT_VIA_GATEWAY') {
-      body.append(h('p', { class: 'src' }, 'att-monitor checks the route Windows uses to reach the AT&T gateway and each internet destination. While a destination is routed past the gateway — through a VPN tunnel, a second network adapter or a phone hotspot — what this computer measures on the Internet may be that other network’s doing, so nothing is attributed to AT&T: an outage is recorded as this computer’s routing, not as an AT&T outage (unless the gateway itself reports its fiber or broadband connection down), and a slowdown stays undetermined. Disconnect the VPN or the other network to resume attribution. Per-application VPNs and IPv6 destinations are not detected. The routes are listed under “Route to the Internet” in the Local link card on the Overview.'));
+      body.append(h('p', { class: 'src' }, 'att-monitor checks the route Windows uses to reach the AT&T gateway and each internet destination. While a destination is routed past the gateway — through a VPN tunnel, a second network adapter or a phone hotspot — what this computer measures on the Internet may be that other network’s doing, so nothing is attributed to AT&T: an outage is recorded as this computer’s routing, not as an AT&T outage (unless the gateway itself reports its fiber or broadband connection down), and a slowdown stays undetermined. Disconnect the VPN or the other network to resume attribution. Per-application VPNs and IPv6 destinations are not detected. The routes are listed under “Route to the Internet” in the details of the Overview’s “This PC’s link” card.'));
     }
     if (cnd.code === 'LEDGER_WRITE_FAILING') {
       body.append(h('p', { class: 'src' }, 'Nothing that happens now becomes evidence, so this period will be missing from the ledger. Free disk space on the data volume; otherwise att-monitor stops so that Windows restarts the service, which reopens the ledger with its crash recovery. ',
@@ -1453,11 +1714,1514 @@
         tile('Monitoring coverage', (x) => x.coverage_pct, (p) => fmtPct(p, 1), 'Share of the window during which the monitor was measuring')));
   }
 
-  /** fillCards rebuilds the Overview's cards from st. flow (the flow meter) and syslog (the
-   *  gateway syslog card, syslogPanel) keep their own state and stay in place (placeChildren):
-   *  the flow meter its readings, the syslog card its control of the gateway's setting. */
-  function fillCards(el, st, flow, syslog) {
-    placeChildren(el, cardInternet(st), cardGatewayWAN(st), flow, cardFiber(st), cardLocalLink(st), syslog.update(st), cardEvidence(st), cardMonitor(st));
+  // ------------------------------------------------------------------ overview: the cards
+
+  /** expandIcon is the arrows that mark what opens in a larger view (a card's details). */
+  function expandIcon() {
+    return s('svg', { class: 'expand', viewBox: '0 0 24 24', 'aria-hidden': 'true', focusable: 'false' }, s('path', { d: 'M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7' }));
+  }
+
+  /** closeIcon is the cross of a close button. */
+  function closeIcon() {
+    return s('svg', { class: 'xmark', viewBox: '0 0 24 24', 'aria-hidden': 'true', focusable: 'false' }, s('path', { d: 'M6 6l12 12M18 6L6 18' }));
+  }
+
+  /** summaryCard builds a card of the Overview (docs/overview-redesign.md §4): an article whose
+   *  title is a button that opens the card's details, stretched over the whole card (CSS), so
+   *  that the card is one click target and one Tab stop and the focus ring outlines it; a screen
+   *  reader announces the title as a button that opens a dialog, then reads the card. It holds no
+   *  other control. paint(st) draws its status chip and content (DETAILS[key].summary); the
+   *  button stays, so that the keyboard focus on it survives every update. */
+  function summaryCard(ov, key, open) {
+    const d = DETAILS[key];
+    // The chip describes the button: Tab says "Internet, button, opens dialog, No answer".
+    const btn = h('button', { type: 'button', class: 'sum-open', 'aria-haspopup': 'dialog', 'aria-describedby': 'sum-chip-' + key, 'data-detail': key }, d.title);
+    btn.addEventListener('click', () => open(key));
+    const chipBox = h('span', { class: 'sum-chip', id: 'sum-chip-' + key });
+    const body = h('div', { class: 'sum-body' });
+    const el = h('article', { class: 'card sum-card tone-none' },
+      h('div', { class: 'sum-head' }, h('h2', { class: 'sum-title' }, btn), ' ', chipBox, ' ',
+        h('span', { class: 'sum-more', 'aria-hidden': 'true' }, 'Details', expandIcon())),
+      body);
+    return {
+      el,
+      btn,
+      paint(st) {
+        const v = st ? d.summary(ov, st) : { tone: 'none', chip: null, body: [h('p', { class: 'loading' }, 'Loading…')] };
+        el.className = 'card sum-card tone-' + v.tone;
+        // No tooltip (the chip's third part): it could not show under the card's button.
+        replace(chipBox, v.chip ? chip(v.chip[0], v.chip[1]) : null);
+        replace(body, untitled(v.body));
+      },
+    };
+  }
+
+  /** untitled takes the tooltips (title) out of a summary card's content (nodes as add() takes
+   *  them) and returns it: the card's button is stretched over the whole card, so no tooltip in it
+   *  could ever show. What one would say is on the card itself, or in its details (where times
+   *  give their UTC value on hover). */
+  function untitled(...kids) {
+    for (const k of kids.flat(Infinity)) {
+      if (!(k instanceof Node) || k.nodeType !== 1) continue;
+      k.removeAttribute('title');
+      for (const e of k.querySelectorAll('[title]')) e.removeAttribute('title');
+    }
+    return kids;
+  }
+
+  /** statusCard is the Overview's status card (docs/overview-redesign.md §2.2): the state now,
+   *  its attribution, since when, the key facts of the newest measurement and the incident in
+   *  progress; on the right the last 24 hours as a strip of the classifier's states. Its button
+   *  "Status & availability" (described by the state shown) opens those details and, stretched
+   *  over the card as the summary cards' titles are, makes the whole card open them; the
+   *  incident's link stays a link of its own (above the button). paint(st) draws the card again
+   *  for every status and every series, but keeps the incident's line while the incident is the
+   *  same (placeChildren never moves it): the keyboard focus on its link survives every update. */
+  function statusCard(ov, open) {
+    const btn = h('button', { type: 'button', class: 'sum-open status-open', 'aria-haspopup': 'dialog', 'aria-describedby': 'status-state', 'data-detail': 'status' }, DETAILS.status.title);
+    btn.addEventListener('click', () => open('status'));
+    const ico = h('span', { class: 'status-ico' });
+    const main = h('div', { class: 'status-main' });
+    const cap = h('span', { class: 'status-strip-cap' });
+    const strip = h('div', { class: 'status-strip' });
+    const el = h('section', { class: 'card status-card tone-none', 'aria-label': 'Current status' },
+      h('div', { class: 'status-left' }, ico, main),
+      h('div', { class: 'status-right' },
+        h('div', { class: 'status-strip-head' }, h('span', { class: 'status-strip-title' }, 'Last 24 hours', cap),
+          h('span', { class: 'status-more' }, btn, expandIcon())),
+        strip));
+    let incId = '';
+    let incLine = null;
+    return {
+      el,
+      btn,
+      paint(st) {
+        const tone = st ? statusTone(st) : 'none';
+        el.className = 'card status-card tone-' + tone;
+        replace(ico, icon(tone, 'status-icon'));
+        const id = st && st.active_incident && st.active_incident.id ? String(st.active_incident.id) : '';
+        if (id !== incId) {
+          incId = id;
+          incLine = id ? statusIncident(id) : null;
+        }
+        placeChildren(main, untitled(statusMain(st)), incLine);
+        const g = seriesGeom(ov.series);
+        replace(cap, g ? ' · worst state in each ' + fmtDur(g.stepMs / 1000) : '');
+        replace(strip, untitled(statusStrip(ov, st)));
+      },
+    };
+  }
+
+  /** statusIncident is the status card's line of the incident in progress (id): a link of its
+   *  own, above the card's button (CSS). */
+  function statusIncident(id) {
+    return h('p', { class: 'status-incident' },
+      h('a', { href: '#/incidents/' + encodeURIComponent(id), 'data-fk': 'status:incident' }, 'Incident in progress: ' + id + ' — open it and its evidence'));
+  }
+
+  /** statusTone is the tone of the state now; an UNKNOWN state (or none yet) has none. */
+  function statusTone(st) {
+    const v = (st && st.verdict) || {};
+    return !v.state || v.state === 'UNKNOWN' ? 'none' : stateInfo(v.state).tone;
+  }
+
+  /** statusTitle words the state now in a word or two, for the status card's title: the
+   *  state's label, except where that label would say more than was observed - a gateway restart
+   *  and traffic routed past the gateway are recorded under LOCAL_FAULT, but neither is this PC's
+   *  or the home network's fault. An UNKNOWN state is "Not measuring" while no cycle is recorded
+   *  (statusStale), "Waiting for the first measurements" before the first one, "Unknown"
+   *  otherwise: the card gives the reasons under it (statusMain). */
+  function statusTitle(st) {
+    const v = (st && st.verdict) || {};
+    if (!v.state || v.state === 'UNKNOWN') {
+      if (!st || !st.last_sample) return 'Waiting for the first measurements';
+      return statusStale(st) ? 'Not measuring' : 'Unknown';
+    }
+    if (v.cause === 'GATEWAY_REBOOT') return 'AT&T gateway restarted';
+    if (v.cause === 'LOCAL_ROUTE') return 'Not through the AT&T gateway';
+    return stateInfo(v.state).label;
+  }
+
+  /** causeWords words a verdict's cause with its source, for the status card's facts: "fiber
+   *  link down (reported by the AT&T gateway)"; traffic routed past the gateway in full, as it
+   *  attributes nothing to AT&T. */
+  function causeWords(v) {
+    if (!v || !v.cause) return '';
+    const c = CAUSES[v.cause];
+    if (!c) return humanize(v.cause);
+    if (c.headline) return c.headline;
+    return c.text + (c.src ? ' (' + c.src + ')' : '');
+  }
+
+  /** gatewayAnswered mirrors the classifier (internal/monitor gatewayAnswered): the gateway's IP
+   *  stack answered a probe when it succeeded, or when a TCP connection was refused (a reset is an
+   *  answer). Every attribution to AT&T rests on it. */
+  function gatewayAnswered(p) {
+    return !!p && (!!p.ok || (String(p.kind).toLowerCase() === 'tcp' && String(p.status || '').trim().toLowerCase() === 'refused'));
+  }
+
+  /** isICMP reports whether a probe is an ICMP one. */
+  function isICMP(p) {
+    return String(p && p.kind).toLowerCase() === 'icmp';
+  }
+
+  /** probeFacts sums up a sample's probes: the internet probes and those that answered; whether
+   *  the gateway answered any probe, as the classifier judges it (gwAnswered), and the gateway's
+   *  probe to show - one that answered, the ICMP one first; else the ICMP one -; the AT&T next
+   *  hop's probe (the ICMP one when there are several); the median round trip of the internet
+   *  probes that answered (µs; null without one). */
+  function probeFacts(smp) {
+    const probes = (smp && Array.isArray(smp.probes) ? smp.probes : []).filter((p) => p && typeof p === 'object');
+    const inet = probes.filter((p) => p.role === 'internet');
+    const ok = inet.filter((p) => p.ok);
+    const gws = probes.filter((p) => p.role === 'gateway');
+    const answered = gws.filter(gatewayAnswered);
+    const gw = answered.find((p) => p.ok && isICMP(p)) || answered.find((p) => p.ok) || answered[0] || gws.find(isICMP) || gws[0] || null;
+    const hop = probes.find((p) => p.role === 'isp_hop' && isICMP(p)) || probes.find((p) => p.role === 'isp_hop') || null;
+    const rtts = ok.map((p) => Number(p.rtt_us)).filter((v) => v > 0);
+    return { inet, ok, gw, gwAnswered: answered.length > 0, hop, median: medianOf(rtts) };
+  }
+
+  /** gatewayRTTWords says how the gateway answered (probeFacts' gw, which answered): its round
+   *  trip ("3.1 ms over TCP" when that is the probe), or that it refused a TCP connection. */
+  function gatewayRTTWords(gw) {
+    if (!gw.ok) return 'it refused a TCP connection';
+    return fmtRTT(gw.rtt_us) + (isICMP(gw) ? '' : ' over TCP');
+  }
+
+  /** statusFacts is the status card's line of key facts from the newest measurement: the
+   *  internet probes answered, whether and how the gateway answered, the internet's median round
+   *  trip and the cause. A status that describes no current measurement (statusStale) has none. */
+  function statusFacts(st) {
+    const smp = st.last_sample;
+    if (!smp || statusStale(st)) return '';
+    const f = probeFacts(smp);
+    const parts = [];
+    if (f.inet.length) parts.push(`${f.ok.length} of ${f.inet.length} internet probes answered`);
+    if (f.gw) {
+      parts.push(!f.gwAnswered ? 'the AT&T gateway did not answer'
+        : f.gw.ok ? 'AT&T gateway ' + gatewayRTTWords(f.gw) : 'the AT&T gateway answered (TCP connection refused)');
+    }
+    if (f.median != null) parts.push('median round trip ' + fmtRTT(f.median));
+    const cause = causeWords(st.verdict);
+    if (cause) parts.push(cause);
+    return parts.join(' · ');
+  }
+
+  /** statusMain is the left of the status card: the state now and what goes with it (its
+   *  incident's line is statusCard's). Never the last state recorded as the present one: a status
+   *  that describes no current measurement says when the last one was taken. An UNKNOWN status
+   *  gives its reasons (its details list them all): a stale one those after the first, which the
+   *  line of the last measurement says already. */
+  function statusMain(st) {
+    const out = [h('p', { class: 'eyebrow' }, 'Internet status now')];
+    if (!st) return out.concat(h('h2', { class: 'status-title', id: 'status-state' }, 'Loading status…'));
+    const v = st.verdict || {};
+    const unknown = !v.state || v.state === 'UNKNOWN';
+    const stale = statusStale(st);
+    out.push(h('h2', { class: 'status-title', id: 'status-state' }, statusTitle(st)));
+    if (!unknown && ATTR_LONG[v.attribution]) out.push(h('p', { class: 'status-attr' }, ATTR_LONG[v.attribution]));
+    if (st.since && !unknown) out.push(h('p', { class: 'status-since' }, 'For ' + sinceText(st.since, st.now) + ', since ', netTimeEl(st.since)));
+    const ls = st.last_sample;
+    if (stale && ls) {
+      out.push(h('p', { class: 'status-since' }, 'The last measurement recorded was taken ', netTimeEl(ls.started),
+        ' (' + sinceText(ls.started, st.now) + ' ago): what it showed is not the current state.'));
+    }
+    const first = stale && ls ? 1 : 0;
+    const reasons = unknown && Array.isArray(v.reasons) ? v.reasons.slice(first, first + 2) : [];
+    if (reasons.length) out.push(h('p', { class: 'status-facts' }, reasons.map((r) => sentence(capitalize(String(r)))).join(' ')));
+    const facts = statusFacts(st);
+    if (facts) out.push(h('p', { class: 'status-facts' }, keepUnits(facts)));
+    return out;
+  }
+
+  /** statusStrip is the right of the status card: the last 24 hours as a strip of the
+   *  classifier's worst state in each bucket (the series), with a legend that pairs its colours
+   *  with the day's key numbers from the status - its availability, its degraded and its
+   *  AT&T-attributed time, worded as the key numbers below word them: they count cycles (the
+   *  conservative figures, gateway restarts left out), the strip buckets, and its own shares are
+   *  in its details - and names every other state the strip shows. The strip ends "now" unless
+   *  the series is minutes older than the status (then its times are given). */
+  function statusStrip(ov, st) {
+    const g = seriesGeom(ov.series);
+    let runs = [];
+    let bar;
+    if (g) {
+      runs = seriesRuns(ov.series);
+      bar = stripSvg(runs, g.from, g.to);
+    } else if (ov.seriesErr) {
+      bar = h('p', { class: 'small muted' }, 'The last 24 hours could not be read: ' + sentence(ov.seriesErr.message));
+    } else {
+      bar = stripSvg([], 0, 1); // the empty track while the series loads
+    }
+    const day = ((st && Array.isArray(st.stats) ? st.stats : []).find((w) => w && w.window === '24h')) || null;
+    const shown = new Set(runs.map((r) => r.state));
+    const items = [
+      ['ONLINE', day ? 'Availability ' + fmtPct(day.availability_pct, 2) : 'Online'],
+      ['DEGRADED', day ? 'Degraded ' + fmtDur(day.degraded_s) : 'Degraded'],
+      ['ISP_OUTAGE', day ? 'AT&T-attributed ' + fmtDur(day.provider_outage_s) : 'AT&T outage'],
+    ];
+    for (const state of ['LOCAL_FAULT', 'UNKNOWN', '']) {
+      if (shown.has(state)) items.push([state, stateInfo(state).label]);
+    }
+    const now = st ? toMs(st.now) : null;
+    const lags = !!g && now != null && now - g.to > 120e3;
+    const axis = !g ? null : lags ? [g.from, (g.from + g.to) / 2, g.to].map((t) => F.hm.format(new Date(t))) : ['24 h ago', '12 h ago', 'now'];
+    return [bar,
+      axis ? h('p', { class: 'strip-axis', 'aria-hidden': 'true' }, axis.map((x) => h('span', null, x))) : null,
+      h('ul', { class: 'strip-legend', 'aria-label': 'Last 24 hours' },
+        items.map(([state, text]) => h('li', null, icon(stateInfo(state).tone), text)))];
+  }
+
+  /** stripSvg draws the runs of states (stateRuns) of [from, to] as a strip across the status
+   *  card; a blip stays visible. Decoration: the legend beside it says what it shows. */
+  function stripSvg(runs, from, to) {
+    const W = 300;
+    const svg = s('svg', { class: 'strip', viewBox: `0 0 ${W} 18`, preserveAspectRatio: 'none', 'aria-hidden': 'true', focusable: 'false' },
+      s('rect', { class: 'strip-track', x: 0, y: 0, width: W, height: 18 }));
+    const X = (t) => ((t - from) / (to - from)) * W;
+    for (const r of runs) {
+      const a = X(r.start);
+      let w = X(r.end) - a;
+      if (r.state !== 'ONLINE' && r.state !== '') w = Math.max(w, 1.5);
+      if (w > 0) svg.append(s('rect', { class: 'sf-' + stateInfo(r.state).tone, x: a.toFixed(2), y: 0, width: w.toFixed(2), height: 18 }));
+    }
+    return svg;
+  }
+
+  // ------------------------------------------------------------------ overview: sparklines
+
+  /** numOrNull reads a number of the data, or null for none (NaN, Infinity, a string). */
+  function numOrNull(v) {
+    return v == null || v === '' || !isFinite(v) ? null : Number(v);
+  }
+
+  // What is drawn from a series (its range, its runs of states, the sparklines' values) is worked
+  // out once per series read, not at every status update (10 s) and flow meter reading (5 s): a
+  // series changes once a minute. Each use builds its own elements from it.
+  const seriesMemos = new WeakMap();
+
+  /** seriesMemo returns what make() works out from the series ser, made once per series object
+   *  and name (it must not be changed); null without a series. */
+  function seriesMemo(ser, name, make) {
+    if (!ser || typeof ser !== 'object') return null;
+    let m = seriesMemos.get(ser);
+    if (!m) seriesMemos.set(ser, m = Object.create(null));
+    if (!(name in m)) m[name] = make();
+    return m[name];
+  }
+
+  /** seriesGeom reads what every use of a series needs (GET /api/series): its range (from, to,
+   *  in ms), its bucket length and its points with their start times; null when its range is not
+   *  valid. */
+  function seriesGeom(ser) {
+    return seriesMemo(ser, 'geom', () => {
+      const from = toMs(ser.from);
+      const to = toMs(ser.to);
+      if (from == null || to == null || to <= from) return null;
+      const stepMs = Math.max(1, Number(ser.step_s) || 60) * 1000;
+      const pts = [];
+      const starts = [];
+      for (const p of Array.isArray(ser.points) ? ser.points : []) {
+        const t = p && typeof p === 'object' ? toMs(p.t) : null;
+        if (t == null) continue;
+        pts.push(p);
+        starts.push(t);
+      }
+      return { from, to, stepMs, pts, starts };
+    });
+  }
+
+  /** seriesRuns is a series' buckets merged into runs of equal state (stateRuns), for the status
+   *  card's strip; none without a valid range. */
+  function seriesRuns(ser) {
+    return seriesMemo(ser, 'runs', () => {
+      const g = seriesGeom(ser);
+      return g ? stateRuns(g.pts, g.from, g.to, g.stepMs) : [];
+    }) || [];
+  }
+
+  /** inetKeys names the internet probes of a series (their keys in rtt_ms and loss): from its
+   *  list of probes, else the keys of its points that start with "inet". */
+  function inetKeys(ser) {
+    const specs = ser && Array.isArray(ser.probes) ? ser.probes.filter((p) => p && p.role === 'internet') : [];
+    if (specs.length) return specs.map((p) => String(p.name));
+    const keys = new Set();
+    for (const p of ser && Array.isArray(ser.points) ? ser.points : []) {
+      for (const k of Object.keys((p && p.rtt_ms) || {}).concat(Object.keys((p && p.loss) || {}))) if (/^inet/.test(k)) keys.add(k);
+    }
+    return [...keys];
+  }
+
+  /** sparkTop is the top of a sparkline's scale: the highest value, unless spikes stand far above
+   *  the rest (more than three times the 90th percentile): then 1.5 times that percentile, and the
+   *  spikes reach the top edge. */
+  function sparkTop(vals) {
+    const a = vals.slice().sort((x, y) => x - y);
+    const max = a[a.length - 1];
+    const p90 = a[Math.floor((a.length - 1) * 0.9)];
+    return p90 > 0 && max > 3 * p90 ? 1.5 * p90 : max;
+  }
+
+  /** sparkSvg draws a summary card's sparkline across [from, to]: vals[i] at times[i] (null: no
+   *  value) as a line, filled down to the axis with o.area, broken where a value is missing or the
+   *  next one comes more than o.gapMs later, with the time spans of o.shade shaded. The scale
+   *  starts at 0 with o.zero, else just below the lowest value (sparkTop sets its top); o.short
+   *  makes it lower. Decoration: hidden from screen readers, as the card says in a sentence what
+   *  it shows. null without a value. */
+  function sparkSvg(times, vals, from, to, o) {
+    const W = 300;
+    const H = o.short ? 30 : 44;
+    const have = vals.filter((v) => v != null);
+    if (!have.length || !(to > from)) return null;
+    let lo = o.zero ? 0 : Math.min(...have);
+    let hi = sparkTop(have);
+    if (!o.zero) {
+      const pad = Math.max((hi - lo) * 0.15, 0.5);
+      lo -= pad;
+      hi += pad;
+    }
+    if (!(hi > lo)) hi = lo + 1;
+    const f = (n) => n.toFixed(1);
+    const X = (t) => ((t - from) / (to - from)) * W;
+    const Y = (v) => H - 2 - ((Math.min(Math.max(v, lo), hi) - lo) / (hi - lo)) * (H - 6);
+    const runs = [];
+    let cur = null;
+    let prev = null;
+    vals.forEach((v, i) => {
+      const t = times[i];
+      if (v == null || t == null) {
+        cur = null;
+        return;
+      }
+      if (!cur || t - prev > o.gapMs) runs.push(cur = []);
+      cur.push([X(t), Y(v)]);
+      prev = t;
+    });
+    const svg = s('svg', { class: 'spark' + (o.short ? ' is-short' : ''), viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: 'none', 'aria-hidden': 'true', focusable: 'false' });
+    for (const [a, b] of o.shade || []) {
+      const x = Math.max(0, X(a));
+      const w = Math.min(W, X(b)) - x;
+      if (w > 0) svg.append(s('rect', { class: 'spark-shade', x: f(x), y: 0, width: f(Math.max(w, 1)), height: H }));
+    }
+    const pts = (r) => r.map(([x, y]) => f(x) + ' ' + f(y)).join('L');
+    if (o.area) svg.append(s('path', { class: 'area f1', d: runs.map((r) => 'M' + f(r[0][0]) + ' ' + H + 'L' + pts(r) + 'L' + f(r[r.length - 1][0]) + ' ' + H + 'Z').join('') }));
+    svg.append(s('path', { class: 'ln c1', d: runs.map((r) => 'M' + pts(r) + (r.length === 1 ? 'h2' : '')).join(''), 'vector-effect': 'non-scaling-stroke' }));
+    return svg;
+  }
+
+  /** rttSpark is the Internet card's sparkline: the median round trip of the internet probes in
+   *  each bucket of the last 24 hours, with the buckets in which none of them got a reply shaded.
+   *  Returns {svg, shaded, sentence} (the sentence says what it shows), or null. */
+  function rttSpark(ser) {
+    const d = seriesMemo(ser, 'rtt', () => {
+      const g = seriesGeom(ser);
+      if (!g) return null;
+      const keys = inetKeys(ser);
+      const vals = [];
+      const shade = [];
+      g.pts.forEach((p, i) => {
+        const rtts = keys.map((k) => numOrNull(p.rtt_ms && p.rtt_ms[k])).filter((v) => v != null && v > 0);
+        vals.push(medianOf(rtts));
+        const loss = keys.map((k) => numOrNull(p.loss && p.loss[k])).filter((v) => v != null);
+        if (loss.length && loss.every((v) => v >= 0.999)) {
+          const last = shade[shade.length - 1];
+          if (last && Math.abs(last[1] - g.starts[i]) < 1000) last[1] = g.starts[i] + g.stepMs;
+          else shade.push([g.starts[i], g.starts[i] + g.stepMs]);
+        }
+      });
+      return { g, vals, shade, times: g.starts.map((t) => t + g.stepMs / 2) };
+    });
+    if (!d) return null;
+    const { g, vals, shade } = d;
+    const svg = sparkSvg(d.times, vals, g.from, g.to, { zero: true, gapMs: g.stepMs * 1.5, shade });
+    if (!svg) return null;
+    const have = vals.filter((v) => v != null);
+    const silent = shade.reduce((a, [x, y]) => a + (y - x), 0) / 1000;
+    return {
+      svg,
+      shaded: shade.length > 0,
+      sentence: 'Median internet round trip from ' + fmtMs(Math.min(...have)) + ' to ' + fmtMs(Math.max(...have)) + ' over the last 24 hours' +
+        (shade.length ? '; no internet probe got a reply for ' + fmtDur(silent) + ' in all.' : '.'),
+    };
+  }
+
+  /** seriesLoss is the internet probes' packet loss over a series, in percent: the share of their
+   *  attempts without a reply, averaged over the buckets with data (null without data). */
+  function seriesLoss(ser) {
+    return seriesMemo(ser, 'loss', () => {
+      const g = seriesGeom(ser);
+      if (!g) return null;
+      const keys = inetKeys(ser);
+      let sum = 0;
+      let n = 0;
+      for (const p of g.pts) {
+        for (const k of keys) {
+          const v = numOrNull(p.loss && p.loss[k]);
+          if (v != null) {
+            sum += v;
+            n++;
+          }
+        }
+      }
+      return n ? (100 * sum) / n : null;
+    });
+  }
+
+  /** rxSpark is the Fiber card's sparkline: the light the gateway received over the last 24
+   *  hours (Series.optical, dBm), broken where it read none. */
+  function rxSpark(ser) {
+    const d = seriesMemo(ser, 'rx', () => {
+      const g = seriesGeom(ser);
+      if (!g) return null;
+      // Each time is read once, before the sort (not twice per comparison).
+      const pts = (Array.isArray(ser.optical) ? ser.optical : []).filter((p) => p && typeof p === 'object')
+        .map((p) => ({ t: toMs(p.t), v: numOrNull(p.rx_x10) == null ? null : Number(p.rx_x10) / 10 }))
+        .filter((p) => p.t != null).sort((a, b) => a.t - b.t);
+      const times = pts.map((p) => p.t);
+      const diffs = [];
+      for (let i = 1; i < times.length; i++) diffs.push(times[i] - times[i - 1]);
+      return { g, times, vals: pts.map((p) => p.v), gapMs: Math.max(3 * (median(diffs) || 60000), 5 * 60000) };
+    });
+    if (!d) return null;
+    const svg = sparkSvg(d.times, d.vals, d.g.from, d.g.to, { gapMs: d.gapMs, short: true });
+    if (!svg) return null;
+    const have = d.vals.filter((v) => v != null);
+    return { svg, sentence: 'Light received from ' + Math.min(...have).toFixed(1) + ' to ' + Math.max(...have).toFixed(1) + ' dBm over the last 24 hours.' };
+  }
+
+  /** trafficSpark is the Traffic card's sparkline: the WAN download in each bucket of the last
+   *  24 hours (Series.traffic, Mb/s), filled. */
+  function trafficSpark(ser) {
+    const d = seriesMemo(ser, 'traffic', () => {
+      const g = seriesGeom(ser);
+      if (!g) return null;
+      const pts = (Array.isArray(ser.traffic) ? ser.traffic : []).filter((p) => p && typeof p === 'object')
+        .map((p) => ({ t: toMs(p.t), v: numOrNull(p.wan_rx_mbps) })).filter((p) => p.t != null);
+      return { g, times: pts.map((p) => p.t + g.stepMs / 2), vals: pts.map((p) => p.v) };
+    });
+    if (!d) return null;
+    const svg = sparkSvg(d.times, d.vals, d.g.from, d.g.to, { zero: true, area: true, gapMs: d.g.stepMs * 1.5 });
+    if (!svg) return null;
+    const have = d.vals.filter((v) => v != null);
+    return { svg, sentence: 'WAN download from ' + fmtRate(Math.min(...have)) + ' to ' + fmtRate(Math.max(...have)) + ' over the last 24 hours.' };
+  }
+
+  /** seriesFoot is the start of a sparkline card's last line: what its sparkline sp covers
+   *  (shown), that the series holds none (none) - or, while the last 24 hours are not known, that
+   *  they are being read or could not be read: never that nothing was measured. */
+  function seriesFoot(ov, sp, shown, none) {
+    if (sp) return shown;
+    if (ov.series) return none;
+    return ov.seriesErr ? 'The last 24 h could not be read' : 'Reading the last 24 h…';
+  }
+
+  // ------------------------------------------------------------------ overview: what each card says
+
+  /** sumFigure is a summary card's key figure: the number, then what it counts (the space
+   *  between them is for the text read out: the layout spaces them). */
+  function sumFigure(num, unit) {
+    return h('p', { class: 'sum-fig' }, h('span', { class: 'sum-num' }, num), unit ? [' ', h('span', { class: 'sum-unit' }, unit)] : null);
+  }
+
+  /** keepUnits keeps a number and its unit on one line ("13.7 ms", "24 h"): a card's lines
+   *  wrap in narrow columns. */
+  function keepUnits(text) {
+    return typeof text === 'string' ? text.replace(/(\d) (?=(ms|s|min|h|d|%|dBm|[kMG]?b\/s|GB|[KMG]iB|°C)(?![\w/]))/g, '$1 ') : text;
+  }
+
+  /** sumLine is a line of a summary card; strong ones (what matters most) are in the text colour.
+   *  null for nothing to say. */
+  function sumLine(content, strong) {
+    if (content == null || content === '' || (Array.isArray(content) && !content.length)) return null;
+    return h('p', { class: 'sum-line' + (strong ? ' is-strong' : '') }, keepUnits(content));
+  }
+
+  /** sumFoot is a summary card's last line: what its sparkline covers, when it was read (start),
+   *  and on the right what else to know (end). */
+  function sumFoot(start, end) {
+    return h('p', { class: 'sum-foot' }, h('span', null, keepUnits(start)), end ? h('span', { class: 'sum-foot-end' }, keepUnits(end)) : null);
+  }
+
+  /** sumSpark adds a sparkline (rttSpark, rxSpark, trafficSpark) to a card: the graphic, hidden
+   *  from screen readers, and the sentence that says what it shows, for them. */
+  function sumSpark(sp) {
+    return sp ? [sp.svg, h('p', { class: 'sr-only' }, sp.sentence)] : null;
+  }
+
+  /** clockText writes a time as its time of day ("6:51:20 PM"); "?" when it is missing. */
+  function clockText(v) {
+    const d = toDate(v);
+    return d ? F.time.format(d) : '?';
+  }
+
+  /** noData is what a card says when the monitor reports nothing for it (yet). */
+  function noData(text, label) {
+    return { tone: 'none', chip: ['none', label || 'No data'], body: [sumLine(text)], context: text };
+  }
+
+  /** summaryStatus is what the details "Status & availability" say in their header (the status
+   *  card itself is statusCard's). */
+  function summaryStatus(ov, st) {
+    const v = st.verdict || {};
+    const unknown = !v.state || v.state === 'UNKNOWN';
+    return { tone: statusTone(st), chip: null, body: null, context: statusHeadline(st) + (st.since && !unknown ? ' for ' + sinceText(st.since, st.now) : '') };
+  }
+
+  /** gatewayWords says what still answers when no internet probe does - the AT&T gateway, as the
+   *  classifier judges it (gatewayAnswered: this PC and the home network work), and the AT&T next
+   *  hop -; in the past tense for the last measurement recorded (stale). */
+  function gatewayWords(f, stale) {
+    if (!f.gw) return 'No probe of the AT&T gateway was made.';
+    if (!f.gwAnswered) return 'The AT&T gateway did not answer either.';
+    let t = 'The AT&T gateway ' + (stale ? 'answered' : 'answers') + ' (' + gatewayRTTWords(f.gw) + ')';
+    if (f.hop) {
+      t += f.hop.ok ? (stale ? ', and so did the AT&T next hop' : ', and so does the AT&T next hop')
+        : (stale ? '; the AT&T next hop did not' : '; the AT&T next hop does not');
+    }
+    return t + '.';
+  }
+
+  /** serviceFacts sums up a service check (Status.last_service_check): its words (the resolution
+   *  queries - dnsQueryVerdict, retries included -, the web checks and the gateway's DNS hijack
+   *  test), and whether a resolution query (dnsBad) or a web check (webBad) failed. */
+  function serviceFacts(sc) {
+    const parts = [];
+    const qs = dnsQueries(sc.dns).map(dnsQueryVerdict);
+    const res = qs.filter((v) => !v.test);
+    const bad = res.filter((v) => v.tone !== 'good');
+    if (res.length) parts.push(bad.length ? bad.map((v) => dnsCheckName(v.r) + ' ' + v.label).join(', ') : 'DNS answered');
+    const web = Array.isArray(sc.http) ? sc.http.filter((r) => r && typeof r === 'object') : [];
+    const ok = web.filter((r) => r.ok && !r.hijacked).length;
+    if (web.length) {
+      parts.push(web.some((r) => r.hijacked) ? 'a web check HIJACKED' : ok === web.length ? 'web checks OK' : ok ? `${ok} of ${web.length} web checks OK` : 'web checks failed');
+    }
+    const test = qs.find((v) => v.test);
+    if (test) parts.push(test.label === 'HIJACKED' ? 'DNS HIJACKED' : test.tone === 'good' ? 'no DNS hijack' : 'DNS hijack test not completed');
+    return { text: parts.join(' · '), dnsBad: bad.length > 0, webBad: ok < web.length };
+  }
+
+  /** summaryInternet: whether the internet probes answer, the median round trip and the packet
+   *  loss of the day, the DNS, web and hijack checks; the day's round trips as a sparkline. When
+   *  nothing answers, what still does (gatewayWords). Every probe answering is not enough for
+   *  "OK": a line the classifier finds degraded (latency, loss over its window, DNS) or a newest
+   *  service check with failures is in the warning tone, as the status card is. */
+  function summaryInternet(ov, st) {
+    const smp = st.last_sample;
+    if (!smp) return noData('No measurements yet.');
+    const stale = statusStale(st);
+    const v = st.verdict || {};
+    const f = probeFacts(smp);
+    const n = f.inet.length;
+    const k = f.ok.length;
+    const sc = st.last_service_check && typeof st.last_service_check === 'object' ? st.last_service_check : null;
+    const svc = sc ? serviceFacts(sc) : null;
+    const hijack = !!sc && [].concat(Array.isArray(sc.dns) ? sc.dns : [], Array.isArray(sc.http) ? sc.http : []).some((r) => r && r.hijacked);
+    const chipV = stale ? ['none', 'Not current']
+      : hijack ? ['critical', 'Hijacked']
+        : !n ? ['none', 'No probes'] : !k ? ['critical', 'No answer'] : k < n ? ['warning', `${k} of ${n} answered`]
+          : v.state === 'DEGRADED' ? ['warning', capitalize(v.cause ? causeText(v.cause) : 'degraded')]
+            : svc && svc.dnsBad ? ['warning', 'DNS failing'] : svc && svc.webBad ? ['warning', 'Web checks failing'] : ['good', 'OK'];
+    const answered = (stale ? 'Last recorded: ' : '') + `${k} of ${n} internet probes answered`;
+    const body = [];
+    if (stale) body.push(sumLine('Not current: the last measurement recorded, ' + sinceText(smp.started, st.now) + ' ago.', true));
+    if (hijack && !stale) body.push(sumLine('A DNS or web check was answered by something other than the real server.', true));
+    if (k) {
+      // The day's loss only once the day is known: until then the footer says why there is none.
+      const loss = seriesLoss(ov.series);
+      // The loss phrase never breaks inside ("in" / "24 h" alone on a line): the line wraps at the dot.
+      body.push(sumFigure(fmtRTT(f.median), 'median round trip'),
+        sumLine(answered + (loss != null ? ' · ' + ('packet loss ' + lossText(loss) + ' in 24 h').replace(/ /g, ' ') : '')));
+    } else {
+      body.push(sumFigure(`0 of ${n}`, 'internet probes answered'), sumLine((stale ? 'Last recorded: ' : '') + gatewayWords(f, stale)));
+    }
+    const sp = rttSpark(ov.series);
+    body.push(sumSpark(sp),
+      sumFoot(seriesFoot(ov, sp, 'Last 24 h' + (sp && sp.shaded ? ' · shaded: no reply' : ''), 'No round trips in the last 24 h'), svc ? svc.text : null));
+    return { tone: chipV[0], chip: chipV, body, context: answered + ' · cycle #' + fmtInt(smp.cycle) + ' at ' + clockText(smp.started) + (smp.dur_ms != null ? ', took ' + fmtInt(smp.dur_ms) + ' ms' : '') };
+  }
+
+  /** ponWords words the fiber (PON) link as the gateway reports it: "Fiber operational (O5)". */
+  function ponWords(bb, d) {
+    const pon = bb.pon_link_status ? String(bb.pon_link_status) : '';
+    if (!pon && d.pon_operational == null) return '';
+    const ok = pon ? d.pon_operational !== false && /O5/.test(pon) : !!d.pon_operational;
+    const code = (/\((O\d)\)/.exec(pon) || [])[1];
+    return (ok ? 'Fiber operational' : 'Fiber not operational') + (code ? ' (' + code + ')' : pon ? ' (' + pon + ')' : '');
+  }
+
+  // GATEWAY_FRESH_S is how old a reading of the gateway's status pages may be and still count as
+  // the gateway now: the classifier's default freshness of gateway snapshots
+  // (incident.snapshot_freshness, 150 s: two and a half polls).
+  const GATEWAY_FRESH_S = 150;
+
+  /** gatewayReading says whether the gateway reading the status carries is current. The status
+   *  keeps the last reading in which the gateway answered (Status.gateway, read at gateway_at):
+   *  while the gateway does not answer this PC's newest probes (silent: as the classifier judges
+   *  it), or the reading is older than the classifier would use (GATEWAY_FRESH_S), it is the last
+   *  reading, not the gateway now. Returns {age (s; null: unknown), silent, current}. */
+  function gatewayReading(st) {
+    const age = ageSeconds(st.gateway_at, st.now);
+    const f = probeFacts(st.last_sample);
+    const silent = !statusStale(st) && !!f.gw && !f.gwAnswered;
+    return { age, silent, current: !silent && age != null && age <= GATEWAY_FRESH_S };
+  }
+
+  /** summaryGateway: the gateway's broadband connection and fiber link as it reports them, its
+   *  uptime, its WAN address and the outage redirect, and when it was read. A reading that is not
+   *  current (gatewayReading) is shown as the last reading, in no tone. */
+  function summaryGateway(ov, st) {
+    const g = st.gateway;
+    if (!g || typeof g !== 'object') return noData('No gateway snapshot yet.');
+    const d = g.derived || {};
+    const bb = g.broadband || {};
+    const r = gatewayReading(st);
+    // The monitor's reading of the page first (derived); the page's own word otherwise.
+    const up = d.broadband_up != null ? !!d.broadband_up : bb.connection ? /^up$/i.test(String(bb.connection).trim()) : null;
+    const word = up === true ? 'Broadband up' : up === false ? 'Broadband down' : 'Broadband unknown';
+    const chipV = !r.current ? ['none', r.silent ? 'Not answering' : 'Not current']
+      : up === true ? ['good', 'Up'] : up === false ? ['critical', 'Down'] : ['none', 'Unknown'];
+    const n = st.notification;
+    const facts = [ponWords(bb, d), d.uptime_s != null && d.uptime_s >= 0 ? 'gateway up ' + fmtDur(d.uptime_s) : ''].filter(Boolean);
+    const body = [
+      sumFigure(r.current ? word : 'Last reading: ' + word),
+      r.current ? null : sumLine(r.silent ? 'The gateway did not answer this PC’s latest probes.' : 'No newer reading of the gateway’s status pages.', true),
+      sumLine(facts.join(' · ')),
+      h('dl', { class: 'sum-kv' },
+        h('dt', null, 'WAN IPv4'), h('dd', { class: 'mono' }, d.wan_ipv4 || bb.ipv4 || 'none'),
+        h('dt', null, 'Outage redirect'), h('dd', null, n ? (n.enabled ? chip('warning', 'On') : 'Off') : 'not checked yet')),
+      sumFoot(st.gateway_at ? [r.current ? 'Polled ' : 'Last reading ', agoEl(st.gateway_at, st.now)] : 'Not polled yet'),
+    ];
+    const when = (r.current ? 'Polled ' : 'Last reading ') + clockText(st.gateway_at) +
+      (r.current ? '' : r.silent ? ' · the gateway does not answer now' : ' · no newer reading');
+    return { tone: chipV[0], chip: chipV, body, context: when + (d.model ? ' · ' + d.model : '') + (d.firmware ? ' · firmware ' + d.firmware : '') };
+  }
+
+  /** measureTone is the gateway's own verdict on a measure: its alarm flag (critical), its
+   *  warning flag (warning) or neither (good). */
+  function measureTone(m) {
+    const on = (x) => !!(x && x.active);
+    if (on(m.low_alarm) || on(m.high_alarm)) return 'critical';
+    if (on(m.low_warning) || on(m.high_warning)) return 'warning';
+    return 'good';
+  }
+
+  // The gateway's fiber module measures (its fiberstat page), as a summary card names them.
+  const MEASURE_WORDS = dict({ 'rx power': 'received light', 'tx power': 'transmit power', temperature: 'module temperature', 'tx bias': 'laser bias', vcc: 'supply voltage' });
+
+  /** fiberFlags is what the gateway flags among its fiber module's measures, each of which has its
+   *  own alarm and warning flags (DMI): the worst tone ("good" for none), and each measure flagged
+   *  in words with its flag, the received light's (rx) apart from the others ("module
+   *  temperature (high alarm)"). */
+  function fiberFlags(fb) {
+    const flagged = (Array.isArray(fb.measures) ? fb.measures : []).filter((m) => m && typeof m === 'object' && measureTone(m) !== 'good');
+    const words = (m) => {
+      const name = String(m.name == null ? '' : m.name);
+      const flag = ['low_alarm', 'high_alarm', 'low_warning', 'high_warning'].find((k) => m[k] && m[k].active);
+      return (MEASURE_WORDS[name.trim().toLowerCase()] || name || 'a measure') + ' (' + flag.replace('_', ' ') + ')';
+    };
+    const isRx = (m) => String(m.name || '').trim().toLowerCase() === 'rx power';
+    return {
+      tone: flagged.some((m) => measureTone(m) === 'critical') ? 'critical' : flagged.length ? 'warning' : 'good',
+      rx: flagged.filter(isRx).map(words),
+      others: flagged.filter((m) => !isRx(m)).map(words),
+    };
+  }
+
+  /** summaryFiber: the light the gateway receives on a gauge with the gateway's own alarm and
+   *  warning thresholds, the flags of every measure of its fiber module (named when they are not
+   *  the received light's, which the gauge shows), the transmit power and the module's
+   *  temperature; the day's received light as a sparkline. No level where the gateway reports
+   *  loss of signal is no light, not a missing reading. A reading that is not current
+   *  (gatewayReading) says so, in no tone. */
+  function summaryFiber(ov, st) {
+    const fb = st.gateway && st.gateway.fiber;
+    if (!fb || typeof fb !== 'object') return noData('No fiber status from the gateway yet.');
+    const r = gatewayReading(st);
+    const rx = findMeasure(fb, 'rx power');
+    const tx = findMeasure(fb, 'tx power');
+    const temp = findMeasure(fb, 'temperature');
+    const flags = fiberFlags(fb);
+    const chipV = !r.current ? ['none', 'Not current']
+      : flags.tone === 'critical' ? ['critical', 'Gateway alarm'] : flags.tone === 'warning' ? ['warning', 'Gateway warning']
+        : !rx ? ['none', 'No reading'] : ['good', 'No gateway flag'];
+    const has = !!rx && numOrNull(rx.current) != null;
+    // The gateway's own loss-of-signal flag first; its optical link down otherwise.
+    const d = (st.gateway && st.gateway.derived) || {};
+    const los = !has && (String(fb.rx_los_state == null ? '' : fb.rx_los_state).trim() === '1' || d.optical_up === false);
+    const last = r.current ? '' : ' at the last reading' + (st.gateway_at ? ', ' + sinceText(st.gateway_at, st.now) + ' ago' : '');
+    const thr = (x) => (x && x.threshold != null ? fmtMeasure(x.threshold, rx.unit) : null);
+    const limits = rx ? [thr(rx.low_alarm) ? 'alarm ' + thr(rx.low_alarm) : '', thr(rx.low_warning) ? 'warning ' + thr(rx.low_warning) : ''].filter(Boolean) : [];
+    const sp = rxSpark(ov.series);
+    const body = [
+      has ? sumFigure(fmtMeasure(rx.current, rx.unit), 'light received' + last)
+        : los ? sumFigure('No light', 'the gateway reports loss of signal on the fiber' + last)
+          : sumFigure('No reading', 'the gateway reports no received light level' + last),
+      has ? bullet(rx, true) : null,
+      limits.length ? h('p', { class: 'sum-scale' }, 'The gateway’s low ' + limits.join(' · ')) : null,
+      flags.others.length ? sumLine('Flagged by the gateway: ' + flags.rx.concat(flags.others).join(', '), true) : null,
+      sumLine([tx ? 'Transmit ' + measureValue(tx) : '', temp ? 'module ' + measureValue(temp) : ''].filter(Boolean).join(' · ')),
+      sumSpark(sp),
+      sumFoot(seriesFoot(ov, sp, 'Last 24 h', 'No optical readings in the last 24 h')),
+    ];
+    const what = has ? 'Received light ' + fmtMeasure(rx.current, rx.unit) : los ? 'No light received (loss of signal)' : 'No received light level';
+    return { tone: chipV[0], chip: chipV, body, context: what + ' · ' + chipV[1].toLowerCase() };
+  }
+
+  /** rateFigure is one direction of the live traffic as a key figure: its colour key, the rate
+   *  and the direction. */
+  function rateFigure(key, v, dir, atLeast) {
+    const [num, unit] = rateParts(v);
+    return h('span', { class: 'sum-rate' }, key, v != null && atLeast ? [h('span', { class: 'sum-unit' }, 'at least'), ' '] : null,
+      h('span', { class: 'sum-num' }, num), ' ', h('span', { class: 'sum-unit' }, (unit ? unit + ' ' : '') + dir));
+  }
+
+  // A flow meter reading older than this is no longer shown as the traffic now (the meter reads
+  // every LIVE_REFRESH_MS): the Traffic card gives its time and what it showed instead.
+  const LIVE_OLD_MS = 60000;
+
+  /** summaryTraffic: the flow meter's reading (download and upload through the gateway now), the
+   *  day's WAN volume and the day's download as a sparkline. A read the monitor skipped while it
+   *  used the gateway itself (its evidence snapshot, a settings check, a NAT read: "skipped: …",
+   *  internal/monitor errLiveBusy) is a wait for the next one, not a failure (flowContent says so
+   *  too). Only a reading of the last few reads is "Live": one that failed or is older (the meter
+   *  reads only while the card or its details are on screen) names its time, and once it is a
+   *  minute old its rates are not shown as the traffic now. A monitor without a flow meter says
+   *  so. */
+  function summaryTraffic(ov, st) {
+    const live = ov.live;
+    const lt = live && live.lt;
+    const err = lt && lt.error ? String(lt.error) : '';
+    const skipped = /^skipped\b/i.test(err);
+    const failed = !!(live && (live.failure || (err && !skipped)));
+    const age = lt && lt.at ? ageSeconds(lt.at) : null;
+    const old = age != null && age * 1000 > 3 * LIVE_REFRESH_MS;
+    const gone = age != null && age * 1000 > LIVE_OLD_MS;
+    const chipV = live && live.unavailable ? ['none', 'No live reading'] : !live ? ['none', 'Reading…']
+      : failed ? ['warning', 'No new reading'] : old ? ['none', 'Not current'] : ['info', 'Live'];
+    const body = [];
+    if (live && live.unavailable) {
+      body.push(sumLine(live.unavailable));
+    } else {
+      const atLeast = !!(lt && lt.at_least);
+      const rx = lt ? numOrNull(lt.wan_rx_mbps) : null;
+      const tx = lt ? numOrNull(lt.wan_tx_mbps) : null;
+      body.push(h('p', { class: 'sum-fig sum-rates' },
+        rateFigure(areaKey(1), gone ? null : rx, 'down', atLeast), ' ', rateFigure(lineKey(2), gone ? null : tx, 'up', atLeast)));
+      if (lt && lt.at && (failed || old)) {
+        const was = gone && (rx != null || tx != null) ? ': ' + fmtRate(rx) + ' down · ' + fmtRate(tx) + ' up' : '';
+        body.push(sumLine('Reading of ' + clockText(lt.at) + ' (' + sinceText(lt.at) + ' ago)' + was, true));
+      }
+      if (failed) body.push(sumLine('The newest read failed: ' + sentence(live.failure ? live.failure.message : err)));
+    }
+    const today = localDateValue(new Date());
+    const day = (ov.series && Array.isArray(ov.series.traffic_days) ? ov.series.traffic_days : []).find((x) => x && x.day === today);
+    if (day) body.push(sumLine('Today ' + fmtGB(day.rx_bytes) + ' down · ' + fmtGB(day.tx_bytes) + ' up' + (day.complete ? '' : ' (at least: part of the day is not counted)')));
+    const sp = trafficSpark(ov.series);
+    body.push(sumSpark(sp), sumFoot(seriesFoot(ov, sp, 'WAN download, last 24 h', 'No traffic readings in the last 24 h')));
+    return { tone: chipV[0], chip: chipV, body, context: 'Through the AT&T gateway, from its own byte counters' + (lt && lt.at ? ' · reading of ' + clockText(lt.at) : '') };
+  }
+
+  /** summaryLink: this PC's network adapter, its signal and link rate, and whether its traffic
+   *  goes through the AT&T gateway: traffic that leaves through another adapter (a VPN, another
+   *  network) is a warning, as everywhere else. While the Internet is out but the gateway answers
+   *  (as the classifier judges it), it says that the home network works: that is what attributes
+   *  an outage to AT&T - except while the outage is this PC's routing (LOCAL_ROUTE), where it says
+   *  that the traffic does not go through the gateway. */
+  function summaryLink(ov, st) {
+    const l = st.local_link;
+    if (!l || typeof l !== 'object') return noData('Not measured yet.');
+    const connected = /^connected$/i.test(String(l.state || ''));
+    const e = l.egress && typeof l.egress === 'object' ? l.egress : null;
+    const bypass = !!(e && !e.err && e.bypass);
+    const chipV = !l.state ? ['none', 'Unknown'] : !connected ? ['critical', capitalize(String(l.state))]
+      : bypass ? ['warning', 'Not through the gateway'] : ['good', 'Connected'];
+    const fig = l.type === 'wifi' ? 'Wi-Fi' + (l.band ? ' ' + l.band : '') : l.type === 'ethernet' ? 'Ethernet' : String(l.interface || 'Network adapter');
+    const facts = [];
+    if (l.signal_pct) facts.push('Signal ' + l.signal_pct + ' %');
+    if (l.rx_mbps || l.tx_mbps) facts.push('receive ' + (l.rx_mbps || '—') + ' / send ' + (l.tx_mbps || '—') + ' Mb/s');
+    else if (l.link_mbps) facts.push('link ' + l.link_mbps + ' Mb/s');
+    const route = !e ? null : e.err ? 'Route to the Internet: not checked'
+      : bypass ? 'Route to the Internet: through another adapter (a VPN or another network)' : 'Route to the Internet: through the AT&T gateway';
+    const f = probeFacts(st.last_sample);
+    const homeWorks = connected && !statusStale(st) && f.gw && f.gwAnswered && f.inet.length && !f.ok.length;
+    const routed = bypass && (st.verdict || {}).cause === 'LOCAL_ROUTE';
+    const body = [
+      sumFigure(fig),
+      sumLine(facts.join(' · ')),
+      l.signal_pct ? h('p', { class: 'sum-meter' }, meter(l.signal_pct), h('span', null, l.signal_pct + ' %')) : null,
+      sumLine(route, true),
+      !homeWorks ? null : routed ? sumLine('This PC reaches the AT&T gateway, but its internet traffic does not go through it.', true)
+        : sumLine('The home network works: this PC reaches the AT&T gateway.', true),
+    ];
+    return { tone: chipV[0], chip: chipV, body, context: [l.interface, l.ssid, l.local_ip].filter(Boolean).map(String).join(' · ') || 'This PC’s network adapter' };
+  }
+
+  /** topOrgs is the organisations of the connections (the flow diagram's) without its groups -
+   *  "other" (the rest), "local" (private addresses) and "unknown" (addresses the IP database
+   *  does not know) -, ranked by the sites reached: the Network card names the first ones as the
+   *  most used, and its details list them in the same order, so that the two never disagree. */
+  function topOrgs(conn) {
+    return netList(conn && conn.orgs).filter((o) => !['other', 'local', 'unknown'].includes(String(o.key)))
+      .sort((a, b) => (Number(b.sites) || 0) - (Number(a.sites) || 0));
+  }
+
+  /** orgNames names the n most used organisations of the connections (topOrgs). */
+  function orgNames(conn, n) {
+    return topOrgs(conn).slice(0, n).map((o) => netText(o.name || o.key, 32));
+  }
+
+  /** summaryNetwork: the connections open at the last read of the NAT table, the devices the
+   *  gateway lists, the most used organisations, and what the firewall blocked in 24 h. A monitor
+   *  without the Network page, or a feature it does not have, is said so. */
+  function summaryNetwork(ov, st) {
+    const smp = st.connections && typeof st.connections === 'object' ? st.connections : null;
+    const net = ov.net;
+    if (!smp && net && net.none) return noData('This monitor offers no Network page.', 'Not offered');
+    const age = smp && smp.nat_at ? ageSeconds(smp.nat_at, st.now) : null;
+    // In whole minutes past the first: the chip neither changes every 10 s nor covers the title.
+    const read = age != null ? fmtDur(age >= 60 ? Math.floor(age / 60) * 60 : age) : '';
+    const chipV = !smp ? ['none', net ? 'No data' : 'Reading…']
+      : !smp.enabled ? ['none', 'Off'] : smp.nat_problem ? ['warning', 'Not reading']
+        : smp.nat_at ? ['info', 'Read ' + read + ' ago'] : ['none', 'Not read yet'];
+    const body = [];
+    if (smp && smp.nat_at) {
+      const every = goDurMs(smp.interval);
+      const fresh = age != null && age * 1000 <= Math.max(10 * 60e3, 2.5 * (every || 4 * 60e3));
+      const listed = Number(smp.devices) > 0 ? ' · ' + fmtInt(smp.devices) + ' devices listed' : '';
+      body.push(sumFigure(fmtInt(smp.sessions), (fresh ? 'connections open' : 'connections open at the last read, ' + fmtDur(age) + ' ago') + listed));
+      if (smp.nat_problem) body.push(sumLine(sentence(capitalize(String(smp.nat_problem))), true));
+    } else if (smp && !smp.enabled) {
+      body.push(sumLine('Reading the gateway’s NAT table is turned off in the configuration.'));
+    } else if (smp && smp.nat_problem) {
+      body.push(sumLine(sentence(capitalize(String(smp.nat_problem))), true));
+    } else if (smp) {
+      body.push(sumLine('The NAT table has not been read yet.'));
+    } else {
+      body.push(sumLine('This monitor reports nothing about its reads of the NAT table.'));
+    }
+    const orgs = net && net.conn ? orgNames(net.conn, 3) : [];
+    if (orgs.length) body.push(sumLine('Most used: ' + orgs.join(', ')));
+    const fw = net && net.fw;
+    const ff = firewallFacts(net, st);
+    if (fw && !net.fwErr) {
+      body.push(h('div', { class: 'sum-split' },
+        sumFigure(fmtInt(fw.drops), 'packets blocked by the firewall ' + (ff.since ? 'since ' + shortWhen(ff.since) : 'in 24 h')),
+        sumLine(fmtInt(fw.inbound) + ' inbound probes from ' + fmtInt(fw.sources) + ' addresses'),
+        ff.unseen ? sumLine(ff.unseen, true) : null));
+    } else if (net && net.fwErr && ff.noStore) {
+      body.push(sumLine('Firewall: this monitor keeps no syslog store, so it shows no blocked packets.'));
+    } else if (net && net.fwErr && net.fwErr.status !== 404) {
+      body.push(sumLine('The firewall figures could not be read: ' + sentence(net.fwErr.message)));
+    }
+    return { tone: chipV[0], chip: chipV, body, context: smp && smp.nat_at ? 'NAT table read ' + sinceText(smp.nat_at, st.now) + ' ago' + (Number(smp.devices) > 0 ? ' · ' + fmtInt(smp.devices) + ' devices listed' : '') : 'Which device talks to which site, and what the firewall blocks' };
+  }
+
+  /** firewallFacts says what the firewall's figures (net.fw: counted from the syslog the store
+   *  kept) can claim, as the Network page's notes say it (fwNotes, fwCoverage): unseen - why
+   *  blocked packets are not seen now (the receiver is off, or the gateway does not send its log
+   *  here), '' when they are -; since - when the syslog kept starts, when that is after the
+   *  period's start (the count covers less than 24 hours); noStore - the figures are missing
+   *  because the monitor keeps no syslog store (a 503 alone may also be a store that is closed or
+   *  busy). */
+  function firewallFacts(net, st) {
+    const sl = syslogStatus(st);
+    const fw = net && net.fw;
+    const oldest = fw ? toMs(fw.oldest) : null;
+    const from = fw ? toMs(fw.from) : null;
+    return {
+      unseen: !sl ? '' : !sl.enabled ? 'The syslog receiver is off: blocked packets are not seen.'
+        : sl.state === 'off' || sl.state === 'elsewhere' ? 'The gateway does not send its log to this PC: blocked packets are not seen.' : '',
+      since: oldest != null && from != null && oldest > from ? fw.oldest : null,
+      noStore: !!(net && net.fwErr && net.fwErr.status === 503 && !syslogStore(sl)),
+    };
+  }
+
+  /** shortWhen writes a time as netTimeEl shows it, as text: its time of day when it is today,
+   *  else with its date. */
+  function shortWhen(v) {
+    const d = toDate(v);
+    return d ? (localDateValue(d) === localDateValue(new Date()) ? F.hm : F.short).format(d) : '?';
+  }
+
+  /** syslogSettingWords says where the gateway sends its log, as last read (Status.syslog.state). */
+  function syslogSettingWords(sl) {
+    const g = sl.gateway && typeof sl.gateway === 'object' ? sl.gateway : null;
+    const level = g && g.level ? ' (level ' + g.level + ')' : '';
+    switch (sl.state || (!g ? 'unknown' : g.enabled ? '' : 'off')) {
+      case 'ok': return 'The gateway sends its log to this PC' + level;
+      case 'off': return 'The gateway sends no syslog messages';
+      case 'elsewhere': return 'The gateway sends its log to ' + (syslogTarget(g) || 'another address') + ', not to this PC';
+      case 'error': return 'The gateway’s Syslog setting could not be checked';
+      case 'unknown':
+        if (sl.problem) return sentence(capitalize(String(sl.problem)));
+        return g ? 'The gateway’s Syslog page was not understood' : 'The gateway’s Syslog setting has not been read yet';
+      default: return 'The gateway sends its log to ' + (syslogTarget(g) || '?') + level;
+    }
+  }
+
+  // The Gateway syslog card's chip while this PC listens but the gateway's setting, as last read,
+  // sends nothing here (Status.syslog.state; the details show it as a warning too).
+  const SYSLOG_GATEWAY_CHIPS = dict({ off: ['warning', 'Gateway not sending'], elsewhere: ['warning', 'Sent elsewhere'], error: ['warning', 'Setting not checked'] });
+
+  /** summarySyslog: whether this PC listens for the gateway's log, the messages received, where
+   *  the gateway sends it, how much the syslog store keeps of its limit, the last message. A
+   *  receiver that listens while the gateway sends its log elsewhere or not at all (or its setting
+   *  could not be checked) collects nothing: the card is in the warning tone, as its details. */
+  function summarySyslog(ov, st) {
+    const sl = syslogStatus(st);
+    if (!sl) return noData('This monitor reports no syslog receiver.', 'Not offered');
+    const gw = sl.enabled && sl.listening ? SYSLOG_GATEWAY_CHIPS[sl.state] || null : null;
+    const chipV = !sl.enabled ? ['none', 'Off'] : sl.listening ? gw || ['good', 'Listening']
+      : sl.listen_error ? ['critical', 'Not listening'] : ['none', 'Not listening yet'];
+    const u = syslogStore(sl);
+    const limit = u && Number(u.keep_mb) > 0 ? Number(u.keep_mb) * MIB : 0;
+    const body = [
+      sumFigure(fmtInt(Number(sl.received) || 0), 'messages since the service started'),
+      sl.enabled && !sl.listening && sl.listen_error ? sumLine(sentence(capitalize(String(sl.listen_error))), true) : null,
+      sumLine(syslogSettingWords(sl), !!gw),
+      u ? h('p', { class: 'sum-meter' }, limit ? meter((100 * (Number(u.bytes) || 0)) / limit) : null, h('span', null, syslogUsageText(u)))
+        : sumLine('This monitor keeps no syslog store.'),
+      sumFoot(sl.last_at ? ['Last message ', agoEl(sl.last_at, st.now)] : 'No message since the service started'),
+    ];
+    const rx = !sl.enabled ? 'Receiver off' : sl.listening ? 'Listening on UDP ' + (sl.listen || '?') : sl.listen_error ? 'Not listening' : 'Not listening yet';
+    return { tone: chipV[0], chip: chipV, body, context: rx + ' · ' + syslogSettingWords(sl) };
+  }
+
+  /** mongoWords sums up the MongoDB copy of the ledger (Status.mongo; optional). */
+  function mongoWords(m) {
+    if (!m || typeof m !== 'object') return '';
+    if (!m.connected && !m.has_data) return 'no MongoDB server (the copy is optional)';
+    if (!m.connected) return 'MongoDB copy not connected';
+    if (m.last_error) return 'MongoDB copy: a problem';
+    if (!m.has_data) return 'MongoDB copy starting';
+    return Number(m.lag) > 0 ? 'MongoDB copy ' + fmtInt(m.lag) + ' records behind' : 'MongoDB copy in sync';
+  }
+
+  /** summaryEvidence: the signed records, the last time-stamp, the MongoDB copy and the last
+   *  verification; whether evidence is being recorded at all. */
+  function summaryEvidence(ov, st) {
+    const L = st.ledger || {};
+    const lv = L.last_verify;
+    const failing = !!findCondition(st, 'LEDGER_WRITE_FAILING');
+    const head = numOrNull(L.head_seq);
+    const chipV = failing ? ['critical', 'Not recording'] : lv && lv.ok === false ? ['critical', 'Verify failed']
+      : head != null ? ['good', 'Recording'] : ['none', 'No data'];
+    const mongo = mongoWords(st.mongo);
+    const verify = lv ? [lv.ok ? 'verified ' : 'verification FAILED ', timeEl(lv.at, F.short)] : ['not verified yet'];
+    if (!mongo) verify[0] = capitalize(verify[0]);
+    const body = [
+      sumFigure(head != null ? fmtInt(head + 1) : '—', 'signed records'),
+      failing ? sumLine('The ledger refuses new records: nothing is being recorded.', true) : null,
+      sumLine(L.last_anchor_time ? ['Last time-stamp ', agoEl(L.last_anchor_time, st.now), ' (' + tsaName(L.last_anchor_tsa) + ')'] : 'No time-stamp yet'),
+      sumLine([mongo ? capitalize(mongo) + ' · ' : null, verify], true),
+      sumFoot(fmtInt(L.unanchored_records) + ' records not yet time-stamped'),
+    ];
+    return { tone: chipV[0], chip: chipV, body, context: (head != null ? fmtInt(head + 1) + ' signed records' : 'No ledger head reported') + (L.last_anchor_time ? ' · last time-stamp ' + sinceText(L.last_anchor_time, st.now) + ' ago' : '') };
+  }
+
+  /** clockWords says how far this computer's clock is from internet time (the first time server
+   *  that answered the latest clock check). */
+  function clockWords(ck) {
+    const results = ck && Array.isArray(ck.results) ? ck.results.filter((r) => r && typeof r === 'object') : [];
+    if (!results.length) return 'Clock not checked yet';
+    const r = results.find((x) => x.ok);
+    if (!r) return 'No time server answered the latest clock check';
+    const ms = Number(r.offset_ms) || 0;
+    return 'Clock ' + (ms >= 0 ? '+' : '') + fmtInt(ms) + ' ms from ' + r.server;
+  }
+
+  /** summaryMonitor: how long the monitor has run and as what, its version and cycles, and this
+   *  computer's clock. */
+  function summaryMonitor(ov, st) {
+    const m = st.monitor && typeof st.monitor === 'object' ? st.monitor : {};
+    const stale = statusStale(st);
+    const off = findCondition(st, 'CLOCK_OFFSET');
+    const chipV = stale ? ['warning', 'Not measuring'] : off ? ['warning', 'Clock off']
+      : m.started || m.uptime_s ? ['good', 'Running'] : ['none', 'No data'];
+    const mode = m.mode ? (String(m.mode) === 'service' ? 'as a Windows service' : 'running as ' + m.mode) : 'running';
+    const body = [
+      sumFigure(m.uptime_s != null ? fmtDur(m.uptime_s) : '—', mode),
+      stale ? sumLine('No measurement cycle is being recorded.', true) : null,
+      sumLine([m.version ? 'Version ' + m.version : '', m.cycles != null ? fmtInt(m.cycles) + ' measurement cycles' : ''].filter(Boolean).join(' · ')),
+      sumLine(clockWords(st.clock), true),
+      m.rules ? sumFoot('Classifier rules ' + m.rules) : null,
+    ];
+    const running = m.mode ? 'running as ' + m.mode + (m.uptime_s != null ? ' for ' + fmtDur(m.uptime_s) : '') : '';
+    return { tone: chipV[0], chip: chipV, body, context: [m.version ? 'Version ' + m.version : '', running].filter(Boolean).join(' · ') || 'The monitor and this computer’s clock' };
+  }
+
+  // ------------------------------------------------------------------ overview: the details modal
+
+  /** onBackdrop reports whether a pointer event on a modal dialog fell on its backdrop: the
+   *  backdrop belongs to the dialog element (it is the target), outside the dialog's box. */
+  function onBackdrop(dlg, ev) {
+    if (ev.target !== dlg) return false;
+    const r = dlg.getBoundingClientRect();
+    return ev.clientX < r.left || ev.clientX > r.right || ev.clientY < r.top || ev.clientY > r.bottom;
+  }
+
+  /** lockScroll keeps the page behind a modal from scrolling (the root element's overflow). The
+   *  room of the scroll bar this takes away goes to the body as padding, so that nothing moves
+   *  sideways - not to a gutter kept for it (scrollbar-gutter), which the modal's backdrop does
+   *  not cover: a band of the page would stay bright beside the dimmed rest, and a modal as wide
+   *  as the window would reach under it. */
+  function lockScroll(on) {
+    const root = document.documentElement;
+    if (!on) {
+      root.classList.remove('detail-open');
+      document.body.style.paddingRight = '';
+      return;
+    }
+    const bar = window.innerWidth - root.clientWidth; // measured while the scroll bar is there
+    root.classList.add('detail-open');
+    if (bar > 0) document.body.style.paddingRight = bar + 'px'; // CSSOM: allowed by the CSP
+  }
+
+  /** stampKeys gives every focusable element of root, and every <details>, a key (data-fk) by
+   *  which keepFocus finds its successor after a rebuild: its tag, its link and its text, and how
+   *  many before it share them. Keys set by the code (charts, ...) are kept. */
+  function stampKeys(root) {
+    const seen = new Map();
+    for (const el of root.querySelectorAll('a, button, summary, details, input, select, textarea, [tabindex]')) {
+      const own = el.getAttribute('data-fk');
+      if (own && !own.startsWith('auto|')) continue;
+      const sum = el.localName === 'details' ? el.querySelector('summary') : null;
+      const base = el.localName + '|' + (el.getAttribute('href') || '') + '|' + (sum || el).textContent.trim().slice(0, 80);
+      const n = seen.get(base) || 0;
+      seen.set(base, n + 1);
+      el.setAttribute('data-fk', 'auto|' + base + '|' + n);
+    }
+  }
+
+  /** keepReading runs render, which rebuilds parts of a details modal's body (dlg, body) for a
+   *  status update, so that the reader keeps their place: the scroll position, the <details>
+   *  they opened and the keyboard focus (keepFocus, by stampKeys' keys). When the element with
+   *  the focus is gone without a successor, the body takes it: the focus stays in the dialog.
+   *  While the reader has text selected in the body (an address or a hash to copy), nothing is
+   *  rebuilt: the first update after the selection is gone is. */
+  function keepReading(dlg, body, render) {
+    const sel = typeof window.getSelection === 'function' ? window.getSelection() : null;
+    if (sel && !sel.isCollapsed && sel.anchorNode && body.contains(sel.anchorNode)) return;
+    stampKeys(body);
+    const opened = new Set(Array.from(body.querySelectorAll('details')).filter((d) => d.open).map((d) => d.getAttribute('data-fk')));
+    const top = body.scrollTop;
+    const inside = dlg.contains(document.activeElement);
+    keepFocus(body, () => {
+      render();
+      stampKeys(body);
+      for (const d of body.querySelectorAll('details')) if (!d.open && opened.has(d.getAttribute('data-fk'))) d.open = true;
+    });
+    body.scrollTop = top;
+    if (inside && !dlg.contains(document.activeElement)) body.focus();
+  }
+
+  /** detailModal is the Overview's details modal (docs/overview-redesign.md §3): one card's
+   *  details at a time on a native <dialog> opened with showModal() - the page behind is inert,
+   *  and does not scroll (lockScroll) -, labelled by its heading, with a line of context and a
+   *  close button. Esc, the close button and a click on the backdrop close it; the keyboard focus
+   *  goes to the close button, and back to the card's button. The address names it: opened by a
+   *  click it is added to the history (#/?detail=<key>: Back closes it, a reload opens it again)
+   *  and closing it goes back; opened from the address (a link, a reload, Back or Forward), closing
+   *  it replaces the address. While open its content follows every status update (update;
+   *  keepReading keeps the reader's place) and its charts their series; while the status cannot
+   *  be read, it says so (stale). Its body is a scroll region of its own (a Tab stop: the keyboard
+   *  scrolls it), and it has its own live region for announce(), as the page's is inert behind
+   *  it. Returns {open(key, how), sync(query) (the route's onQuery), update(st), stale(err),
+   *  key}. */
+  function detailModal(c, ov) {
+    let cur = null; // {key, how, dlg, body, ico, titles, context, contextText, staleNote, ctx, from, why, done, part}
+    let backPending = false; // our history.back() has not arrived yet: a click now would race it
+    let backTimer = 0;
+    const backDone = () => {
+      backPending = false;
+      window.clearTimeout(backTimer);
+    };
+    window.addEventListener('hashchange', backDone);
+    ov.ctx.cleanup(() => {
+      window.removeEventListener('hashchange', backDone);
+      window.clearTimeout(backTimer);
+      if (cur) close(cur, 'dispose');
+    });
+
+    function open(key, how) {
+      const d = DETAILS[key];
+      if (!d || backPending || !ov.ctx.alive) return;
+      if (cur) {
+        if (cur.key === key) return;
+        close(cur, 'address');
+      }
+      const ico = h('span', { class: 'detail-ico-box' }, icon('none', 'detail-ico'));
+      const context = h('p', { class: 'detail-context', id: 'detail-context' }, 'Loading…');
+      const titles = h('div', { class: 'detail-titles' }, h('h2', { id: 'detail-title' }, d.title), context);
+      const closeBtn = h('button', { type: 'button', class: 'btn detail-close', title: 'Close (Esc)' }, closeIcon(), h('span', { class: 'sr-only' }, 'Close'));
+      // The body is the dialog's scroll region and a Tab stop of its own, so that PageDown and the
+      // arrow keys scroll it where it holds no control (the focus starts on Close, in the header).
+      const body = h('div', { class: 'detail-body', tabindex: '0', role: 'region', 'aria-labelledby': 'detail-title' });
+      const dlg = h('dialog', { class: 'dlg dlg-detail', 'aria-labelledby': 'detail-title', 'aria-describedby': 'detail-context', 'data-detail': key },
+        h('div', { class: 'detail-head' }, ico, titles, closeBtn), body, announcer());
+      const e = { key, how, dlg, body, ico, titles, context, contextText: '', staleNote: null, ctx: newViewCtx(), from: window.location.hash, why: '', done: false, part: null };
+      closeBtn.addEventListener('click', () => close(e, 'user'));
+      dlg.addEventListener('close', () => finish(e)); // Esc, or close() below
+      let fromBackdrop = false;
+      // The rest of a double-click that opened these details lands on them, wherever they now lie
+      // under the pointer (their backdrop, their close button, a link, a chart's legend), and must
+      // do nothing - neither act, nor move the focus from Close, nor select a word: it is taken
+      // before anything inside sees it.
+      const openedAt = Date.now();
+      const swallow = (ev) => {
+        if (!(ev.detail > 1) || Date.now() - openedAt >= 1000) return;
+        ev.preventDefault();
+        ev.stopImmediatePropagation();
+        fromBackdrop = false;
+      };
+      dlg.addEventListener('mousedown', swallow, true);
+      dlg.addEventListener('click', swallow, true);
+      // Only a click that also started on the backdrop closes: not one that selected text inside
+      // and ended outside.
+      dlg.addEventListener('pointerdown', (ev) => { fromBackdrop = onBackdrop(dlg, ev); });
+      dlg.addEventListener('click', (ev) => {
+        if (fromBackdrop && onBackdrop(dlg, ev)) close(e, 'user');
+        fromBackdrop = false;
+      });
+      cur = e;
+      e.part = d.mount(ov, e);
+      c.append(dlg);
+      lockScroll(true);
+      dlg.showModal();
+      closeBtn.focus();
+      if (how === 'click') {
+        window.history.pushState(null, '', '#/?detail=' + encodeURIComponent(key));
+        ov.ctx.hash = window.location.hash;
+      }
+      update(app.status);
+      if (app.statusError) stale(app.statusError); // opened while the status cannot be read
+      ov.flow.wake();
+    }
+
+    /** close closes the details shown (e) for why: "user" (the reader: the close button, the
+     *  backdrop; Esc closes the dialog itself), "address" (the address no longer names them) or
+     *  "dispose" (the Overview is left). */
+    function close(e, why) {
+      if (e.done) return;
+      e.why = why;
+      if (e.dlg.open) e.dlg.close();
+      finish(e);
+    }
+
+    function finish(e) {
+      if (e.done) return;
+      e.done = true;
+      if (cur === e) cur = null;
+      e.ctx.dispose();
+      e.dlg.remove();
+      lockScroll(false);
+      if (e.why === 'dispose') return;
+      if (e.why !== 'address') forget(e);
+      const card = ov.cards[e.key];
+      if (card && document.contains(card.btn)) card.btn.focus();
+      ov.flow.wake();
+    }
+
+    /** forget takes closed details out of the address: details a click added to the history are
+     *  gone back from (the history is as before they opened), details opened from the address
+     *  replace it with the Overview's. */
+    function forget(e) {
+      if (e.how === 'click') {
+        ov.ctx.hash = e.from;
+        backPending = true;
+        backTimer = window.setTimeout(backDone, 500);
+        window.history.back();
+      } else {
+        window.history.replaceState(null, '', '#/');
+        ov.ctx.hash = window.location.hash;
+      }
+    }
+
+    /** sync follows the address (route's onQuery): it opens the details it names, closes those it
+     *  no longer names, and ignores a card it does not know. false: nothing to do in place (the
+     *  Overview is rendered again, as for any visit). */
+    function sync(query) {
+      backDone();
+      const key = query.get('detail');
+      if (key == null) {
+        if (!cur) return false;
+        close(cur, 'address');
+        return true;
+      }
+      if (DETAILS[key]) open(key, 'address');
+      else if (cur) close(cur, 'address');
+      return true;
+    }
+
+    /** update follows a status update: the header's icon and line of context, and the content.
+     *  While the status cannot be read (a part read the details' own figures meanwhile), the
+     *  header keeps saying so (stale). */
+    function update(st) {
+      const e = cur;
+      if (!e || !e.part || !st) return;
+      const v = DETAILS[e.key].summary(ov, st);
+      e.contextText = v.context || '';
+      keepReading(e.dlg, e.body, () => e.part.update(st));
+      if (app.statusError) {
+        stale(app.statusError);
+        return;
+      }
+      if (e.staleNote) {
+        e.staleNote.remove();
+        e.staleNote = null;
+      }
+      replace(e.ico, icon(v.tone, 'detail-ico'));
+      replace(e.context, e.contextText, ' · updates while open');
+    }
+
+    /** stale says in the details open that the status could not be read (err): the page's banner
+     *  (#conn) is behind the modal, and inert under it. The header loses its tone and says since
+     *  when nothing was updated, and a note under it (visible at any scroll position) says why: made
+     *  once, when the status stops being read, so that its alert is read once. The next status
+     *  read takes both away (update). */
+    function stale(err) {
+      const e = cur;
+      if (!e) return;
+      const since = app.statusAt ? 'not updated since ' + F.time.format(app.statusAt) : 'no status read yet';
+      replace(e.ico, icon('none', 'detail-ico'));
+      replace(e.context, e.contextText ? e.contextText + ' · ' + since : capitalize(since));
+      if (e.staleNote) return;
+      const why = err && err.status === 0 ? 'the att-monitor service cannot be reached.' : 'the monitor returned an error: ' + sentence(err ? err.message : '');
+      e.staleNote = notice('critical', h('strong', null, capitalize(since) + ': '), why + ' What these details show may be out of date.');
+      e.staleNote.classList.add('detail-stale');
+      e.titles.append(e.staleNote);
+    }
+
+    return { open, sync, update, stale, get key() { return cur ? cur.key : ''; } };
+  }
+
+  /** detailLinks is a details modal's pointer to the page that shows more. */
+  function detailLinks(...kids) {
+    return h('p', { class: 'detail-links' }, ...kids);
+  }
+
+  // The key of what a part of a details modal shows, by its element (keyed).
+  const partKeys = new WeakMap();
+
+  /** keyed draws a part of a details modal (el) again with build()'s content only when what it
+   *  shows changed (key: its inputs, a relative time it words included). A status update every
+   *  10 s must not replace a link, a <details> or a text the reader is on with a copy of it: the
+   *  keyboard focus would move to the copy, a screen reader would announce it again, and a text
+   *  selection would go. */
+  function keyed(el, key, build) {
+    if (partKeys.get(el) === key) return;
+    partKeys.set(el, key);
+    replace(el, build());
+  }
+
+  /** detailsStatus: the status as the classifier words it (statusHero: the reasons, the records it
+   *  was classified from, the incident in progress) and the availability history. */
+  function detailsStatus(ov, m) {
+    const hero = statusHero();
+    const charts = h('section', { class: 'detail-charts', 'aria-label': 'Availability history' });
+    m.body.append(hero.el, charts);
+    setupCharts(charts, m.ctx, ['availability']);
+    return { update(st) { hero.update(st); } };
+  }
+
+  /** detailsInternet: the probes and the name resolution and web checks (cardInternet) side by
+   *  side, the round-trip time and packet-loss charts, the cycle. The probes are drawn for every
+   *  status (they hold no control); the checks only when there is a newer service check, so that
+   *  an answer the reader opened keeps the focus. */
+  function detailsInternet(ov, m) {
+    const cols = h('div', { class: 'detail-cols' }, h('p', { class: 'loading' }, 'Loading…'));
+    const foot = h('div');
+    const charts = h('section', { class: 'detail-charts', 'aria-label': 'Round-trip time and packet loss' });
+    m.body.append(cols, charts, foot, detailLinks('Every cycle’s measurements are on the ', h('a', { href: '#/records' }, 'Records'),
+      ' page; the incidents and their evidence on the ', h('a', { href: '#/incidents' }, 'Incidents'), ' page.'));
+    setupCharts(charts, m.ctx, ['latency', 'loss']);
+    let checksKey = null;
+    let checks = null;
+    return {
+      update(st) {
+        const p = cardInternet(st);
+        const k = JSON.stringify(st.last_service_check || null);
+        if (k !== checksKey) {
+          checksKey = k;
+          checks = p.checks;
+        }
+        placeChildren(cols, p.probes, checks);
+        replace(foot, p.foot);
+      },
+    };
+  }
+
+  /** detailsGateway: the gateway card of before (cardGatewayWAN), and a link to the Gateway page. */
+  function detailsGateway(ov, m) {
+    const box = h('div', null, h('p', { class: 'loading' }, 'Loading…'));
+    m.body.append(box, detailLinks('Every field of the gateway’s status pages, its certificate and the outage-redirect setting are on the ',
+      h('a', { href: '#/gateway' }, 'Gateway'), ' page.'));
+    return { update(st) { keyed(box, JSON.stringify([st.gateway, st.notification, st.gateway_at, gatewayAge(st)]), () => cardGatewayWAN(st)); } };
+  }
+
+  /** detailsFiber: the fiber card of before (cardFiber) and the received light's history. */
+  function detailsFiber(ov, m) {
+    const box = h('div', null, h('p', { class: 'loading' }, 'Loading…'));
+    const charts = h('section', { class: 'detail-charts', 'aria-label': 'Fiber receive power history' });
+    m.body.append(box, charts, detailLinks('The gateway’s diagnostics with every threshold and flag are on the ', h('a', { href: '#/gateway' }, 'Gateway'), ' page.'));
+    setupCharts(charts, m.ctx, ['optical']);
+    return { update(st) { keyed(box, JSON.stringify(st.gateway ? st.gateway.fiber : null), () => cardFiber(st)); } };
+  }
+
+  /** detailsTraffic: the flow meter (which polls while these details are open), the MRTG-style
+   *  traffic chart and the WAN volume per day; above them why there is no flow meter, when there is
+   *  none (hidden otherwise: an empty part would double the gap above the first). */
+  function detailsTraffic(ov, m) {
+    const note = h('div', { hidden: true });
+    const charts = h('section', { class: 'detail-charts', 'aria-label': 'Traffic history' });
+    m.body.append(note, ov.flow.el, charts);
+    setupCharts(charts, m.ctx, ['traffic']);
+    return {
+      update() {
+        const why = ov.live && ov.live.unavailable ? String(ov.live.unavailable) : '';
+        note.hidden = !why;
+        keyed(note, why, () => (why ? callout('info', why) : null));
+      },
+    };
+  }
+
+  /** detailsLink: this PC's link card of before (cardLocalLink), with the route check. */
+  function detailsLink(ov, m) {
+    const box = h('div', null, h('p', { class: 'loading' }, 'Loading…'));
+    m.body.append(box);
+    return { update(st) { keyed(box, JSON.stringify(st.local_link || null), () => cardLocalLink(st)); } };
+  }
+
+  /** detailsNetwork: the reads of the NAT table and the Device List, the day's most active devices
+   *  and organisations, the firewall's counts of the day, and links to the Network page's tabs.
+   *  Its figures are read again when it opens and every minute while it is open. */
+  function detailsNetwork(ov, m) {
+    const samplers = h('section', { class: 'detail-part' }, h('p', { class: 'loading' }, 'Loading…'));
+    const day = h('div', { class: 'detail-cols' });
+    const fw = h('div', { class: 'detail-stack' });
+    m.body.append(samplers, day, fw, detailLinks('Which device talks to which site, hour by hour, and what the firewall blocks are on the Network page: its ',
+      h('a', { href: netHash('connections', { range: '24h' }, '') }, 'Connections'), ' and ', h('a', { href: netHash('firewall', { range: '24h' }, '') }, 'Firewall'), ' tabs.'));
+    loadNetSummary(ov);
+    m.ctx.interval(() => { if (!document.hidden) loadNetSummary(ov); }, NET_REFRESH_MS);
+    const err = (e) => (e ? [e.status, e.message] : null);
+    return {
+      update(st) {
+        const net = ov.net;
+        const smp = st.connections && typeof st.connections === 'object' ? st.connections : null;
+        keyed(samplers, JSON.stringify([smp, net && net.none, net && err(net.fwErr), smp && [sinceText(smp.nat_at, st.now), sinceText(smp.devices_at, st.now)]]),
+          () => netSamplersPart(st, net));
+        keyed(day, JSON.stringify(net && [net.conn, err(net.connErr)]), () => netDayParts(net));
+        keyed(fw, JSON.stringify(net && [net.fw, err(net.fwErr), firewallFacts(net, st)]), () => netFirewallPart(net, st));
+      },
+    };
+  }
+
+  /** netSamplersPart tells how the monitor reads the gateway's NAT table and Device List
+   *  (Status.connections). */
+  function netSamplersPart(st, net) {
+    const smp = st.connections && typeof st.connections === 'object' ? st.connections : null;
+    const head = h('h3', { class: 'subhead' }, 'The gateway’s NAT table and Device List');
+    if (!smp) {
+      return [head, net && net.none ? callout('info', sentence(capitalize(net.fwErr.message)))
+        : emptyNote('This monitor reports nothing about its reads of the NAT table.')];
+    }
+    const every = goDurMs(smp.interval);
+    return [head, kv([
+      ['NAT table', !smp.enabled ? [chip('none', 'off'), ' reading it is turned off in the configuration (connections.enabled)']
+        : smp.nat_at ? ['read ', agoEl(smp.nat_at, st.now), every ? ' · every ' + fmtDur(every / 1000) : ''] : 'not read yet'],
+      ['Open connections', smp.nat_at ? fmtInt(smp.sessions) + ' at the last read' : null],
+      ['NAT sessions', Number(smp.in_use) > 0 || Number(smp.available) > 0 ? fmtInt(smp.in_use) + ' in use, ' + fmtInt(smp.available) + ' available' : null],
+      ['Next read', smp.enabled && smp.nat_next ? timeEl(smp.nat_next, F.time) : null],
+      ['Problem', smp.nat_problem ? [chip('warning', 'not read'), ' ', sentence(capitalize(String(smp.nat_problem)))]
+        : smp.nat_note ? sentence(capitalize(String(smp.nat_note))) : null],
+      ['Device List', smp.devices_at ? [fmtInt(smp.devices) + ' devices listed, read ', agoEl(smp.devices_at, st.now)] : 'not read yet'],
+      ['Device List problem', smp.devices_problem ? sentence(capitalize(String(smp.devices_problem))) : null],
+      ['Gateway logins, 24 h', Number(smp.nat_logins) > 0 ? fmtInt(smp.nat_logins) : null],
+    ])];
+  }
+
+  /** netDayParts shows the day's most active devices and organisations (by the remote addresses
+   *  they reached), as the Network page's connections of the last 24 hours count them: each list
+   *  ranked by the value its bars show. The organisations are those of the flow diagram (the
+   *  heaviest ones the server names, the rest grouped as "other"); without an IP address
+   *  database none is named, which is not none reached. */
+  function netDayParts(net) {
+    if (!net) return h('p', { class: 'loading' }, 'Loading…');
+    if (net.connErr) return net.connErr.status === 404 ? null : callout('warning', 'The connections could not be read: ', sentence(net.connErr.message));
+    const c = net.conn || {};
+    if (!(Number(c.samples) > 0)) return emptyNote('No read of the NAT table in the last 24 hours.');
+    const sites = Number(c.totals && c.totals.sites) || 0;
+    const bySites = (a, b) => (Number(b.sites) || 0) - (Number(a.sites) || 0);
+    const part = (title, items, none) => h('section', { class: 'detail-part' }, h('h3', { class: 'subhead' }, title),
+      items.length ? netBars(items, sites, title) : emptyNote(none || 'None in the last 24 hours.'));
+    const devices = netList(c.devices).slice().sort(bySites).slice(0, 5)
+      .map((dv) => ({ name: netText(dv.name || dv.ipv4 || dv.key, 40), note: '', value: Number(dv.sites) || 0 }));
+    const orgs = topOrgs(c).slice(0, 5).map((o) => ({ name: netText(o.name || o.key, 40), note: '', value: Number(o.sites) || 0 }));
+    return [part('Devices, last 24 hours (sites reached)', devices),
+      part('Most used organisations, last 24 hours (sites)', orgs, !c.ipdb && sites > 0 ? 'Organisations are not named: no IP address database is loaded.' : '')];
+  }
+
+  /** netFirewallPart counts what the gateway's firewall blocked in the last 24 hours, from its
+   *  syslog, with the most probed services - and says what the count cannot cover (firewallFacts):
+   *  a period the syslog kept does not reach back to, a gateway that does not send its log here. A
+   *  monitor without a syslog store says so; any other failure is an error. */
+  function netFirewallPart(net, st) {
+    if (!net || (!net.fw && !net.fwErr)) return null;
+    const ff = firewallFacts(net, st);
+    const head = h('h3', { class: 'subhead' }, 'The gateway’s firewall, ' + (ff.since ? 'since ' + shortWhen(ff.since) : 'last 24 hours'));
+    if (net.fwErr) {
+      if (net.fwErr.status === 404) return null;
+      return [head, ff.noStore ? callout('info', 'This att-monitor keeps no syslog store, so there are no firewall messages to show.')
+        : callout('warning', 'The firewall figures could not be read: ', sentence(net.fwErr.message))];
+    }
+    const fw = net.fw;
+    const svcs = netList(fw.services).slice(0, 5).map((x) => ({
+      name: x.name === 'Other' && !(Number(x.port) > 0) ? 'Other ports' : unnamedPort(x) ? portText(x.port, x.proto) : netText(x.name || portText(x.port, x.proto) || x.proto || '?', 40),
+      note: unnamedPort(x) ? '' : portText(x.port, x.proto), value: Number(x.count) || 0,
+    }));
+    return [head,
+      ff.unseen ? callout('warning', h('strong', null, ff.unseen), ' ', h('a', { href: '#/syslog' }, 'Open the Syslog page')) : null,
+      ff.since ? callout('info', 'The syslog kept starts at ', timeEl(ff.since, F.short),
+        ': what the gateway logged before was not received here or is no longer kept, so the counts cover less than 24 hours.') : null,
+      h('div', { class: 'tiles net-tiles' },
+        netTile('Blocked', fmtInt(fw.drops), 'packets in all'),
+        netTile('Inbound', fmtInt(fw.inbound), 'probes from ' + fmtInt(fw.sources) + ' addresses'),
+        netTile('Outbound', fmtInt(fw.outbound), 'packets from the home network'),
+        netTile('Gateway itself', fmtInt(fw.local), 'to or from the gateway')),
+      svcs.length ? h('section', { class: 'detail-part' }, h('h3', { class: 'subhead' }, 'Most probed services'), netBars(svcs, Number(fw.inbound) || 0, 'Most probed services')) : null];
+  }
+
+  /** detailsSyslog: the gateway syslog card of before (syslogPanel, its control of the gateway's
+   *  Syslog setting included: built once, it keeps the focus and a change's outcome across the
+   *  updates), and a link to the Syslog page. */
+  function detailsSyslog(ov, m) {
+    const panel = syslogPanel(m.ctx, true);
+    const box = h('div', null, h('p', { class: 'loading' }, 'Loading…'));
+    let none = null;
+    m.body.append(box, detailLinks('The messages, their filters and how much of them is kept are on the ', h('a', { href: '#/syslog' }, 'Syslog'), ' page.'));
+    return {
+      update(st) {
+        const el = panel.update(st);
+        if (!el && !none) none = callout('info', 'This monitor reports no syslog receiver.');
+        placeChildren(box, el || none);
+      },
+    };
+  }
+
+  /** detailsEvidence: the evidence card of before (cardEvidence), and links to verify and export. */
+  function detailsEvidence(ov, m) {
+    const box = h('div', null, h('p', { class: 'loading' }, 'Loading…'));
+    m.body.append(box, detailLinks('Verify the whole ledger, time-stamp it now, add a note or build an evidence bundle on the ',
+      h('a', { href: '#/evidence' }, 'Evidence'), ' page; every record is on the ', h('a', { href: '#/records' }, 'Records'), ' page.'));
+    return { update(st) { keyed(box, JSON.stringify([st.ledger, st.mongo]), () => cardEvidence(st)); } };
+  }
+
+  /** detailsMonitor: the monitor and clock card of before (cardMonitor). */
+  function detailsMonitor(ov, m) {
+    const box = h('div', null, h('p', { class: 'loading' }, 'Loading…'));
+    m.body.append(box);
+    return { update(st) { keyed(box, JSON.stringify([st.monitor, st.clock]), () => cardMonitor(st)); } };
   }
 
   /** probeLabel names a probe as configured (Status.probes, else the chart series' list). */
@@ -1575,9 +3339,13 @@
     return v;
   }
 
+  /** cardInternet is the Internet card's details (docs/overview-redesign.md §2.4): the newest
+   *  measurement's probes, the newest service check's name resolution and web checks (with the
+   *  addresses of each query folded: dnsAnswers) and the cycle. Returns {probes, checks, foot}:
+   *  the parts the details lay out side by side (checks null without a service check). */
   function cardInternet(st) {
     const smp = st.last_sample;
-    if (!smp) return card('Internet', emptyNote('No measurements yet.'));
+    if (!smp) return { probes: emptyNote('No measurements yet.'), checks: null, foot: null };
     const stale = statusStale(st);
     const probes = smp.probes || [];
     const inet = probes.filter((p) => p.role === 'internet');
@@ -1597,13 +3365,17 @@
       }
       tbl.append(tb);
     }
-    const body = [
-      // Never let the last recorded measurement read as the present one.
-      stale ? callout('warning', h('strong', null, 'Not current. '), 'This is the last measurement recorded, ',
-        sinceText(smp.started, st.now), ' ago: the monitor is not producing samples (see the status above).') : null,
-      h('p', { class: 'big-line' }, icon(tone), (stale ? 'Last recorded: ' : '') + `${ok} of ${inet.length} internet probes answered`),
-      h('div', { class: 'table-scroll' }, tbl),
-    ];
+    const out = {
+      probes: h('section', { class: 'detail-part', 'aria-label': 'Probes' },
+        h('h3', { class: 'subhead' }, 'Probes'),
+        // Never let the last recorded measurement read as the present one.
+        stale ? callout('warning', h('strong', null, 'Not current. '), 'This is the last measurement recorded, ',
+          sinceText(smp.started, st.now), ' ago: the monitor is not producing samples (see the status card).') : null,
+        h('p', { class: 'big-line' }, icon(tone), (stale ? 'Last recorded: ' : '') + `${ok} of ${inet.length} internet probes answered`),
+        h('div', { class: 'table-scroll' }, tbl)),
+      checks: null,
+      foot: h('p', { class: 'card-foot' }, 'Cycle #', fmtInt(smp.cycle), ' at ', timeEl(smp.started, F.time), smp.dur_ms != null ? ' · took ' + fmtInt(smp.dur_ms) + ' ms' : ''),
+    };
     const sc = st.last_service_check;
     if (sc) {
       // A query and its retry (rules 2026.10-4) are one row, judged by both results.
@@ -1617,7 +3389,7 @@
             h('span', { class: 'chips' },
               chip(v.tone, v.label, v.title),
               r.truncated ? chip('warning', 'truncated', 'The answer had its TC (truncated) bit set: it may be incomplete.') : null),
-            Array.isArray(r.answers) && r.answers.length ? h('span', { class: 'sub small muted wrap-any' }, r.answers.join(', ')) : null,
+            Array.isArray(r.answers) && r.answers.length ? dnsAnswers(r.answers) : null,
             r.hijacked && r.hijack_why ? h('span', { class: 'sub small wrap-any' }, r.hijack_why) : null,
             v.note ? h('span', { class: 'sub small muted' }, v.note) : null,
             v.retry ? h('span', { class: 'sub small muted', title: v.retryTitle }, v.retry) : null),
@@ -1633,11 +3405,23 @@
           r.hijacked ? httpHijackDetail(r) : null),
         r.ok ? fmtRTT(r.rtt_us) : '—',
       ]);
-      body.push(h('h3', { class: 'subhead' }, 'Name resolution & web checks'),
+      out.checks = h('section', { class: 'detail-part', 'aria-label': 'Name resolution and web checks' },
+        h('h3', { class: 'subhead' }, 'Name resolution & web checks'),
         table([{ label: 'Check' }, { label: 'Result' }, { label: 'Time', num: true }], dnsRows.concat(httpRows), { compact: true }));
     }
-    body.push(h('p', { class: 'card-foot' }, 'Cycle #', fmtInt(smp.cycle), ' at ', timeEl(smp.started, F.time), smp.dur_ms != null ? ` · took ${smp.dur_ms} ms` : ''));
-    return card('Internet', ...body);
+    return out;
+  }
+
+  /** dnsAnswers folds the records a DNS query got into a <details> ("1 address", "3 answers"
+   *  when some are not addresses, e.g. a CNAME): every query of a check has them, and they matter
+   *  only when looked into. Closed, they stay in the row's text. */
+  function dnsAnswers(answers) {
+    const list = answers.map(String);
+    const typed = list.some((a) => /^[A-Za-z]+:/.test(a)); // "CNAME:www.l.google.com"
+    const n = list.length;
+    return h('details', { class: 'answers' },
+      h('summary', null, n + ' ' + (typed ? (n === 1 ? 'answer' : 'answers') : n === 1 ? 'address' : 'addresses')),
+      h('span', { class: 'sub small muted wrap-any' }, list.join(', ')));
   }
 
   /** httpHijackDetail shows what answered a hijacked web check: the evidence itself. */
@@ -1655,9 +3439,11 @@
     return v ? chip('good', upWords) : chip('critical', downWords);
   }
 
+  /** cardGatewayWAN is the AT&T gateway card's details: the gateway's WAN as its status pages
+   *  report it, and when they were polled. Returns the content (the details give the heading). */
   function cardGatewayWAN(st) {
     const g = st.gateway;
-    if (!g) return card('AT&T gateway WAN', emptyNote('No gateway snapshot yet.'));
+    if (!g) return [emptyNote('No gateway snapshot yet.')];
     const d = g.derived || {};
     const bb = g.broadband || {};
     const fb = g.fiber || {};
@@ -1665,7 +3451,7 @@
     const clock = d.gateway_clock_blank
       ? h('span', null, chip('warning', 'blank'), ' the gateway shows no time — it does this while its WAN is down')
       : d.gateway_clock_offset_ms != null ? 'offset ' + (d.gateway_clock_offset_ms / 1000).toFixed(1) + ' s vs this PC' : null;
-    return cardWithLink('AT&T gateway WAN', '#/gateway', 'All gateway fields',
+    return [
       kv([
         ['Broadband', bb.connection ? [upDownChip(/^up$/i.test(bb.connection), 'Up', bb.connection), ' as reported by the gateway'] : upDownChip(d.broadband_up, 'Up', 'Down')],
         ['Fiber (PON)', bb.pon_link_status ? [upDownChip(d.pon_operational !== false && /O5/.test(bb.pon_link_status), 'operational', 'not operational'), ' ', bb.pon_link_status] : null],
@@ -1679,14 +3465,16 @@
         ['Model / serial', [d.model, d.serial].filter(Boolean).join(' / ')],
         ['Outage redirect', n ? (n.enabled ? chip('warning', 'ON') : chip('good', 'OFF')) : 'not checked yet'],
       ]),
-      h('p', { class: 'card-foot' }, 'Polled ', timeEl(st.gateway_at, F.time), gatewayAge(st), d.reachable === false ? [' · ', chip('critical', 'status pages unreachable')] : ''));
+      h('p', { class: 'card-foot' }, 'Polled ', timeEl(st.gateway_at, F.time), gatewayAge(st)),
+    ];
   }
 
-  /** gatewayAge says how old the gateway reading shown is when it is older than a few polls
-   *  (the status keeps the last reading in which the gateway answered). */
+  /** gatewayAge says how old the gateway reading shown is when it is not current
+   *  (gatewayReading: the status keeps the last reading in which the gateway answered), and why. */
   function gatewayAge(st) {
-    const age = ageSeconds(st.gateway_at, st.now);
-    return age != null && age > 300 ? ' (' + fmtDur(age) + ' ago — no newer reading)' : null;
+    const r = gatewayReading(st);
+    if (r.current || r.age == null) return null;
+    return ' (' + fmtDur(r.age) + ' ago — ' + (r.silent ? 'the gateway does not answer now' : 'no newer reading') + ')';
   }
 
   function findMeasure(fb, name) {
@@ -1708,8 +3496,10 @@
     return h('span', { class: 'chips' }, out);
   }
 
-  /** bullet draws a value against the gateway's own low/high alarm and warning thresholds. */
-  function bullet(m) {
+  /** bullet draws a value against the gateway's own low/high alarm and warning thresholds. As a
+   *  gauge (a summary card's), it is the graphic alone, hidden from screen readers: the card says
+   *  the value and the thresholds in words. */
+  function bullet(m, gauge) {
     const thr = (x) => (x && x.threshold != null ? x.threshold : null);
     const la = thr(m.low_alarm);
     const lw = thr(m.low_warning);
@@ -1724,7 +3514,7 @@
     lo -= pad;
     hi += pad;
     const X = (v) => ((v - lo) / (hi - lo)) * 100;
-    const svg = s('svg', {
+    const svg = s('svg', gauge ? { class: 'bullet gauge', viewBox: '0 0 100 16', preserveAspectRatio: 'none', 'aria-hidden': 'true', focusable: 'false' } : {
       class: 'bullet', viewBox: '0 0 100 16', preserveAspectRatio: 'none', role: 'img',
       'aria-label': `${m.name} ${fmtMeasure(cur, m.unit)}; gateway low alarm ${fmtMeasure(la, m.unit)}, low warning ${fmtMeasure(lw, m.unit)}`,
     });
@@ -1745,6 +3535,7 @@
       if (v != null) svg.append(s('line', { class: 't', x1: X(v), x2: X(v), y1: 1, y2: 15, 'vector-effect': 'non-scaling-stroke' }));
     }
     svg.append(s('line', { class: 'm', x1: X(cur), x2: X(cur), y1: 0, y2: 16, 'vector-effect': 'non-scaling-stroke' }));
+    if (gauge) return svg;
     return h('div', null, svg,
       h('p', { class: 'bullet-legend' },
         `Black marker: current reading. Gateway thresholds — low alarm ${fmtMeasure(la, m.unit)}, low warning ${fmtMeasure(lw, m.unit)}, high warning ${fmtMeasure(hw, m.unit)}, high alarm ${fmtMeasure(ha, m.unit)}.`));
@@ -1755,9 +3546,11 @@
     return [timeEl(fb.last_change_unix * 1000), h('span', { class: 'small muted' }, ' (raw ' + (fb.last_change_raw || fb.last_change_unix) + '; epoch semantics unverified)')];
   }
 
+  /** cardFiber is the Fiber optics card's details: the received and transmitted light against the
+   *  gateway's own thresholds and flags, and the optical module. Returns the content. */
   function cardFiber(st) {
     const fb = st.gateway && st.gateway.fiber;
-    if (!fb) return card('Fiber optics', emptyNote('No fiber status from the gateway yet.'));
+    if (!fb) return [emptyNote('No fiber status from the gateway yet.')];
     const rx = findMeasure(fb, 'rx power');
     const tx = findMeasure(fb, 'tx power');
     const temp = findMeasure(fb, 'temperature');
@@ -1781,17 +3574,19 @@
       ['Module', [fb.vendor_name, fb.vendor_pn, fb.wave_length].filter(Boolean).join(' · ')],
     ]));
     body.push(h('p', { class: 'card-foot' }, 'Alarm and warning flags are the AT&T gateway’s own diagnostic (DMI) bits from its fiber status page.'));
-    return cardWithLink('Fiber optics', '#/gateway', 'DMI table', ...body);
+    return body;
   }
 
+  /** cardLocalLink is the This PC's link card's details: the network adapter, its signal and
+   *  rate, its addresses and the route check (egressBlock). Returns the content. */
   function cardLocalLink(st) {
     const l = st.local_link;
-    if (!l) return card('Local link (this PC)', emptyNote('Not measured yet.'));
+    if (!l) return [emptyNote('Not measured yet.')];
     const connected = /^connected$/i.test(l.state || '');
     const signal = l.signal_pct || l.rssi_dbm
       ? [l.signal_pct ? l.signal_pct + ' %' : '', l.rssi_dbm ? (l.signal_pct ? ' · ' : '') + l.rssi_dbm + ' dBm' : '', l.signal_pct ? meter(l.signal_pct) : null]
       : null;
-    return card('Local link (this PC)',
+    return [
       kv([
         ['Adapter', [l.interface, l.type ? ' (' + (l.type === 'wifi' ? 'Wi-Fi' : l.type) + ')' : ''].join('')],
         ['State', l.state ? (connected ? chip('good', l.state) : chip('critical', l.state)) : null],
@@ -1806,7 +3601,8 @@
         ['Error', l.err],
       ]),
       egressBlock(l.egress),
-      HEX64.test(l.raw_sha256 || '') ? h('p', { class: 'card-foot' }, 'Raw adapter report: ', blobLinks(l.raw_sha256, { downloadText: 'download' })) : null);
+      HEX64.test(l.raw_sha256 || '') ? h('p', { class: 'card-foot' }, 'Raw adapter report: ', blobLinks(l.raw_sha256, { downloadText: 'download' })) : null,
+    ];
   }
 
   /** ifText names a network interface: its alias and Windows interface index. */
@@ -1886,10 +3682,12 @@
     return h('span', { class: 'meter' + (cls ? ' ' + cls : ''), 'aria-hidden': 'true' }, fill);
   }
 
+  /** cardEvidence is the Evidence card's details: the ledger's head, signing key, time-stamps,
+   *  last verification and MongoDB copy. Returns the content. */
   function cardEvidence(st) {
     const L = st.ledger || {};
     const lv = L.last_verify;
-    return cardWithLink('Evidence integrity', '#/evidence', 'Verify & export',
+    return [
       kv([
         ['Ledger head', ['record #' + fmtInt(L.head_seq), L.head_ts ? [' · ', timeEl(L.head_ts, F.short)] : null]],
         ['Head hash', L.head_hash ? h('span', { class: 'hash', title: L.head_hash }, shortHash(L.head_hash, 20)) : null],
@@ -1899,7 +3697,8 @@
         ['Not yet time-stamped', fmtInt(L.unanchored_records) + ' records'],
         ['Last verification', lv ? [lv.ok ? chip('good', 'passed') : chip('critical', 'FAILED'), ' ', timeEl(lv.at, F.short), ` · ${fmtInt(lv.records)} records, ${fmtInt(lv.failures)} problems`] : 'not run yet'],
         ['MongoDB copy', st.mongo ? mongoCell(st.mongo) : null],
-      ]));
+      ]),
+    ];
   }
 
   /** mongoCell describes the MongoDB copy of the ledger (Status.mongo): a synchronized copy of
@@ -1921,6 +3720,8 @@
     return [state, ` · ${fmtInt(m.records || 0)} records, ${fmtInt(m.blobs || 0)} blobs${m.syslog ? `, ${fmtInt(m.syslog)} syslog messages` : ''} in “${m.database}”`, upTo];
   }
 
+  /** cardMonitor is the Monitor & clock card's details: the monitor's version, mode, start and
+   *  cycles, and this computer's clock against each time server. Returns the content. */
   function cardMonitor(st) {
     const m = st.monitor || {};
     const ck = st.clock;
@@ -1933,23 +3734,28 @@
     ];
     if (ck && ck.results) {
       for (const r of ck.results) {
-        rows.push(['Clock vs ' + r.server, r.ok ? `${r.offset_ms >= 0 ? '+' : ''}${fmtInt(r.offset_ms)} ms (stratum ${r.stratum || '?'})` : chip('warning', 'no answer', r.err)]);
+        // A zero offset is left out of the JSON (omitempty).
+        rows.push(['Clock vs ' + r.server, r.ok ? `${(r.offset_ms || 0) >= 0 ? '+' : ''}${fmtInt(r.offset_ms || 0)} ms (stratum ${r.stratum || '?'})` : chip('warning', 'no answer', r.err)]);
       }
     }
-    return card('Monitor & clock', kv(rows));
+    return [kv(rows)];
   }
 
   // ------------------------------------------------------------------ flow meter
 
-  /** flowMeter builds the Overview's live traffic card (GET /api/traffic/live, docs/
-   *  syslog-snmp-traffic.md §3.3): the newest download and upload rates through the AT&T
-   *  gateway, from its own counters, as large numbers and bars; the recent readings as a
-   *  sparkline; this PC's rates; when the reading was taken. It asks for a reading every
-   *  LIVE_REFRESH_MS while the Overview is shown and the page is visible, and stops otherwise:
-   *  the gateway gets no extra request while nobody watches. The numbers change every few
-   *  seconds and are not announced (aria-live off). A monitor without a flow meter (404) gets
-   *  no card. Returns the card, which the status refresh puts back among the cards as it is. */
-  function flowMeter(ctx) {
+  /** flowMeter builds the live traffic card (GET /api/traffic/live, docs/
+   *  syslog-snmp-traffic.md §3.3) that the Overview's Traffic card opens: the newest download and
+   *  upload rates through the AT&T gateway, from its own counters, as large numbers and bars; the
+   *  recent readings as a sparkline; this PC's rates; when the reading was taken. It asks for a
+   *  reading every LIVE_REFRESH_MS while the page is visible and o.wanted() says so (the Traffic
+   *  card or its details are on screen), and stops otherwise: the gateway gets no extra request
+   *  while nobody watches. o.onReading(live) gets every reading ({lt, failure}) for the Traffic
+   *  card, or {unavailable} from a monitor without a flow meter (404), whose card stays hidden.
+   *  The numbers change every few seconds and are not announced (aria-live off). The card is
+   *  built once and only updated, so that it can move into the details and out again. Returns
+   *  {el, wake()}: wake asks again at once, or stops asking, when o.wanted() changed. */
+  function flowMeter(ctx, o) {
+    const opts = o || {};
     const body = h('div', { class: 'flow', 'aria-live': 'off' }, h('p', { class: 'loading' }, 'Reading the gateway’s counters…'));
     const el = h('section', { class: 'card', 'aria-labelledby': 'flow-h' },
       h('div', { class: 'card-head' }, h('h2', { id: 'flow-h' }, 'Live traffic'),
@@ -1961,7 +3767,8 @@
     let abort = null;
     let last = null; // the newest reading received
     let failure = null; // why the newest request failed (null: it did not)
-    const shown = () => document.visibilityState === 'visible';
+    const shown = () => document.visibilityState === 'visible' && (!opts.wanted || opts.wanted());
+    const tell = (live) => { if (opts.onReading) opts.onReading(live); };
 
     async function poll() {
       window.clearTimeout(timer);
@@ -1983,9 +3790,11 @@
       if (failure && failure.status === 404) { // this monitor offers no flow meter
         stopped = true;
         el.hidden = true;
+        tell({ unavailable: sentence(capitalize(failure.message)) });
         return;
       }
       replace(body, flowContent(last, failure));
+      tell({ lt: last, failure });
       if (shown()) timer = window.setTimeout(poll, LIVE_REFRESH_MS);
     }
 
@@ -1997,6 +3806,15 @@
         timer = 0;
       }
     };
+    const wake = () => {
+      if (stopped) return;
+      if (!shown()) {
+        window.clearTimeout(timer);
+        timer = 0;
+      } else if (!timer && !busy) {
+        poll();
+      }
+    };
     document.addEventListener('visibilitychange', onVisibility);
     ctx.cleanup(() => {
       stopped = true;
@@ -2005,7 +3823,7 @@
       if (abort) abort.abort();
     });
     poll();
-    return el;
+    return { el, wake };
   }
 
   /** flowContent shows a flow meter reading (model.LiveTraffic), and why the newest request or
@@ -2130,19 +3948,19 @@
     return sl && typeof sl === 'object' && !Array.isArray(sl) ? sl : null;
   }
 
-  /** syslogPanel is a view's card of the gateway's syslog: the receiver and what it received,
+  /** syslogPanel is a view's part about the gateway's syslog: the receiver and what it received,
    *  the gateway's Syslog setting as last read, whether att-monitor keeps it sending here, and
-   *  the control that changes that (syslogControl). link: the Overview's card, which links the
-   *  Syslog page and also says how much the store holds (the Syslog page shows the store in a
-   *  card of its own). The card is built once: update(st) redraws what it shows when that
-   *  changes and leaves the control as it is, and the view puts the card back with
-   *  placeChildren, so a status refresh takes neither the keyboard focus nor a change's
-   *  progress or outcome away. update returns the card, or null when the monitor reports no
-   *  syslog status. */
-  function syslogPanel(ctx, link) {
+   *  the control that changes that (syslogControl). details: the Overview's Gateway syslog
+   *  details, which also say how much the store holds (the Syslog page shows the store in a
+   *  card of its own), as their content; else the Syslog page's card. It is built once:
+   *  update(st) redraws what it shows when that changes and leaves the control as it is, and the
+   *  view puts it back with placeChildren, so a status refresh takes neither the keyboard focus
+   *  nor a change's progress or outcome away. update returns the part, or null when the monitor
+   *  reports no syslog status. */
+  function syslogPanel(ctx, details) {
     const ctl = syslogControl(ctx);
     const body = h('div');
-    const el = link ? cardWithLink('Gateway syslog', '#/syslog', 'Messages', body, ctl.el) : card('Receiver and gateway setting', body, ctl.el);
+    const el = details ? h('div', { class: 'syslog-panel' }, body, ctl.el) : card('Receiver and gateway setting', body, ctl.el);
     let key = null;
     return {
       update(st) {
@@ -2151,7 +3969,7 @@
         const k = JSON.stringify([sl, st.local_link ? st.local_link.local_ip : null, gatewayAuthBlock(st)]);
         if (k !== key) {
           key = k;
-          replace(body, syslogCardBody(sl, st, link));
+          replace(body, syslogCardBody(sl, st, details));
         }
         ctl.update(st);
         return el;
@@ -2159,15 +3977,16 @@
     };
   }
 
-  /** syslogCardBody is what syslogPanel's card shows from Status.syslog (sl). */
-  function syslogCardBody(sl, st, link) {
+  /** syslogCardBody is what syslogPanel shows from Status.syslog (sl); withStore: also how much
+   *  the syslog store holds. */
+  function syslogCardBody(sl, st, withStore) {
     const seq = Number(sl.gateway_seq) || 0;
     const store = syslogStore(sl);
     return [
       kv([
         ['Receiver', syslogReceiver(sl)],
         ['Messages', [syslogCounts(sl), h('span', { class: 'sub small muted' }, 'since the service started')]],
-        ['Stored', link && store ? [syslogUsageText(store), store.oldest ? h('span', { class: 'sub small muted' }, 'oldest message ', timeEl(store.oldest, F.short)) : null] : null],
+        ['Stored', withStore && store ? [syslogUsageText(store), store.oldest ? h('span', { class: 'sub small muted' }, 'oldest message ', timeEl(store.oldest, F.short)) : null] : null],
         ['Last message', sl.last_at || sl.last
           ? [timeEl(sl.last_at, F.sec), sl.last ? h('span', { class: 'sub syslog-text small' }, visibleText(sl.last)) : null]
           : 'none since the service started'],
@@ -2362,8 +4181,8 @@
     let whyKey = null;
     let shown = -1; // the gwSyslog.version out shows
     let shownUntil = 0; // until when the outcome out shows is current (0: none shown)
-    on.addEventListener('click', () => changeGatewaySyslog(true, st));
-    off.addEventListener('click', () => changeGatewaySyslog(false, st));
+    on.addEventListener('click', () => changeGatewaySyslog(true, st, ctx));
+    off.addEventListener('click', () => changeGatewaySyslog(false, st, ctx));
     const draw = () => {
       const had = [on, off].find((b) => b === document.activeElement) || null; // the button the keyboard is on
       const sl = syslogStatus(st);
@@ -2382,7 +4201,7 @@
       if (k !== whyKey) {
         whyKey = k;
         replace(why, gwSyslog.unavailable ? callout('info', gwSyslog.unavailable)
-          : block === 'cert' ? h('p', null, chip('critical', 'paused'), ' The gateway presented an unconfirmed TLS certificate, so att-monitor will not log in to it until the certificate is confirmed (see the banner above).')
+          : block === 'cert' ? h('p', null, chip('critical', 'paused'), ' The gateway presented an unconfirmed TLS certificate, so att-monitor will not log in to it until the certificate is confirmed (see the certificate banner at the top of the page).')
             : block === 'code' ? h('p', null, chip('none', 'no access code'), ' No usable gateway access code is stored, so att-monitor can neither set nor read this setting (att-monitor set-access-code).')
               : null);
         why.hidden = !gwSyslog.unavailable && !block;
@@ -2404,10 +4223,13 @@
   }
 
   /** changeGatewaySyslog asks the monitor, once the operator confirmed what will happen on the
-   *  gateway, to send the gateway's log to this PC and keep it so (enabled), or to stop it. */
-  async function changeGatewaySyslog(enabled, st) {
+   *  gateway, to send the gateway's log to this PC and keep it so (enabled), or to stop it. The
+   *  confirmation belongs to the view that asked (ctx): leaving it (Back closing the Overview's
+   *  details) cancels it, so that it is never left open over a page that no longer shows the
+   *  control. */
+  async function changeGatewaySyslog(enabled, st, ctx) {
     if (gwSyslog.busy) return;
-    if (!(await dialog(gwSyslogDialog(enabled, st))) || gwSyslog.busy) return;
+    if (!(await dialog(Object.assign(gwSyslogDialog(enabled, st), { ctx }))) || gwSyslog.busy) return;
     gwSyslogSet({ busy: true, outcome: null, until: 0 });
     let outcome = null;
     let unavailable = gwSyslog.unavailable;
@@ -2488,18 +4310,57 @@
       result ? ' (Recorded result: ' + sentence(result) + ')' : '');
   }
 
-  async function loadRecentIncidents(el, ctx) {
-    const from = new Date(Date.now() - 7 * 86400e3).toISOString();
+  /** loadRecentIncidents shows the Overview's recent incidents (docs/overview-redesign.md §2.5):
+   *  the three newest, one line each, an open one first; every line links its incident. Read
+   *  again every minute and whenever an incident opens or closes (followIncident), it draws the
+   *  lines again only when they changed (an open one's duration follows the status meanwhile), so
+   *  that a link the keyboard is on stays; when they changed, it keeps the focus on the link that
+   *  had it. Of reads that overlap, the last one asked for is shown. */
+  async function loadRecentIncidents(el, ov) {
+    const mine = ++ov.recentToken;
+    const head = h('div', { class: 'card-head' }, h('h2', { id: 'recent-h' }, 'Recent incidents'),
+      h('a', { href: '#/incidents', class: 'small', 'data-fk': 'recent:all' }, 'All incidents'));
     try {
-      const list = await api('/api/incidents?limit=8&from=' + encodeURIComponent(from));
-      if (!ctx.alive) return;
-      replace(el, 
-        h('div', { class: 'card-head' }, h('h2', { id: 'recent-h' }, 'Recent incidents (7 days)'), h('a', { href: '#/incidents', class: 'small' }, 'All incidents')),
-        incidentsTable(list.slice(0, 8), app.status && app.status.now));
+      const list = await api('/api/incidents?limit=3');
+      if (!ov.ctx.alive || mine !== ov.recentToken) return;
+      const now = app.status && app.status.now;
+      const items = (Array.isArray(list) ? list : []).filter((x) => x && typeof x === 'object').slice(0, 3)
+        .sort((a, b) => (b.open ? 1 : 0) - (a.open ? 1 : 0));
+      // What a line shows, but an open incident's duration (followIncident updates it in place).
+      const key = JSON.stringify(items.map((x) => [x.id, x.open, x.opened, x.closed, x.open ? 0 : x.duration_s, x.state, x.cause, x.attribution, x.summary]));
+      if (partKeys.get(el) === key && ov.recent) {
+        ov.recent.forEach((line, i) => { line.inc = items[i]; });
+      } else {
+        partKeys.set(el, key);
+        ov.recent = items.map((inc) => recentIncident(inc, now));
+        keepFocus(el, () => replace(el, head,
+          items.length ? h('ul', { class: 'recent-list' }, ov.recent.map((line) => line.el)) : emptyNote('No incidents recorded.')));
+      }
+      for (const line of ov.recent) if (line.inc.open) replace(line.dur, keepUnits(incidentDuration(line.inc, now)));
     } catch (e) {
-      if (!ctx.alive) return;
-      replace(el, h('h2', { id: 'recent-h' }, 'Recent incidents'), errorNotice(e));
+      if (!ov.ctx.alive || mine !== ov.recentToken) return;
+      partKeys.delete(el);
+      ov.recent = null;
+      keepFocus(el, () => replace(el, head, errorNotice(e)));
     }
+  }
+
+  /** recentIncident is one line of the recent incidents: when it opened (its link), how long it
+   *  lasted, what it was, and to whom it is attributed - or that it is still in progress. Returns
+   *  {el, dur (its duration's element), inc}. */
+  function recentIncident(inc, now) {
+    const d = toDate(inc.opened);
+    const today = d && localDateValue(d) === localDateValue(new Date());
+    const when = d ? h('time', { datetime: d.toISOString(), title: 'UTC: ' + utcText(inc.opened, d) }, today ? 'Today, ' + F.hm.format(d) : F.short.format(d)) : '?';
+    const tag = inc.open ? chip(stateInfo(inc.state).tone, 'In progress')
+      : inc.attribution === 'provider' ? chip('critical', ATTR_SHORT.provider) : chip('none', ATTR_SHORT[inc.attribution] || humanize(inc.attribution) || '—');
+    const dur = h('span', { class: 'recent-dur' }, keepUnits(incidentDuration(inc, now)));
+    const el = h('li', { class: inc.open ? 'is-open' : null },
+      h('a', { class: 'recent-when', href: '#/incidents/' + encodeURIComponent(inc.id), title: inc.id, 'data-fk': 'recent:' + inc.id }, when),
+      dur,
+      h('span', { class: 'recent-sum', title: inc.summary ? String(inc.summary) : null }, headline(inc)),
+      h('span', { class: 'recent-tag' }, tag));
+    return { el, dur, inc };
   }
 
   function incidentDuration(inc, now) {
@@ -2555,26 +4416,47 @@
 
   // ------------------------------------------------------------------ charts
 
-  function setupCharts(section, ctx) {
+  /** setupCharts shows charts of the history in section (which names them: HISTORY_CHARTS) under
+   *  a range control: the series of the range chosen (remembered: app.range) is read at once, again
+   *  every minute while the page is visible and at once when the page is shown again a minute or
+   *  more later, until ctx ends. A series of that range read less than a minute ago by another part
+   *  of the page (seriesCache: the Overview's 24 hours) is used rather than read again. The charts
+   *  stay in the page from one series to the next (showCharts, renderCharts: updated in place). */
+  function setupCharts(section, ctx, which) {
     const body = h('div', { class: 'charts-body' }, h('p', { class: 'loading' }, 'Loading chart data…'));
     section.append(
-      h('div', { class: 'section-head' }, h('h2', { id: 'history-h' }, 'History'),
+      h('div', { class: 'section-head' }, h('h3', { class: 'subhead' }, 'History'),
         rangeControl(app.range, (r) => { app.range = r; savePref('range', r); load(); })),
       body);
     let token = 0;
+    let shownSer = null; // the series the charts show
+    let loadedAt = 0;
+    const charts = new Map(); // the charts shown (renderCharts)
+    ctx.cleanup(() => disposeCharts(charts));
     async function load() {
       const mine = ++token;
+      const range = app.range;
       body.classList.add('is-loading');
       body.setAttribute('aria-busy', 'true');
       try {
-        const ser = await api('/api/series?range=' + encodeURIComponent(app.range));
+        const cached = seriesCache[range];
+        let ser = cached && Date.now() - cached.at < SERIES_REFRESH_MS ? cached.ser : null;
+        if (!ser) {
+          ser = await api('/api/series?range=' + encodeURIComponent(range));
+          if (ser && typeof ser === 'object') seriesCache[range] = { ser, at: Date.now() };
+        }
         if (!ctx.alive || mine !== token) return;
+        loadedAt = Date.now();
+        if (ser && ser === shownSer) return; // nothing newer than the charts show
+        shownSer = ser;
         const firstLabels = !app.series;
         app.series = ser;
-        renderCharts(body, ser, ctx);
-        if (firstLabels && app.status && ctx.onStatus) ctx.onStatus(app.status); // probe labels come with the series
+        showCharts(body, ser, charts, which);
+        if (firstLabels && app.status && app.view && app.view.onStatus) app.view.onStatus(app.status); // probe labels come with the series
       } catch (e) {
         if (!ctx.alive || mine !== token) return;
+        disposeCharts(charts);
+        shownSer = null;
         replace(body, errorNotice(e));
       } finally {
         if (mine === token) {
@@ -2585,6 +4467,35 @@
     }
     load();
     ctx.interval(() => { if (!document.hidden) load(); }, SERIES_REFRESH_MS);
+    // Back from a hidden tab, the minutes the interval skipped are read at once.
+    const onVisible = () => { if (!document.hidden && Date.now() - loadedAt >= SERIES_REFRESH_MS) load(); };
+    document.addEventListener('visibilitychange', onVisible);
+    ctx.cleanup(() => document.removeEventListener('visibilitychange', onVisible));
+  }
+
+  /** showCharts shows the charts of a series in body (renderCharts) so that the reader keeps their
+   *  place. The charts shown are updated in place: a plot keeps the keyboard focus and the time it
+   *  shows, a table view its focus and scroll position, nothing is announced again. For a chart
+   *  drawn anew, body keeps its height until it has been drawn (a plot draws on its first layout,
+   *  two frames later: the section must not shrink and throw the scroll position to the top), a
+   *  table view gets its scroll position back, and the keyboard focus goes to the element that took
+   *  the place of the one that had it (keepFocus) - else to the scroll region around (the details'
+   *  body): never out of the dialog. */
+  function showCharts(body, ser, charts, which) {
+    const scrolls = new Map();
+    for (const t of body.querySelectorAll('.chart-table[data-fk]')) scrolls.set(t.getAttribute('data-fk'), t.scrollTop);
+    const had = body.contains(document.activeElement);
+    body.style.minHeight = body.offsetHeight + 'px'; // CSSOM: allowed by the CSP
+    keepFocus(body, () => renderCharts(body, ser, charts, which));
+    for (const t of body.querySelectorAll('.chart-table[data-fk]')) {
+      const top = scrolls.get(t.getAttribute('data-fk'));
+      if (top && t.scrollTop !== top) t.scrollTop = top;
+    }
+    if (had && !body.contains(document.activeElement)) {
+      const region = body.closest('.detail-body');
+      if (region) region.focus({ preventScroll: true });
+    }
+    window.requestAnimationFrame(() => window.requestAnimationFrame(() => { body.style.minHeight = ''; }));
   }
 
   /** rangeControl offers the RANGES (or the given ranges, [value, label] pairs) as a segmented
@@ -2621,44 +4532,110 @@
     return chosen.map((p, i) => ({ key: p.name, label: p.label || p.name, slot: i + 1 }));
   }
 
-  function renderCharts(body, ser, ctx) {
-    const from = toMs(ser.from);
-    const to = toMs(ser.to);
-    if (from == null || to == null || to <= from) {
+  // The charts of the history by name, in their order (renderCharts; the Overview's details
+  // mount the ones they show): each gets the series, its range and buckets (seriesGeom) and the
+  // charts whose legends show and hide the same probes (linked), and returns what to show, in
+  // order: a chart ({key, kind: 'line' | 'strip', o}: drawn by lineChart or stateStrip, and updated
+  // in place by the next series), or a part drawn anew every time ({el}); null for nothing.
+  const HISTORY_CHARTS = dict({
+    availability: (ser, g) => [{ key: 'availability', kind: 'strip', o: availabilityOpts(g) }],
+    latency: (ser, g, linked) => [{ key: 'latency', kind: 'line', o: latencyOpts(ser, g, linked) }],
+    loss: (ser, g, linked) => [{ key: 'loss', kind: 'line', o: lossOpts(ser, g, linked) }],
+    traffic: (ser, g) => [trafficPart(ser, g.from, g.to, g.stepMs), { el: trafficDaysTable(ser) }],
+    optical: (ser, g) => [opticalPart(ser, g.from, g.to)],
+  });
+
+  /** renderCharts shows in body the charts of a series (GET /api/series) that which names
+   *  (HISTORY_CHARTS: "availability", "latency", "loss", "traffic", "optical"; every one when which
+   *  is not given). A chart already shown (charts: key -> {kind, chart, ctx}) is updated in place
+   *  with the new series when it can be; the others are drawn anew, and those no longer shown end
+   *  with their context. The figures are put in place around those that stay (placeChildren),
+   *  which never moves them: the keyboard focus in one stays. */
+  function renderCharts(body, ser, charts, which) {
+    const g = seriesGeom(ser);
+    if (!g) {
+      disposeCharts(charts);
       replace(body, errorNotice(new Error('The monitor returned an invalid chart range.')));
       return;
     }
-    const stepMs = Math.max(1, ser.step_s || 60) * 1000;
-    const pts = (ser.points || []).filter((p) => toMs(p.t) != null);
-    const starts = pts.map((p) => toMs(p.t));
-    const times = starts.map((t) => t + stepMs / 2); // plot each bucket at its centre
-    const bucketLabel = (i) => F.short.format(new Date(starts[i])) + ' – ' + F.hm.format(new Date(starts[i] + stepMs));
-    const bucketUTC = (i) => new Date(starts[i]).toISOString().slice(0, 16).replace('T', ' ') + ' – ' +
-      new Date(starts[i] + stepMs).toISOString().slice(11, 16) + ' UTC';
-    const specs = chartProbes(ser);
-    const num = (v) => (v == null || !isFinite(v) ? null : Number(v));
     const linked = [];
+    const parts = (which || Object.keys(HISTORY_CHARTS)).flatMap((name) => (HISTORY_CHARTS[name] ? HISTORY_CHARTS[name](ser, g, linked) : []));
+    const next = new Map();
+    const els = [];
+    for (const p of parts) {
+      if (!p) continue;
+      if (!p.kind) {
+        if (p.el) els.push(p.el);
+        continue;
+      }
+      let c = charts.get(p.key);
+      if (c && c.kind === p.kind && c.chart.update(p.o)) {
+        charts.delete(p.key);
+      } else {
+        const ctx = newViewCtx();
+        p.o.ctx = ctx;
+        c = { kind: p.kind, chart: p.kind === 'strip' ? stateStrip(p.o) : lineChart(p.o), ctx };
+      }
+      next.set(p.key, c);
+      els.push(c.chart.el);
+    }
+    disposeCharts(charts); // those not shown any more
+    for (const [k, c] of next) charts.set(k, c);
+    placeChildren(body, els.length ? els : emptyNote('This monitor reports nothing for these charts in this range.'));
+  }
 
-    const strip = stateStrip({ id: 'availability', points: pts, from, to, stepMs, ctx });
-    const latency = lineChart({
-      id: 'latency', ctx, linked,
+  /** disposeCharts ends the charts renderCharts shows (their contexts) and forgets them. */
+  function disposeCharts(charts) {
+    for (const c of charts.values()) c.ctx.dispose();
+    charts.clear();
+  }
+
+  /** bucketWords words the buckets of a series' range (seriesGeom) for the tooltips and the
+   *  table views: when each starts and ends, in local time and in UTC; times are their centres,
+   *  where each bucket is plotted. */
+  function bucketWords(g) {
+    const { starts, stepMs } = g;
+    return {
+      times: starts.map((t) => t + stepMs / 2),
+      label: (i) => F.short.format(new Date(starts[i])) + ' – ' + F.hm.format(new Date(starts[i] + stepMs)),
+      utc: (i) => new Date(starts[i]).toISOString().slice(0, 16).replace('T', ' ') + ' – ' + new Date(starts[i] + stepMs).toISOString().slice(11, 16) + ' UTC',
+    };
+  }
+
+  /** availabilityOpts is the availability chart: the classifier's worst state in each bucket
+   *  (stateStrip). */
+  function availabilityOpts(g) {
+    return { id: 'availability', points: g.pts, from: g.from, to: g.to, stepMs: g.stepMs };
+  }
+
+  /** latencyOpts is the round-trip time chart (lineChart): the gateway's ICMP probe and every
+   *  internet probe (chartProbes), the mean of the successful replies in each bucket. */
+  function latencyOpts(ser, g, linked) {
+    const b = bucketWords(g);
+    return {
+      id: 'latency', linked,
       title: 'Round-trip time',
-      subtitle: 'Mean of the successful replies in each ' + fmtDur(stepMs / 1000) + ' bucket. Gaps: no successful reply, or no data.',
-      series: specs.map((sp) => ({ ...sp, vals: pts.map((p) => num(p.rtt_ms && p.rtt_ms[sp.key])) })),
-      times, from, to, gapMs: stepMs * 1.5, legend: true,
+      subtitle: 'Mean of the successful replies in each ' + fmtDur(g.stepMs / 1000) + ' bucket. Gaps: no successful reply, or no data.',
+      series: chartProbes(ser).map((sp) => ({ ...sp, vals: g.pts.map((p) => numOrNull(p.rtt_ms && p.rtt_ms[sp.key])) })),
+      times: b.times, from: g.from, to: g.to, gapMs: g.stepMs * 1.5, legend: true,
       yMin: 0, minMax: 5, robustMax: true,
-      yFmt: (v) => fmtInt(v) + ' ms', tipFmt: fmtMs, tipTime: bucketLabel, tipUTC: bucketUTC, unit: 'ms',
-    });
-    const loss = lineChart({
-      id: 'loss', ctx, linked,
+      yFmt: (v) => fmtInt(v) + ' ms', tipFmt: fmtMs, tipTime: b.label, tipUTC: b.utc, unit: 'ms',
+    };
+  }
+
+  /** lossOpts is the packet loss chart (lineChart) of the same probes: the share of attempts
+   *  without a reply in each bucket. */
+  function lossOpts(ser, g, linked) {
+    const b = bucketWords(g);
+    return {
+      id: 'loss', linked,
       title: 'Packet loss',
       subtitle: 'Share of probe attempts without a reply in each bucket.',
-      series: specs.map((sp) => ({ ...sp, vals: pts.map((p) => (p.loss && p.loss[sp.key] != null ? num(p.loss[sp.key] * 100) : null)) })),
-      times, from, to, gapMs: stepMs * 1.5, legend: true,
+      series: chartProbes(ser).map((sp) => ({ ...sp, vals: g.pts.map((p) => (p.loss && p.loss[sp.key] != null ? numOrNull(p.loss[sp.key] * 100) : null)) })),
+      times: b.times, from: g.from, to: g.to, gapMs: g.stepMs * 1.5, legend: true,
       yMin: 0, yMax: 100,
-      yFmt: (v) => v + ' %', tipFmt: (v) => (v == null ? '—' : Math.round(v * 10) / 10 + ' %'), tipTime: bucketLabel, tipUTC: bucketUTC, unit: '%',
-    });
-    replace(body, strip, latency, loss, trafficChart(ser, from, to, stepMs, ctx), trafficDaysTable(ser), opticalChart(ser, from, to, ctx));
+      yFmt: (v) => v + ' %', tipFmt: (v) => (v == null ? '—' : Math.round(v * 10) / 10 + ' %'), tipTime: b.label, tipUTC: b.utc, unit: '%',
+    };
   }
 
   /** fmtNum writes a number with at most two decimals (axis ticks, thresholds). */
@@ -2749,21 +4726,24 @@
     return m ? F.day.format(new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]))) : String(v);
   }
 
-  /** trafficChart draws the household's traffic in the manner of an MRTG graph — the "SNMP flow
+  /** trafficPart is the household's traffic in the manner of an MRTG graph — the "SNMP flow
    *  chart" without SNMP (Series.traffic, docs/syslog-snmp-traffic.md §3.3): from the AT&T
    *  gateway's own byte counters, the WAN download as a filled area and the upload as a line, in
    *  bits per second, each bucket's mean drawn across the bucket, with the highest rate between
    *  two readings marked and the classifier's heavy-traffic level; under it MRTG's legend: the
-   *  maximum, average and current rate of each direction over the range, and this computer's.
-   *  null when the monitor reports no traffic at all. */
-  function trafficChart(ser, from, to, stepMs, ctx) {
+   *  maximum, average and current rate of each direction over the range, and this computer's. A
+   *  part of renderCharts: the chart (lineChart), a figure that says there is no reading in the
+   *  range, or null when the monitor reports no traffic at all. */
+  function trafficPart(ser, from, to, stepMs) {
     const title = 'Traffic';
     const heavy = Number(ser.heavy_traffic_mbps) > 0 ? Number(ser.heavy_traffic_mbps) : null;
     const pts = (Array.isArray(ser.traffic) ? ser.traffic : []).filter((p) => p && typeof p === 'object' && toMs(p.t) != null);
     if (!pts.length) {
       if (heavy == null) return null;
-      return h('figure', { class: 'chart' }, h('figcaption', { class: 'chart-head' }, h('div', null, h('span', { class: 'chart-title' }, title))),
-        emptyNote('No traffic readings in this range.'));
+      return {
+        el: h('figure', { class: 'chart' }, h('figcaption', { class: 'chart-head' }, h('div', null, h('span', { class: 'chart-title' }, title))),
+          emptyNote('No traffic readings in this range.')),
+      };
     }
     const starts = pts.map((p) => toMs(p.t));
     const num = (v) => (v == null || !isFinite(v) ? null : Number(v));
@@ -2785,8 +4765,8 @@
       { label: 'This PC download', vals: pcRx },
       { label: 'This PC upload', vals: pcTx },
     ], bucket);
-    return lineChart({
-      id: 'traffic', ctx, linked: null,
+    return { key: 'traffic', kind: 'line', o: {
+      id: 'traffic', linked: null,
       title,
       subtitle: 'Bits per second through the AT&T gateway, from its own IPv4 byte counters (it offers no SNMP), as MRTG draws it: download filled, upload as a line, the mean of each ' +
         fmtDur(stepMs / 1000) + ' bucket across the bucket, and short marks at the highest rate between two of the gateway’s readings.' +
@@ -2810,7 +4790,7 @@
       tipTime: bucket,
       tipUTC: (i) => new Date(starts[i]).toISOString().slice(0, 16).replace('T', ' ') + ' – ' + new Date(starts[i] + stepMs).toISOString().slice(11, 16) + ' UTC',
       after: summary,
-    });
+    } };
   }
 
   /** trafficSummary is MRTG's legend under the traffic chart: for each row (key, label, vals,
@@ -2852,21 +4832,37 @@
       table([{ label: 'Day' }, { label: 'Downloaded', num: true }, { label: 'Uploaded', num: true }, { label: 'Time counted', num: true }, { label: 'Totals' }], rows, { compact: true }));
   }
 
+  /** median is the upper middle value of arr (0 without one), for the gap heuristics of the
+   *  charts; a median that is shown is medianOf's. */
   function median(arr) {
     if (!arr.length) return 0;
     const a = arr.slice().sort((x, y) => x - y);
     return a[Math.floor(a.length / 2)];
   }
 
-  function opticalChart(ser, from, to, ctx) {
+  /** medianOf is the median of arr as the classifier computes it (internal/monitor medianMs):
+   *  the mean of the two middle values for an even count; null without a value. */
+  function medianOf(arr) {
+    if (!arr.length) return null;
+    const a = arr.slice().sort((x, y) => x - y);
+    const n = a.length;
+    return n % 2 ? a[(n - 1) / 2] : (a[n / 2 - 1] + a[n / 2]) / 2;
+  }
+
+  /** opticalPart is the light the gateway received against its own alarm and warning thresholds,
+   *  with its own Rx-low flag as a strip under it. A part of renderCharts: the chart (lineChart),
+   *  or a figure that says there is no reading in the range. */
+  function opticalPart(ser, from, to) {
     const pts = (ser.optical || [])
       .map((p) => ({ t: toMs(p.t), rx: p.rx_x10 != null ? p.rx_x10 / 10 : null, alarm: !!p.rx_low_alarm, warn: !!p.rx_low_warn }))
       .filter((p) => p.t != null && p.t >= from && p.t <= to)
       .sort((a, b) => a.t - b.t);
     const title = 'Fiber receive power vs the gateway’s own thresholds';
     if (!pts.length) {
-      return h('figure', { class: 'chart' }, h('figcaption', { class: 'chart-head' }, h('div', null, h('span', { class: 'chart-title' }, title))),
-        emptyNote('No optical readings from the gateway in this range.'));
+      return {
+        el: h('figure', { class: 'chart' }, h('figcaption', { class: 'chart-head' }, h('div', null, h('span', { class: 'chart-title' }, title))),
+          emptyNote('No optical readings from the gateway in this range.')),
+      };
     }
     const diffs = [];
     for (let i = 1; i < pts.length; i++) diffs.push(pts[i].t - pts[i - 1].t);
@@ -2891,8 +4887,8 @@
       if (last && last.tone === tone && Math.abs(last.end - p.t) < 1000) last.end = end;
       else runs.push({ start: p.t, end, tone, label: flagText[tone] });
     }
-    return lineChart({
-      id: 'optical', ctx, linked: null,
+    return { key: 'optical', kind: 'line', o: {
+      id: 'optical', linked: null,
       title,
       subtitle: 'Optical level reported by the AT&T gateway, in dBm. Dashed lines: the gateway’s alarm and warning thresholds. Strip: the gateway’s own Rx-low flag.',
       series: [{ key: 'rx', label: 'Rx power', slot: 1, vals: pts.map((p) => p.rx) }],
@@ -2903,7 +4899,7 @@
       tipTime: (i) => F.full.format(new Date(pts[i].t)),
       tipExtra: (i) => h('div', { class: 'tip-row' }, icon(flagOf(pts[i])), h('span', { class: 'val' }, flagText[flagOf(pts[i])]), h('span')),
       unit: 'dBm',
-    });
+    } };
   }
 
   function niceTicks(lo, hi, count) {
@@ -2963,27 +4959,45 @@
     return Math.abs(times[lo] - t) <= Math.abs(times[hi] - t) ? lo : hi;
   }
 
+  /** chartTableView is a chart's table view: a focusable scroll region (keyed, data-fk, so that
+   *  keepFocus finds it again in a chart drawn anew) holding the table of cols and rows. */
   function chartTableView(o, cols, rows) {
-    const wrap = h('div', { class: 'chart-table', tabindex: '0', role: 'region', 'aria-label': o.title + ' — table view' });
+    const wrap = h('div', { class: 'chart-table', tabindex: '0', role: 'region', 'aria-label': o.title + ' — table view', 'data-fk': 'chart:' + o.id + ':tableview' });
     wrap.append(table(cols, rows, { compact: true }).firstChild);
     return wrap;
   }
 
-  /** chartFrame builds the figure, caption, table toggle and the focusable plot area. */
+  /** fillTableView shows cols and rows in the table view of wrap: in the region already there (it
+   *  keeps the keyboard focus and its scroll position: new data every minute must not send the
+   *  reader back to the first row), else in a new one (chartTableView). */
+  function fillTableView(wrap, o, cols, rows) {
+    const region = wrap.firstChild;
+    if (region) replace(region, table(cols, rows, { compact: true }).firstChild);
+    else wrap.append(chartTableView(o, cols, rows));
+  }
+
+  /** chartFrame builds the figure, caption (cap; its title and subtitle in head, chartCaption),
+   *  table toggle and the focusable plot area. The plot and the toggle carry keys (data-fk) by
+   *  which keepFocus finds them in a chart drawn anew. */
   function chartFrame(o) {
     const fig = h('figure', { class: 'chart' });
-    const tableBtn = h('button', { type: 'button', class: 'btn btn-small', 'aria-pressed': String(app.tableViews.has(o.id)), title: 'Show the data as a table (T)' }, 'Table');
-    fig.append(h('figcaption', { class: 'chart-head' },
-      h('div', null, h('span', { class: 'chart-title' }, o.title), o.subtitle ? h('p', { class: 'chart-sub' }, o.subtitle) : null),
-      tableBtn));
+    const tableBtn = h('button', { type: 'button', class: 'btn btn-small', 'aria-pressed': String(app.tableViews.has(o.id)), title: 'Show the data as a table (T)', 'data-fk': 'chart:' + o.id + ':table' }, 'Table');
+    const head = chartCaption(h('div'), o.title, o.subtitle);
+    const cap = h('figcaption', { class: 'chart-head' }, head, tableBtn);
+    fig.append(cap);
     const plot = h('div', {
-      class: 'plot', tabindex: '0', role: 'group', 'aria-roledescription': 'chart',
+      class: 'plot', tabindex: '0', role: 'group', 'aria-roledescription': 'chart', 'data-fk': 'chart:' + o.id + ':plot',
       'aria-label': o.title + '. Use the left and right arrow keys to read values, T for the table view.',
     });
     const tip = h('div', { class: 'tip', hidden: true, 'aria-hidden': 'true' });
     plot.append(tip);
     const live = h('div', { class: 'sr-only', 'aria-live': 'polite' });
-    return { fig, tableBtn, plot, tip, live };
+    return { fig, cap, head, tableBtn, plot, tip, live };
+  }
+
+  /** chartCaption writes a chart's title and subtitle in head (chartFrame's) and returns it. */
+  function chartCaption(head, title, subtitle) {
+    return replace(head, h('span', { class: 'chart-title' }, title), subtitle ? h('p', { class: 'chart-sub' }, subtitle) : null);
   }
 
   function placeTip(tip, x, width) {
@@ -3009,16 +5023,44 @@
    * [bool], keys} marks the values at those indexes, of those series, as lower bounds: a chevron
    * above them. yFmtFor(hi), when given, returns the tick labels for an axis that ends at hi
    * (units that follow the scale). after is shown under the plot.
+   * Returns {el, update(o)}: update shows the same chart for new data (a newer series, another
+   * range) in place - the plot keeps the keyboard focus and the time it shows (quietly: nothing is
+   * announced again), the table view its focus and scroll position - and returns false, changing
+   * nothing, when it cannot (a chart with a flag strip and one without differ in height).
    */
-  function lineChart(o) {
-    const { fig, tableBtn, plot, tip, live } = chartFrame(o);
+  function lineChart(o0) {
+    let o = o0;
+    const { fig, cap, head, tableBtn, plot, tip, live } = chartFrame(o);
     const H = o.band ? 252 : 224;
+    // Its height before its first draw (CSSOM: allowed by the CSP): a chart drawn anew must not
+    // make the page shorter for a moment, which would throw the reader's scroll position.
+    plot.style.minHeight = H + 'px';
+    const bandLegend = o.band && o.band.legend ? h('ul', { class: 'legend', 'aria-label': 'Flag strip legend' },
+      o.band.legend.map(([tone, label]) => h('li', null, h('span', { class: 'static' }, icon(tone), label)))) : null;
+    const note = h('p', { class: 'chart-note', hidden: true });
+    const tableWrap = h('div', { hidden: true });
     let legendEl = null;
-    const primary = o.series.filter((se) => !se.of && se.plot !== false);
-    if (o.legend && primary.length > 1) {
+    let legendKey = null;
+
+    let W = 0;
+    let g = null;
+    let idx = -1; // the value shown last (keyboard or pointer): the arrow keys go on from it
+    let want = false; // its tooltip is shown, or is to be once the plot is drawn
+
+    /** legend builds the legend (legendEl): its buttons (each series shown or hidden, for every
+     *  linked chart) and its further entries, anew only when they change (legendKey), so that a
+     *  button the keyboard is on stays; none with fewer than two series. */
+    function legend() {
+      const primary = o.series.filter((se) => !se.of && se.plot !== false);
+      const show = o.legend && primary.length > 1;
+      const k = JSON.stringify(show ? [primary.map((se) => [se.key, se.label, se.slot, !!se.area]), (o.legendExtra || []).map((x) => x[1])] : null);
+      if (k === legendKey) return;
+      legendKey = k;
+      legendEl = null;
+      if (!show) return;
       legendEl = h('ul', { class: 'legend', 'aria-label': 'Series — select to show or hide' });
       for (const se of primary) {
-        const btn = h('button', { type: 'button', 'aria-pressed': String(!app.hidden.has(se.key)), dataset: { key: se.key } },
+        const btn = h('button', { type: 'button', 'aria-pressed': String(!app.hidden.has(se.key)), dataset: { key: se.key }, 'data-fk': 'chart:' + o.id + ':legend:' + se.key },
           se.area ? areaKey(se.slot) : lineKey(se.slot), se.label);
         btn.addEventListener('click', () => {
           if (app.hidden.has(se.key)) app.hidden.delete(se.key); else app.hidden.add(se.key);
@@ -3027,19 +5069,15 @@
         legendEl.append(h('li', null, btn));
       }
       for (const [key, label] of o.legendExtra || []) legendEl.append(h('li', null, h('span', { class: 'static' }, key, label)));
-      fig.append(legendEl);
     }
-    if (o.band && o.band.legend) {
-      fig.append(h('ul', { class: 'legend', 'aria-label': 'Flag strip legend' },
-        o.band.legend.map(([tone, label]) => h('li', null, h('span', { class: 'static' }, icon(tone), label)))));
-    }
-    const note = h('p', { class: 'chart-note', hidden: true });
-    const tableWrap = h('div', { hidden: true });
-    add(fig, [plot, note, o.after, live, tableWrap]);
 
-    let W = 0;
-    let g = null;
-    let idx = -1;
+    /** place puts the chart's parts in its figure (placeChildren: the plot, and whatever has the
+     *  keyboard focus, stays where it is). */
+    function place() {
+      placeChildren(fig, cap, legendEl, bandLegend, plot, note, o.after, live, tableWrap);
+    }
+    legend();
+    place();
 
     function visible() {
       return o.series.filter((se) => !app.hidden.has(se.of || se.key));
@@ -3206,7 +5244,7 @@
       svg.append(g.xh, g.dots);
       const old = plot.querySelector('svg');
       if (old) old.replaceWith(svg); else plot.insertBefore(svg, tip);
-      if (idx >= 0 && !tip.hidden) showAt(idx, false);
+      if (want && idx >= 0) showAt(idx, true); // shown again where it was, quietly (a resize, new data)
     }
 
     function bandAt(t) {
@@ -3214,9 +5252,14 @@
       return o.band.runs.find((r) => t >= r.start && t <= r.end) || null;
     }
 
+    /** showAt shows value i: its crosshair and tooltip, and its figures in the live region unless
+     *  shown from the pointer or again after a redraw (pointer true). Before the plot is drawn it
+     *  only notes it: draw shows it. */
     function showAt(i, pointer) {
-      if (!g || i < 0 || i >= o.times.length) { hide(); return; }
+      if (i < 0 || i >= o.times.length) { hide(); return; }
       idx = i;
+      want = true;
+      if (!g) return;
       const x = g.xs(o.times[i]);
       g.xh.setAttribute('x1', x);
       g.xh.setAttribute('x2', x);
@@ -3247,6 +5290,7 @@
     }
 
     function hide() {
+      want = false;
       tip.hidden = true;
       if (g) {
         g.xh.setAttribute('visibility', 'hidden');
@@ -3280,7 +5324,7 @@
         case 'ArrowRight': i = Math.min(n - 1, i + (e.shiftKey ? 10 : 1)); break;
         case 'Home': i = 0; break;
         case 'End': i = n - 1; break;
-        case 'Escape': hide(); return;
+        case 'Escape': hideByKey(e); return;
         case 't': case 'T': tableBtn.click(); return;
         default: return;
       }
@@ -3288,7 +5332,16 @@
       showAt(i, false);
     });
 
-    function buildTable() {
+    /** hideByKey hides the tooltip on Esc; the key does nothing else then, so that inside a
+     *  modal (the Overview's details) only a second Esc closes it. */
+    function hideByKey(e) {
+      if (tip.hidden) return;
+      e.preventDefault();
+      hide();
+    }
+
+    /** fillTable shows the values in the table view (fillTableView), newest first. */
+    function fillTable() {
       const cols = [{ label: 'Time (local)' }].concat(o.series.map((se) => ({ label: se.label + (o.unit ? ' (' + o.unit + ')' : ''), num: true })));
       if (o.band) cols.push({ label: 'Gateway flag' });
       const rows = [];
@@ -3302,7 +5355,7 @@
         }
         rows.push(r);
       }
-      return chartTableView(o, cols, rows);
+      fillTableView(tableWrap, o, cols, rows);
     }
 
     function applyView() {
@@ -3310,7 +5363,7 @@
       tableBtn.setAttribute('aria-pressed', String(on));
       plot.hidden = on;
       tableWrap.hidden = !on;
-      if (on && !tableWrap.firstChild) tableWrap.append(buildTable());
+      if (on && !tableWrap.firstChild) fillTable();
       if (!on && plot.clientWidth && Math.round(plot.clientWidth) !== W) draw();
     }
     tableBtn.addEventListener('click', () => {
@@ -3318,13 +5371,15 @@
       applyView();
     });
 
+    /** refreshLegend shows on the legend's buttons which series are shown (app.hidden). */
+    function refreshLegend() {
+      if (!legendEl) return;
+      for (const btn of legendEl.querySelectorAll('button')) btn.setAttribute('aria-pressed', String(!app.hidden.has(btn.dataset.key)));
+    }
+
     const api_ = {
       refresh() {
-        if (legendEl) {
-          for (const btn of legendEl.querySelectorAll('button')) {
-            btn.setAttribute('aria-pressed', String(!app.hidden.has(btn.dataset.key)));
-          }
-        }
+        refreshLegend();
         if (W) draw();
       },
     };
@@ -3337,7 +5392,25 @@
     ro.observe(plot);
     if (o.ctx) o.ctx.cleanup(() => ro.disconnect());
     applyView();
-    return fig;
+
+    /** update shows the same chart for new data (o2) in place: see lineChart. */
+    function update(o2) {
+      if (!!o2.band !== !!o.band) return false;
+      const at = idx >= 0 ? o.times[idx] : null;
+      o = Object.assign(o2, { ctx: o.ctx });
+      chartCaption(head, o.title, o.subtitle);
+      legend();
+      refreshLegend();
+      place(); // the flag strip's legend (bandLegend) is the same for every series of the chart
+      if (o.linked) o.linked.push(api_);
+      // The value shown last, by its time: still shown, quietly, when it is in the new data.
+      idx = at != null && at >= o.from && at <= o.to && o.times.length ? nearestIndex(o.times, at) : -1;
+      if (idx < 0 && want) hide();
+      if (app.tableViews.has(o.id)) fillTable(); else replace(tableWrap); // made again when shown
+      if (!plot.hidden && plot.clientWidth) draw(); else W = 0; // drawn again once shown (applyView, the resize observer)
+      return true;
+    }
+    return { el: fig, update };
   }
 
   /** stateRuns merges buckets into runs of equal state; missing buckets become "no data". */
@@ -3372,36 +5445,51 @@
     return order;
   }
 
-  function stateStrip(o) {
-    const runs = stateRuns(o.points, o.from, o.to, o.stepMs);
-    const order = stripOrder(runs);
-    const unknown = order.includes('UNKNOWN');
-    const { fig, tableBtn, plot, tip, live } = chartFrame({
-      id: o.id, title: 'Availability',
-      subtitle: 'Worst classifier state in each ' + fmtDur(o.stepMs / 1000) + ' bucket. Grey: the monitor was not measuring' +
-        (unknown ? ', or its measurements could not be judged (Unknown).' : '.'),
-    });
+  /** stateStrip draws the classifier's worst state in each bucket of a series' range (o: {id,
+   *  points, from, to, stepMs, ctx}) as runs of states, with their legend, their shares of the
+   *  range, a tooltip on hover and from the keyboard, and a table view. Returns {el, update(o)}:
+   *  update shows new data in place, as lineChart's does (the run shown last stays shown, by its
+   *  time, quietly). */
+  function stateStrip(o0) {
+    let o = o0;
+    const { fig, cap, head, tableBtn, plot, tip, live } = chartFrame({ id: o.id, title: 'Availability' });
     const H = 64;
-    fig.append(h('ul', { class: 'legend', 'aria-label': 'States' },
-      order.map((st) => h('li', null, h('span', { class: 'static' }, icon(stateInfo(st).tone), stateInfo(st).label)))));
+    plot.style.minHeight = H + 'px'; // its height before its first draw (see lineChart)
     const summary = h('p', { class: 'chart-summary' });
     const tableWrap = h('div', { hidden: true });
-    fig.append(plot, summary, live, tableWrap);
-
-    const total = {};
-    let all = 0;
-    for (const r of runs) {
-      total[r.state] = (total[r.state] || 0) + (r.end - r.start);
-      all += r.end - r.start;
-    }
-    if (all > 0) {
-      add(summary, ['Share of this range: ', order.filter((st) => total[st]).map((st) =>
-        h('span', { class: 'badge' }, icon(stateInfo(st).tone), stateInfo(st).label + ' ' + fmtPct((100 * total[st]) / all, 2)))]);
-    }
-
+    let runs = [];
+    let legendEl = null;
+    let legendKey = null;
     let W = 0;
     let g = null;
-    let idx = -1;
+    let idx = -1; // the run shown last
+    let want = false; // its tooltip is shown, or is to be once the plot is drawn
+
+    /** compute works out the runs of o and what is said of them: the caption, the legend (anew
+     *  only when its states change) and the shares of the range; place puts them in the figure. */
+    function compute() {
+      runs = stateRuns(o.points, o.from, o.to, o.stepMs);
+      const order = stripOrder(runs);
+      const unknown = order.includes('UNKNOWN');
+      chartCaption(head, 'Availability', 'Worst classifier state in each ' + fmtDur(o.stepMs / 1000) + ' bucket. Grey: the monitor was not measuring' +
+        (unknown ? ', or its measurements could not be judged (Unknown).' : '.'));
+      const k = order.join('|');
+      if (k !== legendKey) {
+        legendKey = k;
+        legendEl = h('ul', { class: 'legend', 'aria-label': 'States' },
+          order.map((st) => h('li', null, h('span', { class: 'static' }, icon(stateInfo(st).tone), stateInfo(st).label))));
+      }
+      const total = {};
+      let all = 0;
+      for (const r of runs) {
+        total[r.state] = (total[r.state] || 0) + (r.end - r.start);
+        all += r.end - r.start;
+      }
+      replace(summary, all > 0 ? ['Share of this range: ', order.filter((st) => total[st]).map((st) =>
+        h('span', { class: 'badge' }, icon(stateInfo(st).tone), stateInfo(st).label + ' ' + fmtPct((100 * total[st]) / all, 2)))] : null);
+      placeChildren(fig, cap, legendEl, plot, summary, live, tableWrap);
+    }
+    compute();
 
     function draw() {
       W = Math.max(260, Math.round(plot.clientWidth));
@@ -3409,16 +5497,13 @@
       const x1 = W - 14;
       const xs = (t) => x0 + ((t - o.from) / (o.to - o.from)) * (x1 - x0);
       const svg = s('svg', { width: W, height: H, viewBox: `0 0 ${W} ${H}`, 'aria-hidden': 'true', focusable: 'false' });
-      const rects = [];
       for (let i = 0; i < runs.length; i++) {
         const r = runs[i];
         const a = xs(r.start);
         let w = xs(r.end) - a;
         if (i < runs.length - 1 && w > 6) w -= 2; // 2px surface gap between touching runs
         if (r.state !== 'ONLINE' && r.state !== '') w = Math.max(w, 2); // a blip stays visible
-        const rect = s('rect', { class: 'sf-' + stateInfo(r.state).tone, x: a.toFixed(1), y: 6, width: Math.max(1, w).toFixed(1), height: 28, rx: 2 });
-        rects.push(rect);
-        svg.append(rect);
+        svg.append(s('rect', { class: 'sf-' + stateInfo(r.state).tone, x: a.toFixed(1), y: 6, width: Math.max(1, w).toFixed(1), height: 28, rx: 2 }));
       }
       for (const t of timeTicks(o.from, o.to, x1 - x0)) {
         const x = Math.round(xs(t.ms)) + 0.5;
@@ -3430,12 +5515,17 @@
       g = { x0, x1, xs, outline };
       const old = plot.querySelector('svg');
       if (old) old.replaceWith(svg); else plot.insertBefore(svg, tip);
-      if (idx >= 0 && !tip.hidden) showAt(idx, false);
+      if (want && idx >= 0) showAt(idx, true); // shown again where it was, quietly (a resize, new data)
     }
 
+    /** showAt shows run i: its outline and tooltip, and its words in the live region unless shown
+     *  from the pointer or again after a redraw (pointer true). Before the plot is drawn it only
+     *  notes it: draw shows it. */
     function showAt(i, pointer) {
-      if (!g || i < 0 || i >= runs.length) { hide(); return; }
+      if (i < 0 || i >= runs.length) { hide(); return; }
       idx = i;
+      want = true;
+      if (!g) return;
       const r = runs[i];
       const si = stateInfo(r.state);
       const a = g.xs(r.start);
@@ -3444,7 +5534,7 @@
       g.outline.setAttribute('width', Math.max(2, b - a).toFixed(1));
       g.outline.setAttribute('visibility', 'visible');
       const range = F.short.format(new Date(r.start)) + ' – ' + F.short.format(new Date(r.end));
-      replace(tip, 
+      replace(tip,
         h('div', { class: 'tip-row' }, icon(si.tone), h('span', { class: 'val' }, si.label), h('span')),
         h('div', { class: 'tip-time' }, range),
         h('div', { class: 'tip-utc' }, utcText(null, new Date(r.start)) + ' – ' + utcText(null, new Date(r.end))),
@@ -3454,6 +5544,7 @@
     }
 
     function hide() {
+      want = false;
       tip.hidden = true;
       if (g) g.outline.setAttribute('visibility', 'hidden');
     }
@@ -3478,7 +5569,13 @@
         case 'ArrowRight': i = Math.min(runs.length - 1, i + 1); break;
         case 'Home': i = 0; break;
         case 'End': i = runs.length - 1; break;
-        case 'Escape': hide(); return;
+        case 'Escape':
+          // As in lineChart: Esc hides the tooltip first, and only then closes a modal around it.
+          if (!tip.hidden) {
+            e.preventDefault();
+            hide();
+          }
+          return;
         case 't': case 'T': tableBtn.click(); return;
         default: return;
       }
@@ -3486,15 +5583,18 @@
       showAt(i, false);
     });
 
+    /** fillTable shows the runs in the table view (fillTableView), newest first. */
+    function fillTable() {
+      const rows = runs.slice().reverse().map((r) => [h('span', { class: 'badge' }, icon(stateInfo(r.state).tone), stateInfo(r.state).label), timeEl(r.start, F.full), timeEl(r.end, F.full), fmtDur((r.end - r.start) / 1000)]);
+      fillTableView(tableWrap, { id: o.id, title: 'Availability' }, [{ label: 'State' }, { label: 'From' }, { label: 'To' }, { label: 'Duration', num: true }], rows);
+    }
+
     function applyView() {
       const on = app.tableViews.has(o.id);
       tableBtn.setAttribute('aria-pressed', String(on));
       plot.hidden = on;
       tableWrap.hidden = !on;
-      if (on && !tableWrap.firstChild) {
-        const rows = runs.slice().reverse().map((r) => [h('span', { class: 'badge' }, icon(stateInfo(r.state).tone), stateInfo(r.state).label), timeEl(r.start, F.full), timeEl(r.end, F.full), fmtDur((r.end - r.start) / 1000)]);
-        tableWrap.append(chartTableView({ title: 'Availability' }, [{ label: 'State' }, { label: 'From' }, { label: 'To' }, { label: 'Duration', num: true }], rows));
-      }
+      if (on && !tableWrap.firstChild) fillTable();
       if (!on && plot.clientWidth && Math.round(plot.clientWidth) !== W) draw();
     }
     tableBtn.addEventListener('click', () => {
@@ -3508,7 +5608,20 @@
     ro.observe(plot);
     if (o.ctx) o.ctx.cleanup(() => ro.disconnect());
     applyView();
-    return fig;
+
+    /** update shows the same chart for new data (o2) in place: see stateStrip. */
+    function update(o2) {
+      const at = idx >= 0 && runs[idx] ? runs[idx].start : null;
+      o = Object.assign(o2, { ctx: o.ctx });
+      compute();
+      // The run shown last, by its start: the run that holds it now.
+      idx = at == null ? -1 : runs.findIndex((r) => at >= r.start && at < r.end);
+      if (idx < 0 && want) hide();
+      if (app.tableViews.has(o.id)) fillTable(); else replace(tableWrap); // made again when shown
+      if (!plot.hidden && plot.clientWidth) draw(); else W = 0; // drawn again once shown (applyView, the resize observer)
+      return true;
+    }
+    return { el: fig, update };
   }
 
   // ------------------------------------------------------------------ incidents
@@ -4719,14 +6832,14 @@
   /** keepFocus runs render, which rebuilds parts of root, and gives the keyboard focus back to the
    *  element that had it - or to the one that took its place: the element of the new content with
    *  the same data-fk. A refresh every minute must not send a keyboard user back to the start of
-   *  the page. */
+   *  the page; nor may the focus scroll the page to it (the reader's scroll position is theirs). */
   function keepFocus(root, render) {
     const a = document.activeElement;
     const key = a && a !== document.body && root.contains(a) && a.getAttribute ? a.getAttribute('data-fk') : null;
     render();
     if (key && !root.contains(a)) {
       const b = Array.from(root.querySelectorAll('[data-fk]')).find((e) => e.getAttribute('data-fk') === key);
-      if (b) b.focus();
+      if (b) b.focus({ preventScroll: true });
     }
   }
 
@@ -6851,7 +8964,10 @@
 
   // ------------------------------------------------------------------ dialog
 
-  /** dialog shows a modal and resolves true (confirmed) or false. */
+  /** dialog shows a modal and resolves true (confirmed) or false. It belongs to a view (o.ctx;
+   *  else the view shown): when that view ends - a route change, Back closing the Overview's
+   *  details it was opened from - it is cancelled, never left open over a page that no longer shows
+   *  what it would change. It has its own live region for announce(): the page behind is inert. */
   function dialog(o) {
     return new Promise((resolve) => {
       const dlg = h('dialog', { class: 'dlg', 'aria-labelledby': 'dlg-title' });
@@ -6860,13 +8976,15 @@
       const form = h('form', { method: 'dialog' },
         h('div', { class: 'dlg-body' }, h('h2', { id: 'dlg-title' }, o.title), o.body || null, o.fields || null),
         h('div', { class: 'dlg-actions' }, cancel, ok));
-      dlg.append(form);
+      dlg.append(form, announcer());
       document.body.append(dlg);
       dlg.addEventListener('close', () => {
         const confirmed = dlg.returnValue === 'ok';
         dlg.remove();
         resolve(confirmed);
       });
+      const owner = o.ctx || app.view;
+      if (owner && owner.alive) owner.cleanup(() => { if (dlg.open) dlg.close('cancel'); });
       dlg.showModal();
       const first = dlg.querySelector('input, textarea');
       (first || cancel).focus();

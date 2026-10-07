@@ -447,17 +447,25 @@ func TestDashboardShowsLocalRoute(t *testing.T) {
 	contains := viewChecker(t, rep)
 	ov := rep.Views["overview"]
 
-	for _, want := range []string{localRouteHeadline, "Attribution undetermined", `leaves through "NordLynx" (interface 23) via 10.5.0.1`,
-		"their failure says nothing about AT&T's network", "Incident in progress"} {
+	// The status card says what was observed and attributes nothing; its details give the
+	// classifier's reasons.
+	for _, want := range []string{"Not through the AT&T gateway", localRouteHeadline, "Attribution undetermined", "Incident in progress"} {
 		if !strings.Contains(ov.Hero, want) {
-			t.Errorf("status hero does not show %q:\n%s", want, ov.Hero)
+			t.Errorf("status card does not show %q:\n%s", want, ov.Hero)
 		}
 	}
-	if strings.Contains(ov.Hero, "AT&T outage") || strings.Contains(ov.Hero, "Attributed to AT&T") {
-		t.Errorf("status hero blames AT&T:\n%s", ov.Hero)
+	if strings.Contains(ov.Hero, "AT&T outage") || strings.Contains(ov.Hero, "Attributed to AT&T") || strings.Contains(ov.Hero, "Local fault") {
+		t.Errorf("status card blames AT&T, or this PC:\n%s", ov.Hero)
 	}
-	// The Local link card: the route check with every destination, and the warning.
-	contains("overview", "Route to the Internet", "Not through the AT&T gateway. The route to 3 of 5 destinations leaves through another adapter",
+	contains("overview status", localRouteHeadline, "Attribution undetermined", `leaves through "NordLynx" (interface 23) via 10.5.0.1`,
+		"their failure says nothing about AT&T's network", "Incident in progress")
+	// The This PC's link card says that the route bypasses the gateway; its details show the
+	// route check with every destination, and the warning.
+	if c := ov.card(t, "link"); !strings.Contains(c.Text, "Route to the Internet: through another adapter (a VPN or another network)") {
+		t.Errorf("the This PC's link card: %+v", c)
+	}
+	ov = rep.Views["overview link"]
+	contains("overview link", "Route to the Internet", "Not through the AT&T gateway. The route to 3 of 5 destinations leaves through another adapter",
 		"nothing measured on the Internet is attributed to AT&T", "This computer reaches the AT&T gateway 192.168.1.254 through Wi-Fi (on-link).")
 	for _, r := range []struct{ dest, chip, via string }{
 		{"1.1.1.1", "warning:no", "NordLynx via 10.5.0.1"},
@@ -478,6 +486,10 @@ func TestDashboardShowsLocalRoute(t *testing.T) {
 		"This computer’s clock is off", "off by about 94 s compared with internet time servers", "w32tm /resync")
 	if !strings.Contains(ov.Pill, "Local fault") || strings.Contains(ov.Pill, "Online") {
 		t.Errorf("status pill: %q", ov.Pill)
+	}
+	// The clock is off: the Monitor & clock card says so.
+	if c := rep.Views["overview"].card(t, "monitor"); c.Chip != "warning:Clock off" {
+		t.Errorf("the Monitor & clock card with the clock off: %+v", c)
 	}
 
 	// The history: the incident list names the cause, the incident detail words it, and its
@@ -504,19 +516,37 @@ func TestDashboardShowsStaleStatus(t *testing.T) {
 	contains := viewChecker(t, rep)
 	ov := rep.Views["overview"]
 
+	// The status card says it in a word or two, and gives the reasons the line of the last
+	// measurement does not (the first one says what that line says); its details give them all.
+	for _, want := range []string{"Internet status nowNot measuringThe last measurement recorded was taken", "not the current state.",
+		"The evidence ledger is refusing records (see the LEDGER_WRITE_FAILING condition)."} {
+		if !strings.Contains(ov.Hero, want) {
+			t.Errorf("status card does not show %q:\n%s", want, ov.Hero)
+		}
+	}
+	if strings.Contains(ov.Hero, "see the reason") || strings.Contains(ov.Hero, "No monitoring cycle has been recorded") {
+		t.Errorf("status card points to a reason elsewhere, or says the line of the last measurement twice:\n%s", ov.Hero)
+	}
+	status := rep.Views["overview status"]
 	for _, want := range []string{"Monitoring is not producing samples — see the reason",
 		"the evidence ledger is refusing records (see the LEDGER_WRITE_FAILING condition)",
 		"The last measurement recorded was taken", "not the current state"} {
-		if !strings.Contains(ov.Hero, want) {
-			t.Errorf("status hero does not show %q:\n%s", want, ov.Hero)
+		if status.Detail == nil || !strings.Contains(status.Detail.Text, want) {
+			t.Errorf("the status details do not show %q", want)
 		}
 	}
-	if !regexp.MustCompile(`no monitoring cycle has been recorded for 7m\d+s \(the last one, at .* UTC, was ONLINE\), so the current state is unknown`).MatchString(ov.Hero) {
-		t.Errorf("status hero does not give the monitor's reason:\n%s", ov.Hero)
+	if status.Detail == nil || !regexp.MustCompile(`no monitoring cycle has been recorded for 7m\d+s \(the last one, at .* UTC, was ONLINE\), so the current state is unknown`).MatchString(status.Detail.Text) {
+		t.Errorf("the status details do not give the monitor's reason: %+v", status.Detail)
 	}
-	for _, bad := range []string{"Online", "In this state since", "Attribut"} {
+	for _, bad := range []string{"Online", "In this state since", "Attribut", "internet probes answered"} {
 		if strings.Contains(ov.Hero, bad) {
-			t.Errorf("status hero shows %q although nothing is being measured:\n%s", bad, ov.Hero)
+			t.Errorf("status card shows %q although nothing is being measured:\n%s", bad, ov.Hero)
+		}
+	}
+	// The cards say that the last measurement is not current, and why.
+	for key, chip := range map[string]string{"internet": "none:Not current", "monitor": "warning:Not measuring", "evidence": "critical:Not recording"} {
+		if c := ov.card(t, key); c.Chip != chip {
+			t.Errorf("the %s card while nothing is measured: %+v, want the chip %s", key, c, chip)
 		}
 	}
 	if !strings.Contains(ov.Pill, "Unknown") || !strings.Contains(ov.Pill, "not measuring") || strings.Contains(ov.Pill, "Online") {
@@ -525,8 +555,8 @@ func TestDashboardShowsStaleStatus(t *testing.T) {
 	if ov.Title != "Unknown · AT&T Internet Monitor" {
 		t.Errorf("window title: %q", ov.Title)
 	}
-	// The Internet card shows the last measurement as what it is.
-	contains("overview", "Not current. This is the last measurement recorded, 7 min", "ago: the monitor is not producing samples",
+	// The Internet details show the last measurement as what it is.
+	contains("overview internet", "Not current. This is the last measurement recorded, 7 min", "ago: the monitor is not producing samples",
 		"Last recorded: 5 of 5 internet probes answered")
 	// The conditions, on the overview and on the Evidence page.
 	for _, view := range []string{"overview", "evidence"} {
@@ -548,7 +578,7 @@ func TestDashboardShowsDNSRetriesAndVerdictInputs(t *testing.T) {
 	w.mu.Unlock()
 	rep := runDashboard(t, w, "plain")
 	contains := viewChecker(t, rep)
-	ov := rep.Views["overview"]
+	ov := rep.Views["overview internet"]
 
 	rows := rowsWith(ov, regexp.MustCompile(`^AT&T DNS`))
 	if len(rows) != 1 || !slices.Equal(rows[0].Chips, []string{"good:answered"}) ||

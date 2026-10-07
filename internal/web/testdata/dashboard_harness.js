@@ -10,16 +10,31 @@
  *
  * Scenarios: "hostile" (every remote string carries the marker), "cert" (a changed gateway
  * certificate is waiting for confirmation; the harness looks at the Gateway page, then confirms
- * it through the dialog on the overview), "overview" (the overview and the Syslog page only),
- * "syslog" (the flow meter's polling while the overview is shown, hidden and left, then the
- * Syslog page's retention form), "gwsyslog" (the control of the gateway's Syslog setting on the
- * Syslog page and the overview), "gwsyslogon" / "gwsyslogoff" (one change of that setting on
- * the Syslog page), "network" (the Network page only, used as networkSteps does) and
- * "networktabs" (its two tabs as they first show); any other name visits every view, the Network
- * page included.
+ * it through the dialog on the overview), "overview" (the overview, every card's details, and
+ * the Syslog page only), "syslog" (the flow meter's polling while the overview is shown, hidden
+ * and left, then the Syslog page's retention form), "gwsyslog" (the control of the gateway's
+ * Syslog setting on the Syslog page and in the overview's syslog details), "gwsyslogon" /
+ * "gwsyslogoff" (one change of that setting on the Syslog page), "network" (the Network page
+ * only, used as networkSteps does), "networktabs" (its two tabs as they first show), "details"
+ * (each card's details opened and closed every way, a status update while they are open, an
+ * AT&T outage: detailsScenario; the server must offer /demo/state), "deeplink" (the page
+ * loaded with the address of a card's details, $HARNESS_HASH: deepLinkScenario), "deepfail" (the
+ * same while the status cannot be read), "summary" (the summary and the details of the cards
+ * $HARNESS_DETAILS names: summaryScenario), "keep" (a reader who stays on something while the page
+ * updates: keepScenario; /demo/state), "statusfail" (the details while the status cannot be read:
+ * statusFailScenario; /demo/statusfail) and "confirmback" (Back while a confirmation is open over
+ * the details: confirmBackScenario); any other name visits every view, every card's details and
+ * the Network page included.
+ *
+ * The page's clock can be moved on (skipTime: what the page does a minute later), and a text
+ * selection made (selectText), as a reader does before copying it.
  *
  * Timers of a second or more (the flow meter's polling) do not run by themselves: the harness
  * fires them (fireLongTimers), so that a test sees exactly which requests a poll makes.
+ *
+ * The session history is kept as a browser keeps it (see "history" below): a visit adds an
+ * entry, pushState adds one, replaceState replaces the current one, back() goes to the one
+ * before, later, with popstate and hashchange events.
  *
  * The keyboard focus is kept as a browser keeps it (document.activeElement; see "focus" below):
  * the harness presses a button as a keyboard user does, with the focus on it, and every view
@@ -72,6 +87,9 @@ const SVGNS = 'http://www.w3.org/2000/svg';
 // focused is the element with the keyboard focus (null: the body, the start of the page).
 let focused = null;
 
+// modals are the dialogs open as modal dialogs (showModal), the topmost last.
+const modals = [];
+
 // The elements that take the focus without a tabindex, and those of them a disabled attribute
 // takes it from.
 const FOCUSABLE = new Set(['button', 'input', 'select', 'textarea', 'summary']);
@@ -107,10 +125,16 @@ class FakeEvent {
   constructor(type, init) {
     this.type = type;
     this.defaultPrevented = false;
+    this.propagationStopped = false;
+    this.immediateStopped = false;
     Object.assign(this, init || {});
   }
   preventDefault() { this.defaultPrevented = true; }
-  stopPropagation() {}
+  stopPropagation() { this.propagationStopped = true; }
+  stopImmediatePropagation() {
+    this.propagationStopped = true;
+    this.immediateStopped = true;
+  }
 }
 
 class FakeNode {
@@ -177,19 +201,38 @@ class FakeNode {
     for (let x = n; x; x = x.parentNode) if (x === this) return true;
     return false;
   }
-  addEventListener(type, fn) {
+  // addEventListener keeps whether a listener captures (true, or {capture: true}).
+  addEventListener(type, fn, opts) {
     if (!this.listeners.has(type)) this.listeners.set(type, []);
-    this.listeners.get(type).push(fn);
+    this.listeners.get(type).push({ fn, capture: opts === true || !!(opts && opts.capture) });
   }
-  removeEventListener(type, fn) {
+  removeEventListener(type, fn, opts) {
+    const capture = opts === true || !!(opts && opts.capture);
     const l = this.listeners.get(type);
-    const i = l ? l.indexOf(fn) : -1;
+    const i = l ? l.findIndex((x) => x.fn === fn && x.capture === capture) : -1;
     if (i >= 0) l.splice(i, 1);
   }
+  // dispatchEvent dispatches as a browser does: the capture listeners of the nodes around this
+  // one (from the root in), then this node's (its capture listeners first), then, for an event
+  // that bubbles (init {bubbles: true}), the others of the nodes around it (outwards).
+  // stopPropagation ends it after the node it is at, stopImmediatePropagation at once.
   dispatchEvent(ev) {
     if (!ev.target) ev.target = this;
-    ev.currentTarget = this;
-    for (const fn of (this.listeners.get(ev.type) || []).slice()) guard('listener for ' + ev.type, () => fn.call(this, ev));
+    const path = [];
+    for (let x = this.parentNode; x; x = x.parentNode) path.unshift(x);
+    const run = (node, capture) => {
+      if (ev.propagationStopped && ev.currentTarget !== node) return;
+      ev.currentTarget = node;
+      for (const l of (node.listeners.get(ev.type) || []).slice()) {
+        if (ev.immediateStopped) return;
+        if (l.capture !== capture) continue;
+        guard('listener for ' + ev.type, () => l.fn.call(node, ev));
+      }
+    };
+    for (const n of path) run(n, true);
+    run(this, true);
+    run(this, false);
+    if (ev.bubbles) for (const n of path.slice().reverse()) run(n, false);
     return !ev.defaultPrevented;
   }
 }
@@ -266,14 +309,21 @@ class FakeElement extends FakeNode {
   click() { this.dispatchEvent(new FakeEvent('click')); }
   scrollIntoView() {}
   showModal() {
+    if (!document.contains(this)) throw new Error('showModal: the dialog is not in the document (InvalidStateError)');
+    if (this.open) throw new Error('showModal: the dialog is open already (InvalidStateError)');
     this.previouslyFocused = focused;
     this.open = true;
+    modals.push(this);
   }
   // close closes a dialog as a browser does: the element that had the focus when the modal
-  // dialog opened (the button that opened it) gets it back, then the close event.
+  // dialog opened (the button that opened it) gets it back, then the close event. A closed
+  // dialog does nothing.
   close(rv) {
+    if (!this.open) return;
     if (rv !== undefined) this.returnValue = rv;
     this.open = false;
+    const i = modals.indexOf(this);
+    if (i >= 0) modals.splice(i, 1);
     const prev = this.previouslyFocused;
     this.previouslyFocused = null;
     if (prev && canFocus(prev)) prev.focus();
@@ -469,12 +519,62 @@ document.body.append(
 // ------------------------------------------------------------------ window
 
 const windowEvents = new FakeNode(0);
-const location = { hash: '' };
+// The page opens at $HARNESS_HASH (a card's details, deepLinkScenario), else at no hash at all.
+const location = { hash: process.env.HARNESS_HASH || '' };
+
+// history is the session history as a browser keeps it: its entries (their hashes) and the
+// current one. A visit (a link, the address bar) and pushState add an entry after the current
+// one, dropping those after it; replaceState replaces the current one; neither fires an event.
+// back() goes to the entry before, later (as a browser traverses the history), firing popstate
+// and, as the hash changes, hashchange.
+const hist = { entries: [location.hash], index: 0 };
+
+function addEntry(hash) {
+  hist.entries.splice(hist.index + 1);
+  hist.entries.push(hash);
+  hist.index = hist.entries.length - 1;
+  location.hash = hash;
+}
+
+function traverse(delta) {
+  setTimeout(() => {
+    const i = hist.index + delta;
+    if (!delta || i < 0 || i >= hist.entries.length) return;
+    const old = location.hash;
+    hist.index = i;
+    location.hash = hist.entries[i];
+    windowEvents.dispatchEvent(new FakeEvent('popstate'));
+    if (location.hash !== old) windowEvents.dispatchEvent(new FakeEvent('hashchange'));
+  }, 0);
+}
+
 const intervals = [];
 const longTimers = new Map(); // id -> function, for timers of a second or more
 let longTimerID = 0;
 const storage = new Map();
 let inflight = 0;
+
+// The page's clock (its Date) is the real one moved on by clock.skew ms: a scenario sees what the
+// page does a minute later (skipTime) without waiting a minute. The server's clock is not moved.
+const clock = { skew: 0 };
+const RealDate = Date;
+class PageDate extends RealDate {
+  constructor(...a) {
+    if (a.length) super(...a);
+    else super(RealDate.now() + clock.skew);
+  }
+  static now() { return RealDate.now() + clock.skew; }
+}
+
+function skipTime(ms) { clock.skew += ms; }
+
+// selection is the page's text selection (window.getSelection): none, until a scenario selects
+// text in a node (selectText) as a reader does before copying it.
+const selection = { isCollapsed: true, anchorNode: null, focusNode: null, toString() { return this.anchorNode ? this.anchorNode.textContent : ''; } };
+
+function selectText(node) {
+  Object.assign(selection, { isCollapsed: !node, anchorNode: node || null, focusNode: node || null });
+}
 
 /** fireLongTimers runs the pending timers of a second or more (each once). */
 function fireLongTimers() {
@@ -507,7 +607,18 @@ async function pageFetch(path, init) {
 const context = {
   document,
   location,
-  history: { replaceState(state, title, url) { if (typeof url === 'string' && url.startsWith('#')) location.hash = url; } },
+  history: {
+    get length() { return hist.entries.length; },
+    pushState(state, title, url) { if (typeof url === 'string' && url.startsWith('#')) addEntry(url); },
+    replaceState(state, title, url) {
+      if (typeof url !== 'string' || !url.startsWith('#')) return;
+      hist.entries[hist.index] = url;
+      location.hash = url;
+    },
+    back() { traverse(-1); },
+    forward() { traverse(1); },
+    go(n) { traverse(Number(n) || 0); },
+  },
   localStorage: {
     getItem: (k) => (storage.has(k) ? storage.get(k) : null),
     setItem: (k, v) => { storage.set(k, String(v)); },
@@ -526,11 +637,14 @@ const context = {
   },
   setInterval: (fn) => intervals.push(fn), // never fires by itself: the harness drives the page
   clearInterval: (id) => { if (id > 0) intervals[id - 1] = null; },
+  requestAnimationFrame: (fn) => setTimeout(() => guard('animation frame', () => fn(Date.now())), 16),
+  getSelection: () => selection,
   scrollTo() {},
   addEventListener: (t, fn) => windowEvents.addEventListener(t, fn),
   removeEventListener: (t, fn) => windowEvents.removeEventListener(t, fn),
   fetch: pageFetch,
   ResizeObserver: class { observe() {} unobserve() {} disconnect() {} },
+  Date: PageDate,
   Node: FakeNode,
   URL,
   URLSearchParams,
@@ -547,7 +661,7 @@ vm.createContext(context);
 
 const ALLOWED_TAGS = new Set([
   'html', 'head', 'body', 'meta', 'header', 'nav', 'main', 'footer',
-  'a', 'button', 'caption', 'code', 'datalist', 'dd', 'details', 'dialog', 'div', 'dl', 'dt', 'figcaption',
+  'a', 'article', 'button', 'caption', 'code', 'datalist', 'dd', 'details', 'dialog', 'div', 'dl', 'dt', 'figcaption',
   'figure', 'form', 'h1', 'h2', 'h3', 'h4', 'input', 'label', 'li', 'ol', 'option', 'p', 'pre', 'section',
   'select', 'span', 'strong', 'summary', 'table', 'tbody', 'td', 'textarea', 'th', 'thead', 'time', 'tr', 'ul',
   'svg', 'g', 'path', 'circle', 'line', 'rect', 'text', 'tspan',
@@ -597,19 +711,84 @@ function chipOf(c) {
   return (m ? m[1] : '') + ':' + c.textContent.trim();
 }
 
+/** markersIn counts the text nodes of root that show the hostile marker. */
+function markersIn(root) {
+  let n = 0;
+  walkText(root, (t) => { if (t.data.includes(marker)) n++; });
+  return n;
+}
+
+/** detailOf describes the Overview's details modal in the view, if there is one: which card's,
+ *  whether it is open, its heading, its line of context, its text and the markers in it. */
+function detailOf() {
+  const dlg = view().querySelector('dialog.dlg-detail');
+  if (!dlg) return null;
+  const title = dlg.querySelector('h2');
+  const context = dlg.querySelector('.detail-context');
+  const body = dlg.querySelector('.detail-body');
+  const stale = dlg.querySelector('.detail-stale');
+  return {
+    key: dlg.getAttribute('data-detail') || '', open: dlg.hasAttribute('open'), title: title ? title.textContent : '',
+    context: context ? context.textContent : '', text: dlg.textContent, markers: markersIn(dlg),
+    // The body as a keyboard user meets it (a Tab stop, a named region), and the parts it shows,
+    // in their order ("<tag>.<class>" of each child not hidden).
+    body: body ? { tabindex: body.getAttribute('tabindex'), role: body.getAttribute('role'), labelledby: body.getAttribute('aria-labelledby') } : null,
+    parts: body ? body.childNodes.filter((n) => n.nodeType === 1 && !n.hasAttribute('hidden')).map((n) => n.localName + '.' + n.className) : [],
+    // The note that the status cannot be read (its text and role), when there is one.
+    stale: stale ? { text: stale.textContent, role: stale.getAttribute('role') || '' } : null,
+  };
+}
+
+/** cardsOf describes the Overview's summary cards, in their order: the card whose details each
+ *  opens, its title, its status chip ("<tone>:<label>"), its tone, its text, the markers in it
+ *  and its sparklines (each hidden from screen readers, with a sentence that says what it shows). */
+function cardsOf() {
+  return view().querySelectorAll('article.sum-card').map((c) => {
+    const btn = c.querySelector('button.sum-open');
+    const ch = c.querySelector('.sum-chip .chip');
+    const tone = /(?:^|\s)tone-([\w-]+)/.exec(c.className);
+    const desc = btn && btn.getAttribute('aria-describedby') ? document.getElementById(btn.getAttribute('aria-describedby')) : null;
+    return {
+      key: btn ? btn.getAttribute('data-detail') || '' : '', title: btn ? btn.textContent : '', chip: ch ? chipOf(ch) : '',
+      tone: tone ? tone[1] : '', text: c.textContent, markers: markersIn(c),
+      // What a screen reader says after the button's name, on Tab (its aria-describedby).
+      described: desc ? desc.textContent.trim() : '',
+      // The tooltips in it (none can show under the card's button).
+      titles: c.querySelectorAll('[title]').length,
+      sparks: c.querySelectorAll('svg.spark').filter((sv) => sv.getAttribute('aria-hidden') === 'true').length,
+      // Every control of the card: its title's button, and nothing else (docs/overview-redesign.md §4).
+      controls: c.querySelectorAll('a, button, input, select, textarea, summary, [tabindex]').length,
+    };
+  });
+}
+
 function capture(name) {
   checkDocument(name);
-  let markers = 0;
-  walkText(view(), (t) => { if (t.data.includes(marker)) markers++; });
-  const hero = view().querySelector('.hero');
+  // The status card's left part: the state now (its right part is the last 24 hours).
+  const hero = view().querySelector('.status-main');
+  const strip = view().querySelector('.status-strip');
+  const statusBtn = view().querySelector('button.status-open');
+  const statusDesc = statusBtn && statusBtn.getAttribute('aria-describedby') ? document.getElementById(statusBtn.getAttribute('aria-describedby')) : null;
+  const statusEl = view().querySelector('.status-card');
   views[name] = {
     text: view().textContent,
     // The status as the page chrome shows it (the pill in the top bar, the window title) and
-    // the status hero, so that a test can tell what is claimed about the present.
+    // the status card, so that a test can tell what is claimed about the present.
     pill: document.getElementById('pill').textContent,
     title: document.title,
     hero: hero ? hero.textContent : '',
-    markers,
+    strip: strip ? strip.textContent : '',
+    // What a screen reader says after the status card's button (its aria-describedby), and the
+    // tooltips in the card (none can show under its button).
+    statusDescribed: statusDesc ? statusDesc.textContent.trim() : '',
+    statusTitles: statusEl ? statusEl.querySelectorAll('[title]').length : 0,
+    markers: markersIn(view()),
+    detail: detailOf(),
+    cards: cardsOf(),
+    // The session history (its length and the current entry) and whether the page behind a
+    // modal is kept from scrolling.
+    history: { length: hist.entries.length, index: hist.index },
+    locked: document.documentElement.classList.contains('detail-open'),
     buttons: view().querySelectorAll('button').map((b) => ({
       text: b.textContent.trim(), disabled: b.disabled, ariaDisabled: b.getAttribute('aria-disabled') === 'true', shown: shownEl(b),
     })),
@@ -646,6 +825,9 @@ function capture(name) {
     // (behind a table view), the labels a reader gets.
     bars: Object.fromEntries(view().querySelectorAll('ol.bars').map((ol) => [ol.getAttribute('aria-label') || '',
       ol.querySelectorAll('.bar-name').map((e) => e.textContent)])),
+    // The values of those bars (the figure each shows), in the same order.
+    barValues: Object.fromEntries(view().querySelectorAll('ol.bars').map((ol) => [ol.getAttribute('aria-label') || '',
+      ol.querySelectorAll('.bar-val').map((e) => (e.firstChild ? e.firstChild.textContent : ''))])),
   };
 }
 
@@ -663,9 +845,16 @@ async function settle() {
   }
 }
 
+/** visit goes to hash as a link or the address bar does: a new history entry, and hashchange. */
 async function visit(hash) {
-  location.hash = hash;
+  addEntry(hash);
   windowEvents.dispatchEvent(new FakeEvent('hashchange'));
+  await settle();
+}
+
+/** back is the browser's Back button. */
+async function back() {
+  context.history.back();
   await settle();
 }
 
@@ -691,10 +880,24 @@ async function press(text) {
   return true;
 }
 
-/** answerDialog records the open dialog's text and closes it with OK or Cancel. With running,
- *  what the answer starts is not waited for: the page is as it shows the action in progress. */
+/** topModal is the topmost modal dialog open, or null. */
+function topModal() {
+  for (let i = modals.length - 1; i >= 0; i--) if (document.contains(modals[i])) return modals[i];
+  return null;
+}
+
+/** confirmation is the confirmation dialog open on top (dialog()), or null: not the Overview's
+ *  details, which may be open under it. */
+function confirmation() {
+  const dlg = topModal();
+  return dlg && !dlg.classList.contains('dlg-detail') ? dlg : null;
+}
+
+/** answerDialog records the open confirmation dialog's text and closes it with OK or Cancel.
+ *  With running, what the answer starts is not waited for: the page is as it shows the action in
+ *  progress. */
 async function answerDialog(ok, fill, running) {
-  const dlg = document.querySelector('dialog');
+  const dlg = confirmation();
   if (!dlg) {
     errors.push('no dialog is open');
     return;
@@ -711,6 +914,13 @@ async function answerDialog(ok, fill, running) {
  *  own (the Overview's recent incidents): intervals never fire by themselves. */
 async function refresh() {
   for (const fn of intervals.slice()) if (fn) guard('interval', fn);
+  await settle();
+}
+
+/** refreshStatusOnly runs only the status refresh every 10 s (not a view's minute work), so that
+ *  a test sees what follows from the status itself. */
+async function refreshStatusOnly() {
+  for (const fn of intervals.slice()) if (fn && fn.name === 'refreshStatus') guard('interval', fn);
   await settle();
 }
 
@@ -747,6 +957,236 @@ function setVisibility(state) {
   document.visibilityState = state;
   document.hidden = state !== 'visible';
   document.dispatchEvent(new FakeEvent('visibilitychange'));
+}
+
+// ------------------------------------------------------------------ the Overview's details
+
+/** cardButtons are the Overview's buttons that open a card's details (the status card's first). */
+function cardButtons() { return view().querySelectorAll('button[data-detail]'); }
+
+function cardButton(key) { return cardButtons().find((b) => b.getAttribute('data-detail') === key) || null; }
+
+/** detailDialog is the Overview's details modal when one is open, else null. */
+function detailDialog() {
+  const dlg = view().querySelector('dialog.dlg-detail');
+  return dlg && dlg.hasAttribute('open') ? dlg : null;
+}
+
+/** pressKeyOn presses a key on el as a keyboard user does, with the focus on it: a browser
+ *  activates a focused button with Enter (on keydown) and Space (on keyup), unless the page
+ *  prevents it. */
+async function pressKeyOn(el, key) {
+  el.focus();
+  const down = new FakeEvent('keydown', { key });
+  el.dispatchEvent(down);
+  if (el.localName === 'button' && key === 'Enter' && !down.defaultPrevented) el.click();
+  if (key === ' ') {
+    const up = new FakeEvent('keyup', { key });
+    el.dispatchEvent(up);
+    if (el.localName === 'button' && !down.defaultPrevented && !up.defaultPrevented) el.click();
+  }
+  await settle();
+}
+
+/** openCard opens a card's details: with a click, or from the keyboard (Enter, Space). */
+async function openCard(key, how) {
+  const b = cardButton(key);
+  if (!b) {
+    errors.push('no card opens the details "' + key + '"');
+    return;
+  }
+  if (how === 'enter') await pressKeyOn(b, 'Enter');
+  else if (how === 'space') await pressKeyOn(b, ' ');
+  else {
+    b.focus(); // a browser focuses a button it clicks
+    b.click();
+    await settle();
+  }
+}
+
+/** pressEscape is Esc on the topmost modal dialog: its cancel event, then, unless the page
+ *  prevents it, the dialog closes. */
+async function pressEscape() {
+  const dlg = topModal();
+  if (!dlg) {
+    errors.push('Esc: no modal dialog is open');
+    return;
+  }
+  const ev = new FakeEvent('cancel');
+  dlg.dispatchEvent(ev);
+  if (!ev.defaultPrevented) dlg.close();
+  await settle();
+}
+
+/** clickBackdrop clicks the topmost modal dialog's backdrop: a browser gives the click to the
+ *  dialog element, at a point outside its box (the fake box is 0..800 x 0..240). */
+async function clickBackdrop() {
+  const dlg = topModal();
+  if (!dlg) {
+    errors.push('backdrop: no modal dialog is open');
+    return;
+  }
+  for (const type of ['pointerdown', 'click']) dlg.dispatchEvent(new FakeEvent(type, { target: dlg, clientX: 900, clientY: 300 }));
+  await settle();
+}
+
+/** closeDetail closes the open details as a reader does: Esc, their close button, a click on the
+ *  backdrop, or the browser's Back button. */
+async function closeDetail(how) {
+  const dlg = detailDialog();
+  if (!dlg) {
+    errors.push('no details open to close (' + how + ')');
+    return;
+  }
+  switch (how) {
+    case 'escape': await pressEscape(); break;
+    case 'close': {
+      const b = dlg.querySelector('button.detail-close');
+      if (!b) {
+        errors.push('the details have no close button');
+        return;
+      }
+      b.focus();
+      b.click();
+      await settle();
+      break;
+    }
+    case 'backdrop': await clickBackdrop(); break;
+    case 'back': await back(); break;
+    default: errors.push('closeDetail: ' + how);
+  }
+}
+
+/** overviewDetails opens every card's details in turn with a click and captures them
+ *  (prefix + key); the charts in them are used from the keyboard first and captured with their
+ *  table views on (the plots drawn behind them), then put back to plots; the traffic's over 7
+ *  days too (prefix + "traffic 7d", plots). Each is closed with Esc. */
+async function overviewDetails(prefix) {
+  for (const key of cardButtons().map((b) => b.getAttribute('data-detail'))) {
+    await openCard(key, 'click');
+    if (!detailDialog()) {
+      errors.push('the ' + key + ' card opened no details');
+      continue;
+    }
+    const charts = !!detailDialog().querySelector('.plot');
+    if (charts) {
+      exerciseCharts(); // read from the keyboard, then the table views on
+      await settle();
+    }
+    capture(prefix + key);
+    if (charts) {
+      exerciseCharts(); // and the plots again
+      await settle();
+      if (key === 'traffic') {
+        radio('7d');
+        await settle();
+        capture(prefix + 'traffic 7d');
+        radio('24h');
+        await settle();
+      }
+    }
+    await pressEscape();
+  }
+}
+
+/** detailsScenario uses each card's details as a reader does (facts.details): opened with a
+ *  click, Enter or Space and closed with Esc, the close button, the backdrop or Back, in turn,
+ *  noting the address, the history, the focus and the scroll lock before, while open and after.
+ *  Then the This PC's link details across a status update, with their route check opened and the
+ *  focus in it, scrolled (facts.live); then the Internet details while the line goes down
+ *  (/demo/state?s=outage) and the summary in the outage (facts.outage); then a confirmation
+ *  dialog over the syslog details (facts.confirm). */
+async function detailsScenario() {
+  const ways = ['click', 'enter', 'space'];
+  const closes = ['escape', 'close', 'backdrop', 'back'];
+  const keys = cardButtons().map((b) => b.getAttribute('data-detail'));
+  const steps = [];
+  const state = () => ({ hash: location.hash, length: hist.entries.length, index: hist.index, focus: focusOf(),
+    open: !!detailDialog(), locked: document.documentElement.classList.contains('detail-open'), modals: modals.length });
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i];
+    const how = ways[i % ways.length];
+    const close = closes[i % closes.length];
+    const before = state();
+    await openCard(key, how);
+    const opened = state();
+    capture('detail ' + key);
+    await closeDetail(close);
+    steps.push({ key, how, close, before, opened, after: state() });
+  }
+  facts.details = steps;
+
+  // A status update while the details are open: their content is drawn anew, and the reader
+  // keeps their place.
+  await openCard('link', 'click');
+  let dlg = detailDialog();
+  const live = { opened: !!dlg };
+  if (dlg) {
+    const det = dlg.querySelector('details.egress');
+    const body = dlg.querySelector('.detail-body');
+    if (det && body) {
+      det.open = true;
+      det.dispatchEvent(new FakeEvent('toggle'));
+      det.querySelector('summary').focus();
+      body.scrollTop = 120;
+      live.before = focusOf();
+      await refresh();
+      const now = detailDialog();
+      const det2 = now ? now.querySelector('details.egress') : null;
+      Object.assign(live, {
+        sameDialog: now === dlg, kept: !!det2 && det2 === det, open: !!det2 && det2.open,
+        focusKept: !!det2 && document.activeElement === det2.querySelector('summary'), focus: focusOf(),
+        scrollTop: body.scrollTop, hash: location.hash,
+      });
+    } else {
+      errors.push('the link details have no route check to open');
+    }
+    await closeDetail('escape');
+  }
+  facts.live = live;
+
+  // The line goes down while the Internet details are open: they follow the status.
+  await openCard('internet', 'click');
+  dlg = detailDialog();
+  capture('internet online');
+  await fetch(new URL('/demo/state?s=outage', base));
+  await refresh();
+  capture('internet outage');
+  facts.outage = { sameDialog: !!dlg && detailDialog() === dlg, hash: location.hash, focus: focusOf() };
+  await closeDetail('escape');
+  capture('summary outage');
+
+  // A confirmation over the details: the syslog control's "Stop sending", then Cancel.
+  await openCard('syslog', 'click');
+  const confirm = { before: modals.length };
+  if (await press('Stop sending')) {
+    const c = confirmation();
+    confirm.over = !!c && modals.length === 2 && !!detailDialog();
+    await answerDialog(false);
+    confirm.after = { modals: modals.length, detailOpen: !!detailDialog(), focus: focusOf() };
+  }
+  facts.confirm = confirm;
+  await closeDetail('escape');
+}
+
+/** deepLinkScenario starts with the page loaded at a card's details ($HARNESS_HASH): they are
+ *  open at once; closed, they replace the address (facts.deep). Then an address that names no
+ *  card, details reached from another page, and Back from details opened from the address. */
+async function deepLinkScenario() {
+  capture('deep link');
+  const opened = { hash: location.hash, length: hist.entries.length, index: hist.index, focus: focusOf() };
+  await closeDetail('close');
+  capture('deep link closed');
+  const closed = { hash: location.hash, length: hist.entries.length, index: hist.index, focus: focusOf() };
+  await visit('#/?detail=nosuchcard');
+  capture('unknown card');
+  await visit('#/incidents');
+  await visit('#/?detail=fiber');
+  capture('from another page');
+  const fromPage = { hash: location.hash, focus: focusOf() };
+  await back();
+  capture('back to incidents');
+  facts.deep = { opened, closed, fromPage, backHash: location.hash, backHasDialog: !!view().querySelector('dialog') };
 }
 
 /** syslogScenario (on the overview): the flow meter asks again when its timer fires, not while
@@ -794,7 +1234,7 @@ async function syslogScenario() {
   type(mib, '50');
   type(days, '3');
   await submit(form);
-  if (document.querySelector('dialog')) await answerDialog(true); // recorded (dialogs), never expected
+  if (confirmation()) await answerDialog(true); // recorded (dialogs), never expected
   await settle();
   capture('syslog retention unchanged');
   type(mib, '0');
@@ -802,12 +1242,13 @@ async function syslogScenario() {
   capture('syslog retention refused');
 }
 
-/** gwSyslogScenario: the control of the gateway's Syslog setting, on the Syslog page and on the
- *  Overview, used from the keyboard. "Stop sending" is confirmed and runs (captured while it
- *  runs - pressed again meanwhile, it must do nothing -, then when it is done); "Send the
- *  gateway’s log to this PC" is cancelled in its dialog (nothing is sent), then confirmed. On
- *  the Overview the syslog card's control stops the sending again, and stays where it is, with
- *  its outcome, when the status refresh rebuilds the cards around it. */
+/** gwSyslogScenario: the control of the gateway's Syslog setting, on the Syslog page and in the
+ *  Overview's Gateway syslog details, used from the keyboard. "Stop sending" is confirmed and
+ *  runs (captured while it runs - pressed again meanwhile, it must do nothing -, then when it is
+ *  done); "Send the gateway’s log to this PC" is cancelled in its dialog (nothing is sent), then
+ *  confirmed. In the Overview's details the control stops the sending again (its confirmation
+ *  over the details), and stays where it is, with its outcome, when the status refresh draws the
+ *  details again around it. */
 async function gwSyslogScenario() {
   await visit('#/syslog');
   capture('syslog');
@@ -816,7 +1257,7 @@ async function gwSyslogScenario() {
     capture('syslog stopping');
     const again = button('Stop sending');
     if (again) again.click();
-    if (document.querySelector('dialog')) {
+    if (confirmation()) {
       errors.push('"Stop sending", pressed while its change runs, opened a dialog');
       await answerDialog(false, null, true);
     }
@@ -828,15 +1269,17 @@ async function gwSyslogScenario() {
   if (await press('Send the gateway’s log to this PC')) await answerDialog(true);
   capture('syslog sending');
   await visit('#/');
+  await openCard('syslog', 'click');
   capture('overview sending');
   const ctl = view().querySelector('.syslog-control');
-  const card = ctl && ctl.closest('section');
+  const panel = ctl && ctl.closest('.syslog-panel');
   let moved = 0;
-  if (card) card.onTaken = () => { moved++; };
+  if (panel) panel.onTaken = () => { moved++; };
+  else errors.push('the Overview’s syslog details have no syslog panel');
   if (await press('Stop sending')) await answerDialog(true);
   await refresh();
-  if (!ctl || view().querySelector('.syslog-control') !== ctl) errors.push('the status refresh rebuilt the syslog control on the Overview');
-  if (moved) errors.push('the status refresh took the syslog card out of the Overview ' + moved + ' times (it loses the focus, and its live region is announced again)');
+  if (!ctl || view().querySelector('.syslog-control') !== ctl) errors.push('the status refresh rebuilt the syslog control in the Overview’s details');
+  if (moved) errors.push('the status refresh took the syslog panel out of the Overview’s details ' + moved + ' times (it loses the focus, and its live region is announced again)');
   capture('overview stopped');
 }
 
@@ -1003,19 +1446,281 @@ async function networkSteps() {
   capture('network firewall 1h');
 }
 
+/** summaryScenario captures the Overview's summary ("overview") and the details of each card
+ *  $HARNESS_DETAILS names (comma-separated), each as "overview <key>", opened with a click and
+ *  closed with Esc. */
+async function summaryScenario() {
+  for (const key of (process.env.HARNESS_DETAILS || '').split(',').filter(Boolean)) {
+    await openCard(key, 'click');
+    capture('overview ' + key);
+    await pressEscape();
+  }
+}
+
+/** countFocus counts the focus events on el from now on (a screen reader announces each). */
+function countFocus(el) {
+  const n = { focus: 0 };
+  if (el) el.addEventListener('focus', () => { n.focus++; });
+  return n;
+}
+
+/** requestsTo counts the requests made so far to path (with its query). */
+function requestsTo(path) {
+  return requests.filter((r) => r.path === path).length;
+}
+
+/** keepScenario uses the Overview as a reader who stays on something while it updates
+ *  (facts.keep): the cards' buttons as Tab reads them; the Internet details opened right after the
+ *  summary read the last 24 hours; their body as a keyboard user meets it; the round-trip chart
+ *  read from the keyboard, and the packet-loss chart's table view scrolled, across the charts'
+ *  refresh (the Overview's series read, then the details' minute); a double-click that opened them;
+ *  a status change announced while they are open; the status card's incident link, the status
+ *  details' record link and a text selected in the gateway details across status updates; the
+ *  page shown again after a while. The server must offer /demo/state. */
+async function keepScenario() {
+  const keep = {};
+  keep.cards = cardsOf().map((c) => ({ key: c.key, described: c.described, chip: c.chip, titles: c.titles }));
+  const hero = view().querySelector('button.status-open');
+  keep.status = { described: hero && hero.getAttribute('aria-describedby') ? (document.getElementById(hero.getAttribute('aria-describedby')) || { textContent: '' }).textContent : '' };
+
+  // The Internet details opened right after the summary read the series: they draw from it.
+  const reads = requestsTo('/api/series?range=24h');
+  await openCard('internet', 'click');
+  let dlg = detailDialog();
+  keep.seriesReads = requestsTo('/api/series?range=24h') - reads;
+  const d = detailOf();
+  keep.body = d && d.body;
+
+  // The round-trip chart read from the keyboard: three buckets back.
+  const plot = dlg.querySelector('[data-fk="chart:latency:plot"]');
+  const charts = { minHeight: plot ? plot.style.minHeight : '' };
+  if (plot) {
+    plot.focus();
+    for (let i = 0; i < 3; i++) plot.dispatchEvent(new FakeEvent('keydown', { key: 'ArrowLeft' }));
+    const fig = plot.closest('figure');
+    const tipOf = () => { const t = plot.querySelector('.tip'); return t && !t.hidden ? t.querySelector('.tip-time').textContent : ''; };
+    const liveOf = () => { const l = fig.querySelector('[aria-live]'); return l ? l.textContent : ''; };
+    Object.assign(charts, { tip: tipOf(), live: liveOf() });
+    const svg = plot.querySelector('svg');
+    const focus = countFocus(plot);
+    await refresh(); // the Overview reads the series again (the details still show theirs)
+    await refresh(); // the details' minute: their charts follow the newer series
+    const now = dlg.querySelector('[data-fk="chart:latency:plot"]');
+    Object.assign(charts, {
+      samePlot: now === plot, focused: document.activeElement === plot, redrawn: !!svg && plot.querySelector('svg') !== svg,
+      tipAfter: tipOf(), liveAfter: liveOf(), focusEvents: focus.focus,
+    });
+    plot.blur();
+  }
+  // The packet-loss chart's table view, scrolled to older rows.
+  const tableBtn = dlg.querySelector('[data-fk="chart:loss:table"]');
+  if (tableBtn) {
+    tableBtn.click();
+    const region = dlg.querySelector('[data-fk="chart:loss:tableview"]');
+    if (region) {
+      region.focus();
+      region.scrollTop = 500;
+      const tbl = region.firstChild;
+      const focus = countFocus(region);
+      skipTime(61000); // the cached series is a minute old: the details read their own
+      await refresh();
+      const now = dlg.querySelector('[data-fk="chart:loss:tableview"]');
+      charts.table = { same: now === region, focused: document.activeElement === region, scrollTop: now ? now.scrollTop : null, refilled: region.firstChild !== tbl, focusEvents: focus.focus };
+    }
+    const btn = dlg.querySelector('[data-fk="chart:loss:table"]');
+    if (btn) btn.click();
+  }
+  keep.charts = charts;
+  await closeDetail('escape');
+
+  // A double-click on a card: its second click lands on the details that just opened.
+  await openCard('internet', 'click');
+  dlg = detailDialog();
+  const dbl = {};
+  if (dlg) {
+    for (const type of ['pointerdown', 'click']) dlg.dispatchEvent(new FakeEvent(type, { target: dlg, clientX: 900, clientY: 300, detail: 2 }));
+    await settle();
+    dbl.afterBackdrop = { open: !!detailDialog(), hash: location.hash };
+    const close = dlg.querySelector('button.detail-close');
+    close.dispatchEvent(new FakeEvent('click', { detail: 2, bubbles: true }));
+    await settle();
+    dbl.afterClose = { open: !!detailDialog(), hash: location.hash };
+    const link = dlg.querySelector('.detail-links a');
+    const ev = new FakeEvent('click', { detail: 2, bubbles: true });
+    if (link) link.dispatchEvent(ev);
+    dbl.linkPrevented = ev.defaultPrevented;
+    skipTime(1500); // a click well after the opening is a click
+    for (const type of ['pointerdown', 'click']) dlg.dispatchEvent(new FakeEvent(type, { target: dlg, clientX: 900, clientY: 300, detail: 1 }));
+    await settle();
+    dbl.later = { open: !!detailDialog(), hash: location.hash };
+  }
+  keep.doubleClick = dbl;
+
+  // An incident opens, then closes: the recent incidents follow the status at once, not at their
+  // next minute.
+  const recentText = () => { const r = view().querySelector('section.recent'); return r ? r.textContent : ''; };
+  keep.recent = { before: recentText() };
+  await fetch(new URL('/demo/state?s=outage', base));
+  await refreshStatusOnly();
+  keep.recent.opened = recentText();
+  keep.recent.hero = (view().querySelector('.status-main') || { textContent: '' }).textContent;
+  await fetch(new URL('/demo/state?s=online', base));
+  await refreshStatusOnly();
+  keep.recent.closed = recentText();
+
+  // A status change while the details are open is announced in them: the page's own live region
+  // is inert behind the modal.
+  await openCard('internet', 'click');
+  dlg = detailDialog();
+  await fetch(new URL('/demo/state?s=outage', base));
+  await refresh();
+  await tick(150);
+  const region = dlg && dlg.querySelector('[data-announce]');
+  keep.announce = { modal: region ? region.textContent : '', page: document.getElementById('live').textContent, live: region ? region.getAttribute('aria-live') : '' };
+  await closeDetail('escape');
+
+  // The status card's incident link, focused across status updates (the outage goes on).
+  await settle();
+  const inc = view().querySelector('.status-incident a');
+  if (inc) {
+    inc.focus();
+    const focus = countFocus(inc);
+    await refresh();
+    await refresh();
+    keep.incident = { same: view().querySelector('.status-incident a') === inc, focused: document.activeElement === inc, focusEvents: focus.focus, text: inc.textContent };
+  }
+
+  // The status details' link to the gateway snapshot the verdict used, focused across a status
+  // update that names the same records.
+  await openCard('status', 'click');
+  dlg = detailDialog();
+  const snap = dlg && dlg.querySelector('[data-fk="inputs:snapshot"]');
+  if (snap) {
+    snap.focus();
+    const focus = countFocus(snap);
+    await refresh();
+    keep.inputs = { same: dlg.querySelector('[data-fk="inputs:snapshot"]') === snap, focused: document.activeElement === snap, focusEvents: focus.focus };
+  }
+  await closeDetail('escape');
+
+  // A text selected in the gateway details (the WAN address, to copy it) across a status update;
+  // once it is no longer selected, the next update draws the details again.
+  await openCard('gateway', 'click');
+  dlg = detailDialog();
+  const dd = dlg && dlg.querySelectorAll('dd').find((e) => e.textContent.includes(process.env.HARNESS_WAN || '203.0.113.45'));
+  if (dd) {
+    selectText(dd.firstChild || dd);
+    await refresh();
+    const kept = document.contains(dd);
+    selectText(null);
+    await refresh();
+    keep.selection = { kept, redrawnAfter: !document.contains(dd) };
+  }
+  await closeDetail('escape');
+
+  // The page hidden, then shown again a minute later: the series and the recent incidents are
+  // read at once, not at the next minute - and so is the series of the details open (their
+  // range set to 6 hours, which only they read).
+  await openCard('internet', 'click');
+  radio('6h');
+  await settle();
+  setVisibility('hidden');
+  await settle();
+  const before = { series: requestsTo('/api/series?range=24h'), incidents: requestsTo('/api/incidents?limit=3'), details: requestsTo('/api/series?range=6h') };
+  skipTime(61000);
+  setVisibility('visible');
+  await settle();
+  keep.visible = {
+    series: requestsTo('/api/series?range=24h') - before.series, incidents: requestsTo('/api/incidents?limit=3') - before.incidents,
+    details: requestsTo('/api/series?range=6h') - before.details,
+  };
+  radio('24h');
+  await settle();
+  await closeDetail('escape');
+  facts.keep = keep;
+}
+
+/** statusFailScenario: the Internet details open while the status stops being read
+ *  (/demo/statusfail?mode=down: the service does not answer; mode=500: it answers with an error),
+ *  then is read again (facts.fail). */
+async function statusFailScenario() {
+  await openCard('internet', 'click');
+  const fail = { before: detailOf() };
+  await fetch(new URL('/demo/statusfail?mode=down', base));
+  await refresh();
+  fail.down = detailOf();
+  const note = detailDialog() && detailDialog().querySelector('.detail-stale');
+  await refresh();
+  fail.sameNote = !!note && detailDialog().querySelector('.detail-stale') === note;
+  // Details opened while the status cannot be read say so at once.
+  await closeDetail('escape');
+  await openCard('internet', 'click');
+  fail.reopened = detailOf();
+  await fetch(new URL('/demo/statusfail', base));
+  await refresh();
+  fail.back = detailOf();
+  await fetch(new URL('/demo/statusfail?mode=500', base));
+  await refresh();
+  fail.error = detailOf();
+  await fetch(new URL('/demo/statusfail', base));
+  await refresh();
+  facts.fail = fail;
+}
+
+/** confirmBackScenario: the syslog details' "Stop sending" asks for confirmation, and the browser's
+ *  Back closes the details meanwhile (facts.confirmBack). */
+async function confirmBackScenario() {
+  await openCard('syslog', 'click');
+  const out = { asked: false };
+  if (await press('Stop sending')) {
+    out.asked = !!confirmation();
+    await back();
+    out.after = { modals: modals.length, dialogs: document.querySelectorAll('dialog').length, detailOpen: !!detailDialog(), hash: location.hash, focus: focusOf() };
+  }
+  facts.confirmBack = out;
+}
+
 async function run() {
   const res = await fetch(new URL('/static/app.js', base));
   const code = await res.text();
   guard('app.js', () => vm.runInContext(code, context, { filename: 'app.js' }));
   await settle();
 
+  if (scenario === 'deeplink') { // the page loaded at a card's details ($HARNESS_HASH)
+    await deepLinkScenario();
+    return;
+  }
+  if (scenario === 'deepfail') { // the page loaded at a card's details while the status cannot be read
+    await refresh();
+    capture('deep fail');
+    return;
+  }
   await visit('#/');
-  exerciseCharts();
-  await settle();
   capture('overview');
-  if (scenario === 'overview') { // the status cards only (and the Syslog page's)
+  if (scenario === 'summary') {
+    await summaryScenario();
+    return;
+  }
+  if (scenario === 'keep') {
+    await keepScenario();
+    return;
+  }
+  if (scenario === 'statusfail') {
+    await statusFailScenario();
+    return;
+  }
+  if (scenario === 'confirmback') {
+    await confirmBackScenario();
+    return;
+  }
+  if (scenario === 'overview') { // the summary and every card's details only (and the Syslog page)
+    await overviewDetails('overview ');
     await visit('#/syslog');
     capture('syslog');
+    return;
+  }
+  if (scenario === 'details') {
+    await detailsScenario();
     return;
   }
   if (scenario === 'syslog') {
@@ -1045,20 +1750,8 @@ async function run() {
     capture('syslog changed');
     return;
   }
-  // The charts over 7 days (the range is remembered: back to 24 hours afterwards).
-  const week = view().querySelector('input[value="7d"]');
-  if (week) {
-    week.checked = true;
-    week.dispatchEvent(new FakeEvent('change'));
-    await settle();
-    exerciseCharts(); // the table views were on: back to the plots
-    await settle();
-    capture('overview 7d');
-    const day = view().querySelector('input[value="24h"]');
-    day.checked = true;
-    day.dispatchEvent(new FakeEvent('change'));
-    await settle();
-  }
+  // Every card's details, their charts used (the traffic's over 7 days too).
+  await overviewDetails('overview ');
 
   if (scenario === 'cert') {
     await visit('#/gateway');

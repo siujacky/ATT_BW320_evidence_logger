@@ -223,14 +223,14 @@ rate in each direction. The byte counters are 32-bit and wrap around every 4 GiB
 tell whether a wrap is certain, and when the counter may have wrapped more often than can be told, the
 rate is shown as **"at least"**. Counters that were reset (a gateway restart) never show as traffic.
 
-* **Traffic chart** (Overview, 1 hour to 7 days), drawn like an MRTG graph: download as a filled area,
+* **Traffic chart** (the Overview's Traffic details, 1 hour to 7 days), drawn like an MRTG graph: download as a filled area,
   upload as a line, in bits per second with automatic units, short marks at the highest rate between two
   readings, the classifier's 80 Mb/s heavy-traffic line, "at least" markers, and gaps where there is no
   reading. Under it MRTG's legend (maximum, average and current for the WAN download, the WAN upload and
   this PC), a table view, and the volume per day.
-* **Live flow meter** (Overview): the current download and upload through the gateway as numbers and
-  bars, a sparkline of the last 15 minutes or so, and this PC's own rates. While the Overview is open and
-  visible the dashboard asks every 5 seconds; the service reads the Broadband Status page for it at most
+* **Live flow meter** (the Overview's Traffic card and its details): the current download and upload
+  through the gateway as numbers and bars, a sparkline of the last 15 minutes or so, and this PC's own
+  rates. While the Traffic card or its details are on screen the dashboard asks every 5 seconds; the service reads the Broadband Status page for it at most
   once every 5 seconds whoever asks, and while nobody watches the gateway gets no extra request. The
   flow meter is a display only: nothing of it is recorded (the snapshots are the evidence), and it never
   holds up the evidence - it skips a reading while the service itself is reading the gateway, gives up
@@ -275,7 +275,7 @@ page could not be set*, and is tried again at the next check. While the gateway 
 no message from it arrives for a day, the dashboard says so (at level Notice the gateway may log
 little).
 
-**Changing it.** The dashboard's **Syslog** page (and the Syslog card on the Overview) shows the setting
+**Changing it.** The dashboard's **Syslog** page (and the Overview's Gateway syslog details) shows the setting
 and whether the monitor keeps it: *Send the gateway's log to this PC* sets it now and keeps it so; *Stop
 sending* switches Syslog off on the gateway and stops keeping it. Each asks first, saying what will
 happen on the gateway, and shows the outcome; the choice is saved (`gateway.enforce_syslog`) and
@@ -457,12 +457,14 @@ what was recorded stays on the page until the retention limits delete it.
 
 **http://127.0.0.1:8320**, on the monitoring PC only.
 
-* **Overview**: the current state in plain words with its cause and attribution and the reasons behind
-  it; cards for the Internet, the gateway's WAN, the fiber optics (Rx/Tx power against the gateway's own
-  thresholds), the local link, evidence integrity (including the MongoDB copy) and the gateway's
-  syslog (with its Syslog setting and the buttons that change it); the live flow meter; latency, loss,
-  availability, traffic (MRTG-style, with daily totals) and optical charts from 1 hour to 7 days;
-  recent incidents.
+* **Overview**: a summary on about one screen - the current state in plain words with its cause,
+  attribution and key facts and the last 24 hours as a strip of states; six key numbers; nine summary
+  cards (Internet, AT&T gateway, Fiber optics, Traffic, This PC's link, Network, Gateway syslog,
+  Evidence, Monitor & clock) with status chips and 24-hour trend lines; the newest incidents. Each card
+  opens its **details** in a window over the page: the tables, the latency, loss, availability, traffic
+  (MRTG-style, with daily totals) and optical charts from 1 hour to 7 days, the live flow meter, and the
+  gateway's Syslog setting with the buttons that change it. Esc, Close, a click outside or Back closes
+  it; the details update while open, and the address (`#/?detail=...`) reopens them.
 * **Incidents**: every outage with its timeline and evidence (raw gateway pages, traceroutes, DNS
   results) and a one-click evidence export.
 * **Gateway**: every value read from the gateway, the fiber module diagnostics and the redirect setting.
@@ -729,7 +731,7 @@ order mark is accepted).
   its outage-redirect and Syslog settings, and reads the gateway's NAT table every 4 minutes in a web
   session it keeps (no new login while the reads go on; at most six a day caused by the reads, and
   none sooner than a minute after the previous attempt, also across restarts) and its Device List
-  (no login) every 15 minutes. While the dashboard's Overview is open, the flow meter reads the gateway's Broadband Status
+  (no login) every 15 minutes. While the Overview's Traffic card or its details are on screen, the flow meter reads the gateway's Broadband Status
   page at most every 5 seconds.
 
 ## Development

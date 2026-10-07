@@ -272,11 +272,26 @@ func TestAppJSURLAndAttributeGuards(t *testing.T) {
 // ----------------------------------------------------------------------------- the real script
 
 type dashboardView struct {
-	Text    string            `json:"text"`
-	Pill    string            `json:"pill"`  // the status pill in the top bar
-	Title   string            `json:"title"` // document.title
-	Hero    string            `json:"hero"`  // the status hero card, if the view has one
-	Markers int               `json:"markers"`
+	Text  string `json:"text"`
+	Pill  string `json:"pill"`  // the status pill in the top bar
+	Title string `json:"title"` // document.title
+	// Hero is the Overview's status card as far as it speaks of the present (its left part: the
+	// state, its attribution, since when, the key facts, the incident in progress); Strip its
+	// right part, the last 24 hours.
+	Hero    string `json:"hero"`
+	Strip   string `json:"strip"`
+	Markers int    `json:"markers"`
+	// Detail is the Overview's details modal when one is in the view; Cards the Overview's summary
+	// cards, in their order.
+	Detail *dashboardDetail `json:"detail"`
+	Cards  []dashboardCard  `json:"cards"`
+	// History is the session history when the view was captured: its length and the index of the
+	// current entry. Locked: the page behind a modal is kept from scrolling.
+	History struct {
+		Length int `json:"length"`
+		Index  int `json:"index"`
+	} `json:"history"`
+	Locked  bool              `json:"locked"`
 	Buttons []dashboardButton `json:"buttons"`
 	Rows    []dashboardRow    `json:"rows"`
 	// Marks counts chart marks by kind: "peak", "atleast", "ref", "area", and the flow meter's
@@ -294,8 +309,65 @@ type dashboardView struct {
 	Forms  []string `json:"forms"`  // the forms shown, by their aria-label (else their class)
 	Hash   string   `json:"hash"`   // the URL's hash when the view was captured
 	// Bars holds the names of each list of ranked bars (by its aria-label), in their order,
-	// also behind a table view.
-	Bars map[string][]string `json:"bars"`
+	// also behind a table view; BarValues the figure each bar shows, in the same order.
+	Bars      map[string][]string `json:"bars"`
+	BarValues map[string][]string `json:"barValues"`
+	// StatusDescribed is what a screen reader says after the status card's button (its
+	// aria-describedby); StatusTitles the tooltips in the status card.
+	StatusDescribed string `json:"statusDescribed"`
+	StatusTitles    int    `json:"statusTitles"`
+}
+
+// dashboardDetail is the Overview's details modal of a rendered view: the card whose details
+// they are, whether the dialog is open, its heading, its line of context, its text and the
+// hostile markers in it; its body as a keyboard user meets it and the parts it shows ("<tag>.
+// <class>", in order); the note that the status cannot be read, when there is one.
+type dashboardDetail struct {
+	Key     string `json:"key"`
+	Open    bool   `json:"open"`
+	Title   string `json:"title"`
+	Context string `json:"context"`
+	Text    string `json:"text"`
+	Markers int    `json:"markers"`
+	Body    *struct {
+		Tabindex   string `json:"tabindex"`
+		Role       string `json:"role"`
+		Labelledby string `json:"labelledby"`
+	} `json:"body"`
+	Parts []string `json:"parts"`
+	Stale *struct {
+		Text string `json:"text"`
+		Role string `json:"role"`
+	} `json:"stale"`
+}
+
+// dashboardCard is one of the Overview's summary cards: the details it opens, its title, its
+// status chip ("<tone>:<label>"), its tone, its text, the hostile markers in it, its sparklines
+// (hidden from screen readers), its controls (its title's button only), what a screen reader
+// says after its button (aria-describedby) and the tooltips in it.
+type dashboardCard struct {
+	Key       string `json:"key"`
+	Title     string `json:"title"`
+	Chip      string `json:"chip"`
+	Tone      string `json:"tone"`
+	Text      string `json:"text"`
+	Markers   int    `json:"markers"`
+	Sparks    int    `json:"sparks"`
+	Controls  int    `json:"controls"`
+	Described string `json:"described"`
+	Titles    int    `json:"titles"`
+}
+
+// card returns the summary card of v that opens key, failing the test without one.
+func (v dashboardView) card(t *testing.T, key string) dashboardCard {
+	t.Helper()
+	for _, c := range v.Cards {
+		if c.Key == key {
+			return c
+		}
+	}
+	t.Fatalf("no summary card %q (cards: %+v)", key, v.Cards)
+	return dashboardCard{}
 }
 
 // dashboardButton is one button of a rendered view.
@@ -328,14 +400,15 @@ type dashboardReport struct {
 	Facts map[string]json.RawMessage `json:"facts"`
 }
 
-// runHarness drives the dashboard served at base in testdata/dashboard_harness.js.
-func runHarness(t *testing.T, base, scenario string) dashboardReport {
+// runHarness drives the dashboard served at base in testdata/dashboard_harness.js; env adds
+// variables for it ("HARNESS_HASH=#/?detail=internet": the address the page opens at).
+func runHarness(t *testing.T, base, scenario string, env ...string) dashboardReport {
 	t.Helper()
 	node := requireNode(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, node, filepath.Join("testdata", "dashboard_harness.js"), base, scenario)
-	cmd.Env = append(os.Environ(), "HARNESS_MARKER="+hostileMarker)
+	cmd.Env = append(append(os.Environ(), "HARNESS_MARKER="+hostileMarker), env...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
@@ -362,7 +435,14 @@ func runDashboardOn(t *testing.T, srv *Server, scenario string) dashboardReport 
 	t.Helper()
 	requireNode(t)
 	base, _ := startServer(t, srv)
-	rep := runHarness(t, base, scenario)
+	return checkedHarness(t, base, scenario)
+}
+
+// checkedHarness drives the dashboard at base in the harness (runHarness) and fails the test on
+// any markup-sink violation or script error.
+func checkedHarness(t *testing.T, base, scenario string, env ...string) dashboardReport {
+	t.Helper()
+	rep := runHarness(t, base, scenario, env...)
 	for _, v := range rep.Violations {
 		t.Errorf("markup/URL violation: %s", v)
 	}
@@ -492,7 +572,11 @@ func TestDashboardRendersHostileDataAsText(t *testing.T) {
 	w.mu.Unlock()
 	rep := runDashboard(t, w, "hostile")
 
-	want := []string{"overview", "overview 7d", "incidents", "incident export", "gateway", "syslog", "syslog more", "syslog severity", "syslog search",
+	// The Overview's summary and every card's details that show remote text (the traffic and the
+	// evidence details show none: rates, counts, hashes and times only).
+	want := []string{"overview", "overview status", "overview internet", "overview gateway", "overview fiber", "overview link",
+		"overview network", "overview syslog", "overview monitor",
+		"incidents", "incident export", "gateway", "syslog", "syslog more", "syslog severity", "syslog search",
 		"network", "network device", "network search", "network tables", "network firewall",
 		"evidence", "records", "records from genesis", "records config_state"}
 	for name := range rep.Views {
@@ -511,6 +595,17 @@ func TestDashboardRendersHostileDataAsText(t *testing.T) {
 		}
 		if v.Markers == 0 {
 			t.Errorf("view %q shows none of the hostile text, so this test would not notice it being parsed as markup", name)
+		}
+		// A card's details: the hostile text is in the details themselves.
+		if key, ok := strings.CutPrefix(name, "overview "); ok && (v.Detail == nil || !v.Detail.Open || v.Detail.Key != key || v.Detail.Markers == 0) {
+			t.Errorf("view %q: the %s details are not open or show none of the hostile text: %+v", name, key, v.Detail)
+		}
+	}
+	// Every card's details were opened, the traffic and evidence ones too (their markup is
+	// checked after every step all the same).
+	for _, key := range []string{"traffic", "traffic 7d", "evidence"} {
+		if v, ok := rep.Views["overview "+key]; !ok || v.Detail == nil || !v.Detail.Open {
+			t.Errorf("the %s details were not opened", key)
 		}
 	}
 	// The certificate banner and the Gateway page's certificate card are drawn from the
@@ -619,10 +714,13 @@ func TestDashboardCertificateAndAccountingViews(t *testing.T) {
 		"No usable gateway access code", "att-monitor set-access-code",
 		"only checking or changing the gateway’s settings (the outage redirect and the Syslog page) and reading its NAT table (the connections on the Network page) do",
 		"Recent time-stamps could not be verified", "do not count as proof of time",
-		"AT&T-attributed time without Internet", "Degraded",
-		"Classified from: gateway snapshot #", "DNS & web check #", "local link #", "window of 6 cycles",
-		"Without Internet", "gateway restart 5 min 30 s",
-		"86 % · -52 dBm", "TLS certificate "+demoGoogleCertSHA[:12])
+		"AT&T-attributed time without Internet", "Degraded")
+	// What the status hero said is in the status card's details; the cards of before are the
+	// details of the summary cards (the time accounting of the incidents is on the Incidents page,
+	// below).
+	contains("overview status", "Classified from: gateway snapshot #", "DNS & web check #", "local link #", "window of 6 cycles")
+	contains("overview link", "86 % · -52 dBm")
+	contains("overview internet", "TLS certificate "+demoGoogleCertSHA[:12])
 	if len(rep.Dialogs) != 1 {
 		t.Fatalf("dialogs: %q", rep.Dialogs)
 	}

@@ -37,18 +37,23 @@ func TestDashboardShowsSyslogAndTraffic(t *testing.T) {
 	contains := viewChecker(t, rep)
 	bs := string(rune(0x5c)) // a backslash: escapes are shown as typed
 
-	// The Overview card: the receiver, its counters, how much the store holds, the last
-	// message, the gateway's setting and the record of its latest check, and that att-monitor
-	// keeps it sending here (gateway.enforce_syslog), with the control that stops it.
+	// The Overview's Gateway syslog details (the card of before): the receiver, its counters, how
+	// much the store holds, the last message, the gateway's setting and the record of its latest
+	// check, and that att-monitor keeps it sending here (gateway.enforce_syslog), with the
+	// control that stops it. The card says the essentials.
 	w.mu.Lock()
 	checkSeq := w.syslogCheck.Seq
 	w.mu.Unlock()
-	contains("overview", "Gateway syslog", "Receiverlistening on UDP 0.0.0.0:514", " received · ", " stored · 0 dropped · 7 from other senders",
+	contains("overview syslog", "Gateway syslog", "Receiverlistening on UDP 0.0.0.0:514", " received · ", " stored · 0 dropped · 7 from other senders",
 		"Gateway settingon sends to 192.168.1.71:514 (this PC) · level Notice", "record #"+strconv.FormatUint(checkSeq, 10),
 		"Kept by att-monitoryes on, sending to 192.168.1.71:514 · level Notice",
 		"att-monitor keeps the gateway sending its log to this PC: it reads the setting in its daily settings check (also within 10 minutes after "+
 			"the service starts and after this PC’s address changes), sets it again whenever it differs, and records every reading and change with the gateway’s page.")
-	ov := rep.Views["overview"]
+	if c := rep.Views["overview"].card(t, "syslog"); c.Chip != "good:Listening" || !strings.Contains(c.Text, "messages since the service started") ||
+		!strings.Contains(c.Text, "The gateway sends its log to this PC (level Notice)") || !regexp.MustCompile(`\d+\.\d KiB of 100 MiB used`).MatchString(c.Text) {
+		t.Errorf("the Gateway syslog card: %+v", c)
+	}
+	ov := rep.Views["overview syslog"]
 	for _, s := range []string{"To set it on the gateway itself", "does not change it"} {
 		if strings.Contains(ov.Text, s) {
 			t.Errorf("the card says %q while att-monitor keeps the gateway sending here", s)
@@ -58,15 +63,21 @@ func TestDashboardShowsSyslogAndTraffic(t *testing.T) {
 		t.Errorf("the card's control: send %q, stop %q", s, o)
 	}
 	if !regexp.MustCompile(`Stored\d+\.\d KiB of 100 MiB usedoldest message `).MatchString(ov.Text) {
-		t.Error("the Overview's syslog card does not say how much the store holds")
+		t.Error("the Overview's syslog details do not say how much the store holds")
 	}
 
-	// The flow meter: the rates through the gateway as numbers and bars against the larger of
-	// the recent maximum and the heavy-traffic level, the last 15 minutes, this PC, the reading's
-	// time; its numbers are in no live region.
-	contains("overview", "Live trafficflow meter · every 5 s", "Download through the gateway", "Upload through the gateway",
+	// The flow meter, in the Traffic details: the rates through the gateway as numbers and bars
+	// against the larger of the recent maximum and the heavy-traffic level, the last 15 minutes,
+	// this PC, the reading's time; its numbers are in no live region. The Traffic card gives
+	// the rates too.
+	contains("overview traffic", "Live trafficflow meter · every 5 s", "Download through the gateway", "Upload through the gateway",
 		" · mark: heavy household traffic, 80 Mb/s", "Last 15 min: highest download ", "This PC (its network adapter): download ",
 		"Reading of ", ", over the 5.0 s between two readings", "shown, not recorded (the gateway snapshots every minute are the evidence)")
+	if c := rep.Views["overview"].card(t, "traffic"); c.Chip != "info:Live" || !regexp.MustCompile(`[\d.,]+ [kMG]?b/s down [\d.,]+ [kMG]?b/s up`).MatchString(c.Text) ||
+		!regexp.MustCompile(`Today [\d.,]+\x{a0}GB down · [\d.,]+\x{a0}GB up`).MatchString(c.Text) || c.Sparks != 1 {
+		t.Errorf("the Traffic card: %+v", c)
+	}
+	ov = rep.Views["overview traffic"]
 	if !regexp.MustCompile(`Download through the gateway[\d.,]+ [kMG]?b/s`).MatchString(ov.Text) || !regexp.MustCompile(`Bars from 0 to \d+ [MG]b/s`).MatchString(ov.Text) {
 		t.Error("the flow meter shows no rate or no scale")
 	}
@@ -77,15 +88,15 @@ func TestDashboardShowsSyslogAndTraffic(t *testing.T) {
 		t.Errorf("the flow meter's numbers are not marked aria-live off: %q", ov.Live)
 	}
 
-	// History: the Traffic chart in MRTG's manner (download filled, upload a line, the peaks,
-	// the heavy-traffic line) with MRTG's legend under it, its table view, and the WAN volume
-	// per day.
-	contains("overview", "Traffic", "Bits per second through the AT&T gateway, from its own IPv4 byte counters (it offers no SNMP), as MRTG draws it",
+	// The history in the Traffic details: the Traffic chart in MRTG's manner (download filled,
+	// upload a line, the peaks, the heavy-traffic line) with MRTG's legend under it, its table
+	// view, and the WAN volume per day.
+	contains("overview traffic", "Traffic", "Bits per second through the AT&T gateway, from its own IPv4 byte counters (it offers no SNMP), as MRTG draws it",
 		"WAN download", "WAN upload", "peak: the highest rate between two readings in the bucket", "Heavy household traffic 80 Mb/s",
 		"In this rangeMaximumAverageCurrent", "Maximum: the highest rate between two readings of the gateway’s counters",
 		"WAN download peak", "This PC upload", "WAN volume per day", "(today, so far)", "Time counted")
 	if ov.Marks["peak"] == 0 || ov.Marks["ref"] != 1 || ov.Marks["atleast"] != 0 || ov.Marks["area"] < 2 {
-		t.Errorf("overview chart marks: %v", ov.Marks) // areas: the chart's download and the flow meter's sparkline
+		t.Errorf("overview chart marks: %v", ov.Marks) // areas: the chart's download and the flow meter's sparkline (and the card's)
 	}
 	rate := `(at least )?[\d.,]+ [kMG]?b/s`
 	for _, row := range []string{"WAN download", "WAN upload", "This PC download", "This PC upload"} {
@@ -98,8 +109,8 @@ func TestDashboardShowsSyslogAndTraffic(t *testing.T) {
 	}
 	// Over 7 days the big download's rates are "at least": marked, explained, in MRTG's legend
 	// and in the table.
-	wk := rep.Views["overview 7d"]
-	contains("overview 7d", "at least: the true rate may have been higher", "Chevron: the gateway’s 32-bit byte counter may have wrapped more often than can be told")
+	wk := rep.Views["overview traffic 7d"]
+	contains("overview traffic 7d", "at least: the true rate may have been higher", "Chevron: the gateway’s 32-bit byte counter may have wrapped more often than can be told")
 	if wk.Marks["atleast"] == 0 || len(rowsWith(wk, regexp.MustCompile(`at least \d{3} Mb/s`))) == 0 {
 		t.Errorf("7 days: %d chevrons, %d table rows with \"at least\"", wk.Marks["atleast"], len(rowsWith(wk, regexp.MustCompile(`at least \d`))))
 	}
@@ -387,9 +398,15 @@ func TestDashboardFlowMeterStates(t *testing.T) {
 			w.liveState = state
 			w.mu.Unlock()
 			rep := runDashboard(t, w, "overview")
-			viewChecker(t, rep)("overview", wants...)
-			if ov := rep.Views["overview"]; !slices.Contains(ov.Headings, "Live traffic") {
+			viewChecker(t, rep)("overview traffic", wants...)
+			if ov := rep.Views["overview traffic"]; !slices.Contains(ov.Headings, "Live traffic") {
 				t.Errorf("headings: %q", ov.Headings)
+			}
+			// The Traffic card: a reading that failed is no new reading; one without a rate yet,
+			// or at least, is live all the same.
+			want := map[string]string{"atleast": "info:Live", "error": "warning:No new reading", "first": "info:Live", "unavailable": "warning:No new reading"}[state]
+			if c := rep.Views["overview"].card(t, "traffic"); c.Chip != want {
+				t.Errorf("the Traffic card: %+v, want the chip %s", c, want)
 			}
 		})
 	}
@@ -410,6 +427,11 @@ func TestDashboardWithoutSyslogStoreOrFlowMeter(t *testing.T) {
 	}
 	if n := liveRequests(rep, len(rep.Requests)); n != 2 { // one for each Overview, then nothing more
 		t.Errorf("%d flow meter requests to a monitor without one", n)
+	}
+	// The Traffic card says that this monitor has no flow meter.
+	if c := rep.Views["overview"].card(t, "traffic"); c.Chip != "none:No live reading" ||
+		!strings.Contains(c.Text, "The live traffic meter is not available: this att-monitor offers no live reading of the gateway's counters.") {
+		t.Errorf("the Traffic card without a flow meter: %+v", c)
 	}
 	contains("syslog", "The gateway's syslog messages are not available: this att-monitor keeps no syslog store.")
 	contains("syslog retention", "How much syslog is kept cannot be changed here: this att-monitor offers no control of a syslog store.")
@@ -434,32 +456,45 @@ func TestDashboardSyslogCardStates(t *testing.T) {
 		arrived = "Messages have arrived since this setting was read, so it may have been changed on the gateway since. "
 		next    = "It is set again at the next check, or now with “Send the gateway’s log to this PC”."
 	)
+	// Each state's words in the Overview's Gateway syslog details (the card of before) or on the
+	// Syslog page, and the summary card's chip and line.
 	for state, want := range map[string]struct {
 		view       string
 		texts      []string
 		hand       bool   // the card says how to set the gateway by hand
 		send, stop string // how the control offers the changes (buttonState)
+		chip, line string // the summary card
 	}{
-		"offquiet": {"overview", []string{"Gateway settingoff the gateway sends no syslog messages", "Last messagenone since the service started",
-			"Kept by att-monitorno att-monitor only reads this setting", notKept}, false, "shown", "hidden"},
-		"off": {"overview", []string{"Gateway settingoff the gateway sends no syslog messages", arrived + notKept}, false, "shown", "hidden"},
-		"elsewhere": {"overview", []string{"Gateway settingsends elsewhere to 192.168.1.20:1514 · level Warning, not to this PC", "Kept by att-monitorno", notKept},
-			false, "shown", "shown"},
-		"manual": {"overview", []string{"Gateway settingon sends to 192.168.1.71:514 (this PC)", "Kept by att-monitorno", notKept}, false, "shown", "shown"},
-		"pending": {"overview", []string{"Gateway settingoff the gateway sends no syslog messages", "Kept by att-monitoryes on, sending to 192.168.1.71:514 · level Notice",
-			kept, next}, false, "shown", "shown"},
+		// While this PC listens but the gateway, as last read, sends its log elsewhere or not at all
+		// (or its setting could not be checked), the card is in the warning tone, as the details are.
+		"offquiet": {"overview syslog", []string{"Gateway settingoff the gateway sends no syslog messages", "Last messagenone since the service started",
+			"Kept by att-monitorno att-monitor only reads this setting", notKept}, false, "shown", "hidden", "warning:Gateway not sending", "The gateway sends no syslog messages"},
+		"off": {"overview syslog", []string{"Gateway settingoff the gateway sends no syslog messages", arrived + notKept}, false, "shown", "hidden",
+			"warning:Gateway not sending", "The gateway sends no syslog messages"},
+		"elsewhere": {"overview syslog", []string{"Gateway settingsends elsewhere to 192.168.1.20:1514 · level Warning, not to this PC", "Kept by att-monitorno", notKept},
+			false, "shown", "shown", "warning:Sent elsewhere", "The gateway sends its log to 192.168.1.20:1514, not to this PC"},
+		"manual": {"overview syslog", []string{"Gateway settingon sends to 192.168.1.71:514 (this PC)", "Kept by att-monitorno", notKept}, false, "shown", "shown",
+			"good:Listening", "The gateway sends its log to this PC (level Notice)"},
+		"pending": {"overview syslog", []string{"Gateway settingoff the gateway sends no syslog messages", "Kept by att-monitoryes on, sending to 192.168.1.71:514 · level Notice",
+			kept, next}, false, "shown", "shown", "warning:Gateway not sending", "The gateway sends no syslog messages"},
 		// The latest check failed, but messages arrive: no instructions.
-		"error": {"overview", []string{"Gateway settingcheck failed the latest settings check could not read the gateway's Syslog page: gateway: login throttled",
-			"Last read: on, sends to 192.168.1.71:514 · level Notice", kept}, false, "shown", "shown"},
+		"error": {"overview syslog", []string{"Gateway settingcheck failed the latest settings check could not read the gateway's Syslog page: gateway: login throttled",
+			"Last read: on, sends to 192.168.1.71:514 · level Notice", kept}, false, "shown", "shown", "warning:Setting not checked", "The gateway’s Syslog setting could not be checked"},
 		// The latest check failed, and nothing arrived since the service started: instructions.
-		"errorquiet": {"overview", []string{"Gateway settingcheck failed the latest settings check could not read the gateway's Syslog page", kept},
-			true, "shown", "shown"},
-		"unknown": {"overview", []string{"Gateway settingnot read yet", "the gateway's Syslog setting has not been read yet", kept}, false, "shown", "shown"},
-		"notarget": {"overview", []string{"Kept by att-monitoryes on, sending to this PC (its address toward the gateway is not known yet)", kept},
-			false, "shown", "shown"},
-		"nolisten": {"overview", []string{"Receivernot listening listen udp 0.0.0.0:514: bind: Only one usage of each socket address"}, false, "hidden", "shown"},
-		"disabled": {"overview", []string{"Receiveroff turned off in the configuration (syslog.enabled)"}, false, "hidden", "shown"},
-		"nostore":  {"syslog", []string{"This monitor reports no syslog store, so how much is kept cannot be shown or changed here."}, false, "hidden", "shown"},
+		"errorquiet": {"overview syslog", []string{"Gateway settingcheck failed the latest settings check could not read the gateway's Syslog page", kept},
+			true, "shown", "shown", "warning:Setting not checked", "The gateway’s Syslog setting could not be checked"},
+		"unknown": {"overview syslog", []string{"Gateway settingnot read yet", "the gateway's Syslog setting has not been read yet", kept}, false, "shown", "shown",
+			"good:Listening", "The gateway's Syslog setting has not been read yet."},
+		"notarget": {"overview syslog", []string{"Kept by att-monitoryes on, sending to this PC (its address toward the gateway is not known yet)", kept},
+			false, "shown", "shown", "good:Listening", "this computer's address toward the gateway is not known yet."},
+		// Why it does not listen is on the card itself (a chip's tooltip could not show under the
+		// card's button).
+		"nolisten": {"overview syslog", []string{"Receivernot listening listen udp 0.0.0.0:514: bind: Only one usage of each socket address"}, false, "hidden", "shown",
+			"critical:Not listening", "Listen udp 0.0.0.0:514: bind: Only one usage of each socket address"},
+		"disabled": {"overview syslog", []string{"Receiveroff turned off in the configuration (syslog.enabled)"}, false, "hidden", "shown",
+			"none:Off", "messages since the service started"},
+		"nostore": {"syslog", []string{"This monitor reports no syslog store, so how much is kept cannot be shown or changed here."}, false, "hidden", "shown",
+			"good:Listening", "This monitor keeps no syslog store."},
 	} {
 		t.Run(state, func(t *testing.T) {
 			w := newDemoWorld(time.Now())
@@ -468,10 +503,13 @@ func TestDashboardSyslogCardStates(t *testing.T) {
 			w.mu.Unlock()
 			rep := runDashboard(t, w, "overview")
 			viewChecker(t, rep)(want.view, want.texts...)
-			if state == "nostore" && strings.Contains(rep.Views["overview"].Text, "Stored") {
-				t.Error("the Overview's card shows a store the monitor does not report")
+			if state == "nostore" && strings.Contains(rep.Views["overview syslog"].Text, "Stored") {
+				t.Error("the Overview's syslog details show a store the monitor does not report")
 			}
-			for _, view := range []string{"overview", "syslog"} {
+			if c := rep.Views["overview"].card(t, "syslog"); c.Chip != want.chip || !strings.Contains(c.Text, want.line) || c.Tone != strings.Split(want.chip, ":")[0] {
+				t.Errorf("the Gateway syslog card: %+v; want the chip %s (its tone the card's) and %q", c, want.chip, want.line)
+			}
+			for _, view := range []string{"overview syslog", "syslog"} {
 				v := rep.Views[view]
 				if hand := strings.Contains(v.Text, byHand); hand != want.hand {
 					t.Errorf("%s: says how to set the gateway by hand: %v, want %v", view, hand, want.hand)
@@ -485,14 +523,18 @@ func TestDashboardSyslogCardStates(t *testing.T) {
 			}
 		})
 	}
-	// A monitor without a receiver: no card, no store panel.
+	// A monitor without a receiver: the card and its details say so; no store panel.
 	w := newDemoWorld(time.Now())
 	w.mu.Lock()
 	w.syslogState = "none"
 	w.mu.Unlock()
 	rep := runDashboard(t, w, "overview")
-	if strings.Contains(rep.Views["overview"].Text, "Gateway syslog") {
-		t.Error("a card for a monitor that reports no syslog receiver")
+	if c := rep.Views["overview"].card(t, "syslog"); c.Chip != "none:Not offered" || !strings.Contains(c.Text, "This monitor reports no syslog receiver.") {
+		t.Errorf("the Gateway syslog card of a monitor that reports no syslog receiver: %+v", c)
+	}
+	viewChecker(t, rep)("overview syslog", "This monitor reports no syslog receiver.")
+	if d := rep.Views["overview syslog"].Detail; d == nil || strings.Contains(d.Text, "Receiver") {
+		t.Errorf("syslog details for a monitor that reports no syslog receiver: %+v", d)
 	}
 	viewChecker(t, rep)("syslog", "This monitor reports no syslog receiver")
 	if slices.Contains(rep.Views["syslog"].Headings, "Stored messages") {

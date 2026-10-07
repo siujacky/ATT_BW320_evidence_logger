@@ -42,9 +42,10 @@ func rowsWith(v dashboardView, re *regexp.Regexp) []dashboardRow {
 func TestDashboardShowsDNSHijackTestAsPassed(t *testing.T) {
 	requireNode(t)
 	rep := runDashboard(t, newDemoWorld(time.Now()), "plain")
-	ov, ok := rep.Views["overview"]
+	// The checks are in the Overview's Internet details.
+	ov, ok := rep.Views["overview internet"]
 	if !ok {
-		t.Fatalf("no overview rendered (views: %v)", keys(rep.Views))
+		t.Fatalf("no Internet details rendered (views: %v)", keys(rep.Views))
 	}
 
 	tests := rowsWith(ov, hijackTestName)
@@ -71,11 +72,14 @@ func TestDashboardShowsDNSHijackTestAsPassed(t *testing.T) {
 			t.Errorf("resolution check row %q has chips %q, want a green \"answered\"", r.Text, r.Chips)
 		}
 	}
-	// Nothing on a healthy line is a red DNS result.
+	// Nothing on a healthy line is a red DNS result, and the summary card says so.
 	for _, r := range ov.Rows {
 		if strings.Contains(r.Text, "DNS") && slices.ContainsFunc(r.Chips, func(c string) bool { return strings.HasPrefix(c, "critical:") }) {
 			t.Errorf("healthy line: DNS row %q shows a critical chip %q", r.Text, r.Chips)
 		}
+	}
+	if c := rep.Views["overview"].card(t, "internet"); c.Chip != "good:OK" || !strings.Contains(c.Text, "DNS answered · web checks OK · no DNS hijack") {
+		t.Errorf("the Internet card on a healthy line: %+v", c)
 	}
 
 	// The timeline and the records say the same as the overview.
@@ -108,7 +112,7 @@ func TestDashboardShowsDNSHijack(t *testing.T) {
 	w.dnsHijack = true
 	w.mu.Unlock()
 	rep := runDashboard(t, w, "plain")
-	ov := rep.Views["overview"]
+	ov := rep.Views["overview internet"]
 	tests := rowsWith(ov, hijackTestName)
 	if len(tests) != 1 {
 		t.Fatalf("overview: %d rows name the .invalid hijack test query, want 1; rows:\n%s", len(tests), rowDump(ov.Rows))
@@ -124,6 +128,10 @@ func TestDashboardShowsDNSHijack(t *testing.T) {
 	}
 	if strings.Contains(row.Text, "not hijacked") {
 		t.Errorf("hijacked test row %q says \"not hijacked\"", row.Text)
+	}
+	// The summary card says it in red.
+	if c := rep.Views["overview"].card(t, "internet"); c.Chip != "critical:Hijacked" || c.Tone != "critical" || !strings.Contains(c.Text, "DNS HIJACKED") {
+		t.Errorf("the Internet card on a hijacked line: %+v", c)
 	}
 }
 

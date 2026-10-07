@@ -639,13 +639,18 @@ itself when the store refused it; never with a problem), `nat_next`, `nat_logins
 logins the NAT reads needed in the last 24 hours), the newest Device List read with
 `devices_problem`, and the store's volume and limits.
 
-Dashboard views (hash routes): Overview (status hero with state/cause/attribution and
-reasons; cards Internet / AT&T gateway WAN / Fiber optics (Rx/Tx power vs thresholds and the
-gateway's own alarm flags) / Local link / Evidence integrity / Syslog (the receiver, the gateway's
-Syslog setting, whether it is kept, and its control: see the Syslog view); the live flow meter (polls
-`/api/traffic/live` every 5 s only while the Overview is shown and the page visible); latency chart
-per target, availability strip, MRTG-style traffic chart with its maximum/average/current legend and
-the daily totals for 1h/6h/24h/7d; recent incidents), Incidents (list + detail timeline with evidence
+Dashboard views (hash routes): Overview (a summary dashboard, docs/overview-redesign.md: the
+status card with state/cause/attribution, key facts, the open incident and the 24-hour strip of
+states; the six key numbers; nine summary cards - Internet / AT&T gateway / Fiber optics (Rx power
+on a gauge with the gateway's own thresholds) / Traffic / This PC's link / Network / Gateway syslog /
+Evidence / Monitor & clock - each a stretched button opening its details in a native modal dialog
+(`#/?detail=<card>`; Esc, Close, the backdrop and Back close it; live while open, keeping focus and
+scroll); the details hold the former cards (Internet / gateway WAN / Fiber optics with Rx/Tx power
+vs thresholds and the gateway's alarm flags / Local link / Evidence integrity / Syslog with its
+control: see the Syslog view), the latency, loss, availability, MRTG-style traffic (maximum/average/
+current legend, daily totals) and optical charts for 1h/6h/24h/7d, and the live flow meter (polls
+`/api/traffic/live` every 5 s only while the Traffic card or its details are on screen and the page
+visible); recent incidents), Incidents (list + detail timeline with evidence
 links), Gateway (all parsed fields, DMI table, notification setting), Syslog (the syslog conditions;
 the receiver and the gateway's Syslog setting with its control, "Send the gateway's log to this PC"
 and "Stop sending" - each confirmed in a dialog that says what happens on the gateway, then its
@@ -655,8 +660,8 @@ while authenticated gateway actions cannot run; while a change runs they keep th
 the button the focus is on is no longer offered, the focus goes to the outcome (else the reason,
 else the other button) - and how to set the page by hand, only while the gateway does not send
 here, the monitor cannot set it (setting it failed or cannot be done) and no message arrived since
-the read; the Overview's card is the same, kept in place across status refreshes so that its
-control keeps the focus; the gateway's messages
+the read; the Overview's Gateway syslog details are the same, kept in place across status refreshes
+so that its control keeps the focus; the gateway's messages
 with search and severity filter, each linked to its chunk's `syslog_chunk` record; a row shows at
 most 500 characters of the text and 100 of the host and the app as shown (an escape counts its
 length), each with at most 16 runs of hidden characters, one element per run, and the exact
@@ -1148,7 +1153,8 @@ read ended, shared by all callers (callers arriving during a read get its outcom
 against the previous counter reading (a live read, or the newest recorded snapshot) when it is at
 most 2 minutes old; this computer's rates from the newest local-link interval; about 15 minutes of
 history (at most 256 points). Nothing of it is recorded, stored or fed into the monitor's state;
-the dashboard asks only while the Overview is shown and the page visible, so the gateway gets no
+the dashboard asks only while the Overview's Traffic card or its details are on screen and the page
+visible, so the gateway gets no
 extra request when nobody watches. The evidence comes first: a live read never waits for the
 gateway lock - while a poll, an incident snapshot or the settings check holds it the read is
 skipped (the previous readings come back, with the reason) - it holds the lock for at most 5 s (its
