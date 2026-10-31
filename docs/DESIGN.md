@@ -71,7 +71,9 @@ problems are on the provider's side**, with a complete chain of custody:
      read (a session that has served no page for an hour is renewed); and a session whose login form
      the gateway accepted is kept even when the page that verifies it does not come. The NAT reads
      have a login budget of their own (the client counts the login forms it posts): after two reads
-     in a row that each needed a login the next waits an hour, after 6 within a day they pause until
+     in a row that each needed a login within the client's session reuse (5 minutes) of the read
+     before, the next waits an hour (a login after a longer pause is due, not a sign of a gateway
+     that ends its sessions, and does not extend the streak), after 6 within a day they pause until
      the oldest is a day old, and a read that keeps failing otherwise waits an interval, then two,
      four, ... up to two hours. Every login, whoever asks, goes through one policy: at most one
      attempt a minute, none for 5 minutes after "sessions in use", none after 3 rejections within an
@@ -1238,7 +1240,14 @@ speed and last activity (`testdata/gateway/devices_real.html` is a sanitized cap
   `LoginAttempts`, compared around each read, which holds the gateway lock): after two reads in a
   row that each needed a login - the gateway may end its sessions sooner than the client assumes -
   the next read waits an hour, and once the reads needed 6 logins within 24 hours they pause until
-  the oldest of them is 24 hours old (`nat_problem` says so, `nat_logins` counts them). A read
+  the oldest of them is 24 hours old (`nat_problem` says so, `nat_logins` counts them). Only a
+  login less than the client's session reuse (`gateway.SessionReuse`, 5 minutes) after the
+  previous read counts for the streak: the read after the hour's wait has to log in - its session
+  is long gone - and counting that login made every wait lead to the next one (one login an hour
+  until the day's six were used up, then a pause of most of a day, on the owner's gateway from
+  2026-10-28, set off by the first reads after a run of short outages). A login after a longer
+  pause neither extends the streak nor makes the next read wait (the read after it, an interval
+  later, tells whether the gateway keeps its sessions); every login counts for the six. A read
   stopped for the evidence after it had sent a login is tried again an interval later, not after
   half a minute. Those logins and the stop after a rejected code are kept in
   `state\nat-sampler.json` and restored at the start: a restart gives no new budget and no new

@@ -54,7 +54,9 @@ import (
 //     cause - after a pause in the reads longer than the session reuse (an incident, skipped
 //     rounds), or when the gateway ends sessions sooner than the client assumes - are counted
 //     (the gateway client's LoginAttempts, compared around each read): after two reads in a row
-//     that each needed one, the next waits an hour, and once the reads needed connLoginBudget
+//     that each needed one although the previous read was less than 5 minutes before (a login
+//     after a longer pause was due, and does not count), the next waits an hour, and once the
+//     reads needed connLoginBudget
 //     logins within a day they pause until the oldest of them is a day old. Those logins and a stop
 //     after a rejected access code are kept in the state folder (natStateFile), so that a restart
 //     - even in a loop - starts with what the previous run knew. A read that keeps failing
@@ -91,12 +93,16 @@ const (
 	// connLoginBudget is how many gateway logins the NAT reads may cause within connLoginWindow
 	// (docs/DESIGN.md §2: logins must stay rare): once they have, the reads pause until the oldest
 	// of those logins is connLoginWindow old. After connLoginStreak reads in a row that each needed
-	// a login - the gateway may end its sessions sooner than the client assumes - the next read
-	// waits connLoginStreakWait.
+	// a login although the previous read was less than connSessionReuse before it - the gateway
+	// may end its sessions sooner than the client assumes - the next read waits connLoginStreakWait.
 	connLoginBudget     = 6
 	connLoginWindow     = 24 * time.Hour
 	connLoginStreak     = 2
 	connLoginStreakWait = time.Hour
+	// connSessionReuse is how long the gateway client reuses its session after the session's last
+	// use (gateway.SessionReuse; a test keeps the two equal). A read that begins this long or more
+	// after the previous one is expected to log in: its login says nothing about the gateway.
+	connSessionReuse = 5 * time.Minute
 	// connRawEvery: each raw page copy is written at most this often.
 	connRawEvery = time.Hour
 	// connPruneEvery: how often the connection store's retention limits are applied, and the raw
@@ -186,10 +192,14 @@ type natState struct {
 	// nor the rounds that did not read), for their back-off.
 	fails int
 	// logins are when the gateway logins that NAT reads caused were made (real time, oldest first,
-	// within connLoginWindow); streak counts the reads in a row that each needed one.
-	logins []time.Time
-	streak int
-	raw    rawCopy
+	// within connLoginWindow); streak counts the reads, since the last that worked without one, that
+	// each needed one although the previous read was recent (natLogin); lastRead is when the newest
+	// read that reached the gateway (it logged in, or it worked) began (real time; zero before the
+	// first of the run).
+	logins   []time.Time
+	streak   int
+	lastRead time.Time
+	raw      rawCopy
 }
 
 // devState is what the Device List sampler knows (guarded by connSamplers.mu).
@@ -400,21 +410,34 @@ func recentLogins(ts []time.Time, now time.Time) []time.Time {
 }
 
 // natLogin notes whether a NAT read needed a gateway login (loggedIn; err is the read's error) and
-// returns when the next round is due given the regular one (next). A login is counted for the
-// budget and kept in the state folder. After connLoginStreak reads that each needed one, with no
-// read between them that worked without one, the next round waits connLoginStreakWait after this
-// one began: the gateway may end its sessions sooner than the client assumes, and every read would
-// then log in. Only a read that worked without a login - the session was reused - ends the streak.
+// returns when the next round is due given the regular one (next). Every login is counted for the
+// budget and kept in the state folder. After connLoginStreak reads that each needed one although
+// the previous read had begun less than connSessionReuse before - with no read between them that
+// worked without one - the next round waits connLoginStreakWait after this one began: the gateway
+// may end its sessions sooner than the client assumes, and every read would then log in. A read
+// that worked without a login - the session was reused - ends the streak. A login after a longer
+// pause (the hour's wait itself, a pause of the reads, an incident) neither extends the streak nor
+// makes the next round wait: the client's session had expired by then, so the login was due and
+// tells nothing about the gateway - the next read, an interval later, does. Counting it made the
+// hour's wait feed itself - one login an hour until the budget ran out, the reads paused for most
+// of the day - though the gateway kept its sessions.
 func (m *Monitor) natLogin(began, next time.Time, loggedIn bool, err error) time.Time {
 	c := m.conns
-	streak := 0
+	streak, counted := 0, false
 	c.locked(func() {
+		due := !c.nat.lastRead.IsZero() && began.Sub(c.nat.lastRead) >= connSessionReuse
 		switch {
 		case loggedIn:
 			c.nat.logins = append(recentLogins(c.nat.logins, began), began)
-			c.nat.streak++
+			if !due {
+				c.nat.streak++
+				counted = true
+			}
 		case err == nil:
 			c.nat.streak = 0
+		}
+		if loggedIn || err == nil {
+			c.nat.lastRead = began
 		}
 		streak = c.nat.streak
 	})
@@ -422,7 +445,7 @@ func (m *Monitor) natLogin(began, next time.Time, loggedIn bool, err error) time
 		return next
 	}
 	m.saveNATState()
-	if streak >= connLoginStreak {
+	if counted && streak >= connLoginStreak {
 		m.log.Warn("NAT table reads for the Network page needed a gateway login each: the next read waits an hour",
 			"reads", streak)
 		return later(next, began.Add(connLoginStreakWait))

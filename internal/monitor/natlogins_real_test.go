@@ -34,6 +34,14 @@ var (
 	_ loginCooldown = (*gateway.CooldownError)(nil)
 )
 
+// TestConnSessionReuseMatchesTheGateway: the sampler judges whether a read's login was due by the
+// gateway client's session reuse (connSessionReuse), which must stay the client's.
+func TestConnSessionReuseMatchesTheGateway(t *testing.T) {
+	if connSessionReuse != gateway.SessionReuse {
+		t.Fatalf("connSessionReuse %v, gateway.SessionReuse %v: keep them equal", connSessionReuse, gateway.SessionReuse)
+	}
+}
+
 // gwTestCode is the imitation's access code (made up).
 const gwTestCode = "Zq7#x9!Lm2"
 

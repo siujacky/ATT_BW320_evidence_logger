@@ -118,6 +118,75 @@ func TestNATSamplerLoginStreak(t *testing.T) {
 	wantNext(t, "a read with a login after it", began, r.m.sampleNAT(ctx), interval)
 }
 
+// TestNATSamplerStreakDoesNotFeedItself: the read after the hour's wait must log in - the client
+// keeps a session 5 minutes after its last use - and that login, due after the pause, neither
+// extends the streak nor makes the next read wait another hour: the reads go back to their interval
+// when the gateway keeps its sessions again, instead of one login an hour until the day's budget
+// is used up (as on the owner's gateway from 2026-10-28). Every login still counts for the budget,
+// and a gateway that still ends its sessions is still found out by the read after that one.
+func TestNATSamplerStreakDoesNotFeedItself(t *testing.T) {
+	ctx := context.Background()
+	const interval = 4 * time.Minute
+	r, _ := connRig(t, func(c *config.Config) { c.Connections.Interval = config.D(interval) })
+	// Reads 1-3 log in (the gateway ended the sessions); read 4 reuses read 3's session.
+	loginEachRead(r, func(n int) bool { return n >= 4 })
+	began := time.Now()
+	wantNext(t, "the first read with a login", began, r.m.sampleNAT(ctx), interval)
+	began = time.Now()
+	wantNext(t, "the second in a row", began, r.m.sampleNAT(ctx), connLoginStreakWait)
+	// The hour's wait: the previous read began an hour ago.
+	pause := func(d time.Duration) {
+		r.m.conns.locked(func() { r.m.conns.nat.lastRead = r.m.conns.nat.lastRead.Add(-d) })
+	}
+	pause(connLoginStreakWait)
+	began = time.Now()
+	wantNext(t, "the read after the hour's wait, which had to log in", began, r.m.sampleNAT(ctx), interval)
+	began = time.Now()
+	wantNext(t, "the next read, in that read's session", began, r.m.sampleNAT(ctx), interval)
+	var streak, logins int
+	r.m.conns.locked(func() { streak, logins = r.m.conns.nat.streak, len(r.m.conns.nat.logins) })
+	if streak != 0 || logins != 3 {
+		t.Fatalf("streak %d, logins counted %d; want 0 and 3 (every login counts for the budget)", streak, logins)
+	}
+	if st := connStatus(t, r); st.NATLogins != 3 {
+		t.Fatalf("status nat_logins %d, want 3", st.NATLogins)
+	}
+
+	// The gateway ends its sessions again: two logins in a row, the hour's wait, the due login -
+	// and the read after it, which should have reused that login's session, logs in too: it waits
+	// another hour (not one more interval: the due login did not end the streak). The first three
+	// logins are taken as a day old, out of the budget's way.
+	r.m.conns.locked(func() { r.m.conns.nat.logins = nil })
+	loginEachRead(r, nil)
+	began = time.Now()
+	wantNext(t, "a login again", began, r.m.sampleNAT(ctx), interval)
+	began = time.Now()
+	wantNext(t, "and again", began, r.m.sampleNAT(ctx), connLoginStreakWait)
+	pause(connLoginStreakWait)
+	began = time.Now()
+	wantNext(t, "the due login after the second wait", began, r.m.sampleNAT(ctx), interval)
+	began = time.Now()
+	wantNext(t, "a login the session should have spared", began, r.m.sampleNAT(ctx), connLoginStreakWait)
+	r.m.conns.locked(func() { logins = len(r.m.conns.nat.logins) })
+	if logins != 4 {
+		t.Fatalf("logins counted %d, want 4", logins)
+	}
+}
+
+// TestNATSamplerStreakAfterAShortPause: a read that logs in less than the session reuse after the
+// previous one still extends the streak - the gateway ended a session the client still held.
+func TestNATSamplerStreakAfterAShortPause(t *testing.T) {
+	ctx := context.Background()
+	const interval = 4 * time.Minute
+	r, _ := connRig(t, func(c *config.Config) { c.Connections.Interval = config.D(interval) })
+	loginEachRead(r, nil)
+	began := time.Now()
+	wantNext(t, "the first read with a login", began, r.m.sampleNAT(ctx), interval)
+	r.m.conns.locked(func() { r.m.conns.nat.lastRead = r.m.conns.nat.lastRead.Add(-(connSessionReuse - 30*time.Second)) })
+	began = time.Now()
+	wantNext(t, "a login 4 min 30 s after the previous read", began, r.m.sampleNAT(ctx), connLoginStreakWait)
+}
+
 // TestNATHeldReadAfterALogin: a read stopped for the evidence after it had logged in is not tried
 // again half a minute later - which, should the login's session be lost, would log in again - but
 // an interval later; one stopped before it logged in is tried again shortly.

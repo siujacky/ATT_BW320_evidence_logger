@@ -161,7 +161,8 @@ One page, two tabs, one date filter (1 h, 24 h, 7 d, 30 d, or a custom from/to) 
   answer the latest poll; a rejected access code (met by a NAT read or the settings check) stops
   the NAT reads until a code is stored anew, or for an hour; a read that fails otherwise than with
   the login page keeps the gateway client's session (no login per failing read), failing reads back
-  off up to two hours, two reads in a row that each needed a login make the next wait an hour, and
+  off up to two hours, two reads in a row that each needed a login within 5 minutes of the read
+  before make the next wait an hour (a login after a longer pause does not count for that), and
   after 6 logins within a day the reads pause; the logins, the stop and the gateway client's login
   policy are kept in `state\` across restarts. The pages of the first read that worked, of a page
   not understood and of one with rows left out are copied to `connections\last-nattable.html` /

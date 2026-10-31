@@ -386,9 +386,11 @@ Every chart has a table view, and the page is read again every minute while it i
   too slow) keeps the session: it never leads to a login by itself. Every login follows the same
   rules as setup's (one attempt a minute at most, none after three rejections within an hour - also
   across restarts of the service), and the reads have a budget of their own: after two reads in a
-  row that each needed a login the next waits an hour, after six logins within a day they pause
-  until the next day, and reads that keep failing are tried less and less often (up to every two
-  hours). The monitor only reads the page; it never reads it during an outage, after a failed
+  row that each needed a login although the session should still have been good (the read before
+  was less than 5 minutes earlier) the next waits an hour - a login after a longer pause, such as
+  an outage, is expected and does not count -, after six logins within a day they pause until the
+  next day, and reads that keep failing are tried less and less often (up to every two hours). The
+  monitor only reads the page; it never reads it during an outage, after a failed
   measurement cycle or while a changed gateway certificate waits for your confirmation, and it stops
   for an hour when the gateway rejects the access code. Without a stored access code the NAT table
   is not read (the rest of the page still works).
