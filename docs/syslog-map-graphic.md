@@ -163,7 +163,8 @@ One page, two tabs, one date filter (1 h, 24 h, 7 d, 30 d, or a custom from/to) 
   the login page keeps the gateway client's session (no login per failing read), failing reads back
   off up to two hours, two reads in a row that each needed a login within 5 minutes of the read
   before make the next wait an hour (a login after a longer pause does not count for that), and
-  after 6 logins within a day the reads pause; the logins, the stop and the gateway client's login
+  after 6 logins within a day the reads make no login (they go on in the session the gateway keeps,
+  and pause once it is gone); the logins, the stop and the gateway client's login
   policy are kept in `state\` across restarts. The pages of the first read that worked, of a page
   not understood and of one with rows left out are copied to `connections\last-nattable.html` /
   `last-devices.html` (at most hourly; the Device List's without the Wi-Fi network's name), to

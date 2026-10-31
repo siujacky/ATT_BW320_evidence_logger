@@ -194,13 +194,15 @@ type ConnSamplerStatus struct {
 	// code, a changed gateway certificate awaiting confirmation, ...); "" when it worked.
 	NATProblem string `json:"nat_problem,omitempty"`
 	// NATNote says what the newest NAT read, which worked, could not keep: rows of the page that
-	// were not understood, or the read itself when the connection store refused it; "" when nothing
-	// (and always when NATProblem is set).
+	// were not understood, or the read itself when the connection store refused it; otherwise that
+	// the reads, having used up their login budget, make no login for now; "" when nothing (and
+	// always when NATProblem is set).
 	NATNote string `json:"nat_note,omitempty"`
 	NATNext string `json:"nat_next,omitempty"`
 	// NATLogins counts the gateway logins the NAT reads needed within the last 24 hours: normally
-	// none, as the reads reuse the gateway client's login session. At 6 the reads pause until the
-	// oldest of them is a day old (NATProblem says so).
+	// none, as the reads reuse the gateway client's login session. At 6 the reads make no login
+	// until the oldest of them is a day old: they go on in the session while the gateway keeps it
+	// (NATNote says so), and pause once it is gone (NATProblem says until when).
 	NATLogins int `json:"nat_logins"`
 	// The newest Device List read that worked, and the problem of the newest attempt.
 	DevicesAt      string `json:"devices_at,omitempty"`

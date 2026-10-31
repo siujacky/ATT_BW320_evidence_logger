@@ -73,8 +73,9 @@ problems are on the provider's side**, with a complete chain of custody:
      have a login budget of their own (the client counts the login forms it posts): after two reads
      in a row that each needed a login within the client's session reuse (5 minutes) of the read
      before, the next waits an hour (a login after a longer pause is due, not a sign of a gateway
-     that ends its sessions, and does not extend the streak), after 6 within a day they pause until
-     the oldest is a day old, and a read that keeps failing otherwise waits an interval, then two,
+     that ends its sessions, and does not extend the streak), after 6 within a day they make no
+     login until the oldest is a day old (reads in the session the gateway keeps go on: the client
+     is told to make none, `contracts.WithoutGatewayLogin`), and a read that keeps failing otherwise waits an interval, then two,
      four, ... up to two hours. Every login, whoever asks, goes through one policy: at most one
      attempt a minute, none for 5 minutes after "sessions in use", none after 3 rejections within an
      hour; and a rejected access code - met by a NAT read or by the settings check - stops the NAT
@@ -1239,8 +1240,13 @@ speed and last activity (`testdata/gateway/devices_real.html` is a sanitized cap
   up to two hours while the reads keep failing. The reads' logins are counted (the gateway client's
   `LoginAttempts`, compared around each read, which holds the gateway lock): after two reads in a
   row that each needed a login - the gateway may end its sessions sooner than the client assumes -
-  the next read waits an hour, and once the reads needed 6 logins within 24 hours they pause until
-  the oldest of them is 24 hours old (`nat_problem` says so, `nat_logins` counts them). Only a
+  the next read waits an hour, and once the reads needed 6 logins within 24 hours they make no login
+  until the oldest of them is 24 hours old (`nat_logins` counts them): a read goes on in the gateway
+  client's session as long as the gateway keeps it (`contracts.WithoutGatewayLogin`: the client
+  reuses its session, or fails with `ErrGatewayLoginNeeded` before posting a login form; `nat_note`
+  says so), and once the session is gone the reads pause until a login may be made (`nat_problem`
+  says when). Pausing every read instead, as before, made the read after the pause need a login -
+  its session long gone - and use up the budget again: one read an hour for good. Only a
   login less than the client's session reuse (`gateway.SessionReuse`, 5 minutes) after the
   previous read counts for the streak: the read after the hour's wait has to log in - its session
   is long gone - and counting that login made every wait lead to the next one (one login an hour

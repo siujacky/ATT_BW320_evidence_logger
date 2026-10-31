@@ -56,9 +56,10 @@ import (
 //     (the gateway client's LoginAttempts, compared around each read): after two reads in a row
 //     that each needed one although the previous read was less than 5 minutes before (a login
 //     after a longer pause was due, and does not count), the next waits an hour, and once the
-//     reads needed connLoginBudget
-//     logins within a day they pause until the oldest of them is a day old. Those logins and a stop
-//     after a rejected access code are kept in the state folder (natStateFile), so that a restart
+//     reads needed connLoginBudget logins within a day they make no login until the oldest of
+//     them is a day old - they go on in the gateway client's session while the gateway keeps it
+//     (contracts.WithoutGatewayLogin), and pause once it is gone. Those logins and a stop after a
+//     rejected access code are kept in the state folder (natStateFile), so that a restart
 //     - even in a loop - starts with what the previous run knew. A read that keeps failing
 //     otherwise is tried again after an interval, then two, four, ... up to connFailBackoffMax.
 //   - Neither sampler reads while an incident is open or being closed, while the latest cycle was
@@ -91,8 +92,9 @@ const (
 	// with each failure in a row - an interval, two, four, ... - up to this.
 	connFailBackoffMax = 2 * time.Hour
 	// connLoginBudget is how many gateway logins the NAT reads may cause within connLoginWindow
-	// (docs/DESIGN.md §2: logins must stay rare): once they have, the reads pause until the oldest
-	// of those logins is connLoginWindow old. After connLoginStreak reads in a row that each needed
+	// (docs/DESIGN.md §2: logins must stay rare): once they have, the reads make no login until the
+	// oldest of those logins is connLoginWindow old - they go on in the gateway client's session as
+	// long as the gateway keeps it. After connLoginStreak reads in a row that each needed
 	// a login although the previous read was less than connSessionReuse before it - the gateway
 	// may end its sessions sooner than the client assumes - the next read waits connLoginStreakWait.
 	connLoginBudget     = 6
@@ -302,7 +304,12 @@ func (m *Monitor) sampleNAT(ctx context.Context) time.Time {
 		}
 		return next
 	}
-	table, raw, loggedIn, err := m.readNAT(ctx)
+	// Once the reads have used up their login budget they go on in the gateway client's session,
+	// as long as the gateway keeps it, but make no login (contracts.WithoutGatewayLogin). Pausing
+	// every read instead made the read after the pause need a login - its session long gone - and
+	// use up the budget again: one read an hour, each with a login, for good.
+	budgetEnd, logins := m.natBudgetEnd(began)
+	table, raw, loggedIn, err := m.readNAT(ctx, !budgetEnd.IsZero())
 	next = m.natLogin(began, next, loggedIn, err)
 	if ctx.Err() != nil {
 		return next // stopping: an aborted read says nothing
@@ -312,6 +319,10 @@ func (m *Monitor) sampleNAT(ctx context.Context) time.Time {
 		pending *certPendingError
 	)
 	switch {
+	case errors.Is(err, contracts.ErrGatewayLoginNeeded):
+		// No session to go on in, and no login may be made: no read until one may.
+		m.noteNATSkip(m.natBudgetWhy(logins, budgetEnd))
+		return later(next, budgetEnd)
 	case errors.Is(err, errCertConfirming):
 		m.noteNATSkip(natSkipConfirm)
 		return earlier(next, began.Add(c.busyRetry))
@@ -335,16 +346,21 @@ func (m *Monitor) sampleNAT(ctx context.Context) time.Time {
 		m.connFailed(&c.natLog, "cannot read the gateway's NAT table for the Network page", problem)
 		return due
 	}
-	m.natRead(table, raw)
+	note := ""
+	if !budgetEnd.IsZero() {
+		note = fmt.Sprintf("the NAT reads needed %d gateway logins within the last %s (at most %d): until %s they make no login, and go on in the gateway's session as long as it lasts",
+			logins, fmtWindow(connLoginWindow), connLoginBudget, fmtHuman(m.monitorTime(budgetEnd)))
+	}
+	m.natRead(table, raw, note)
 	return next
 }
 
 // natPaused says why no NAT read is made now ("" when one may be) and, for a round that left the
 // gateway to a failing cycle or stays stopped after a rejected access code, when to look again
 // (zero: at the next round): the gateway is needed for evidence (samplerHold), no access code is
-// stored, a changed certificate waits for confirmation, the reads have used up their login budget
-// (natBudgetEnd), or the access code was rejected and has not been stored anew since (for at most
-// authRetry).
+// stored, a changed certificate waits for confirmation, or the access code was rejected and has not
+// been stored anew since (for at most authRetry). A used-up login budget does not stop the reads:
+// they go on without a login (sampleNAT).
 func (m *Monitor) natPaused(now time.Time) (why string, retry time.Time) {
 	c := m.conns
 	if why := m.samplerHold(); why != "" {
@@ -359,10 +375,6 @@ func (m *Monitor) natPaused(now time.Time) (why string, retry time.Time) {
 	if m.pendingCert() != "" {
 		return natSkipCert, time.Time{}
 	}
-	if end, n := m.natBudgetEnd(now); !end.IsZero() {
-		return fmt.Sprintf("NAT reads paused: they needed %d gateway logins within the last %s (at most %d: logins must stay rare); they resume at %s",
-			n, fmtWindow(connLoginWindow), connLoginBudget, fmtHuman(m.monitorTime(end))), time.Time{}
-	}
 	var until time.Time
 	var stamp, stopWhy string
 	c.locked(func() { until, stamp, stopWhy = c.nat.stopUntil, c.nat.stopStamp, c.nat.stopWhy })
@@ -376,6 +388,13 @@ func (m *Monitor) natPaused(now time.Time) (why string, retry time.Time) {
 	m.saveNATState()
 	m.log.Info("NAT table reads for the Network page resume after the rejected access code", "code_changed", now.Before(until))
 	return "", time.Time{}
+}
+
+// natBudgetWhy says that the NAT reads, having needed n gateway logins within connLoginWindow,
+// make no read until a login may be made again (end): they have no session to go on in.
+func (m *Monitor) natBudgetWhy(n int, end time.Time) string {
+	return fmt.Sprintf("NAT reads paused: they needed %d gateway logins within the last %s (at most %d: logins must stay rare); they resume at %s",
+		n, fmtWindow(connLoginWindow), connLoginBudget, fmtHuman(m.monitorTime(end)))
 }
 
 // fmtWindow writes the login budget's window ("24 hours").
@@ -478,8 +497,9 @@ func (m *Monitor) loginAttempts() (uint64, bool) {
 // refused as busy because of a NAT read, and waits for one in progress at the gateway lock. The
 // read itself is bounded by natTimeout and stopped when the gateway is needed for evidence
 // (samplerRead: samplerHeld). loggedIn reports whether the gateway client posted a login form
-// during the read.
-func (m *Monitor) readNAT(ctx context.Context) (table model.NATTable, raw []byte, loggedIn bool, err error) {
+// during the read. With noLogin (the login budget is used up) the read may reuse the client's
+// session but makes no login (contracts.WithoutGatewayLogin).
+func (m *Monitor) readNAT(ctx context.Context, noLogin bool) (table model.NATTable, raw []byte, loggedIn bool, err error) {
 	if !m.certMu.TryRLock() {
 		return model.NATTable{}, nil, false, errCertConfirming
 	}
@@ -487,6 +507,9 @@ func (m *Monitor) readNAT(ctx context.Context) (table model.NATTable, raw []byte
 	if aerr := m.withGatewayAuth(gwUseNAT, func() {
 		before, counted := m.loginAttempts()
 		err = m.samplerRead(ctx, m.conns.natTimeout, func(rctx context.Context) error {
+			if noLogin {
+				rctx = contracts.WithoutGatewayLogin(rctx)
+			}
 			var rerr error
 			table, raw, rerr = m.gw.NATTable(rctx)
 			return rerr
@@ -596,15 +619,15 @@ func cooldownEnd(err error, policy time.Duration) time.Time {
 // copied when it is the first since the start or rows of it were not understood (copyRawPage),
 // and the status follows it - a read with nothing wrong clears the problem, and what the read
 // could not keep (rows not understood, or the read itself when the store refused it) is its note:
-// the table was read all the same.
-func (m *Monitor) natRead(table model.NATTable, raw []byte) {
+// the table was read all the same. Otherwise the note is budgetNote: the reads make no login now.
+func (m *Monitor) natRead(table model.NATTable, raw []byte, budgetNote string) {
 	c := m.conns
 	now := m.now()
 	serr := c.store.AppendNAT(now, table)
 	// A page whose totals count sessions of which no row was understood was not understood either.
 	suspect := table.Skipped > 0 || (len(table.Sessions) == 0 && table.InUse > 0)
 	copied := m.copyRawPage(&c.nat.raw, natRawFile, raw, true, suspect)
-	note := ""
+	note := budgetNote
 	switch {
 	case serr != nil:
 		note = "the connection store could not keep the newest read: " + errText(serr)
@@ -1107,7 +1130,7 @@ func (m *Monitor) connStatus() *model.ConnSamplerStatus {
 	}
 	usage := c.store.Usage()
 	now := m.now()
-	budgetEnd, logins := m.natBudgetEnd(time.Now())
+	_, logins := m.natBudgetEnd(time.Now())
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	s := &model.ConnSamplerStatus{
@@ -1130,9 +1153,10 @@ func (m *Monitor) connStatus() *model.ConnSamplerStatus {
 	if !c.dev.at.IsZero() {
 		s.DevicesAt = fmtTS(c.dev.at)
 	}
-	// The next read: the next round, or - while the reads stop after a rejected access code, or
-	// pause after using up their login budget - the end of that pause.
-	if next := later(later(c.nat.next, c.nat.stopUntil), budgetEnd); !next.IsZero() {
+	// The next read: the next round, or - while the reads stop after a rejected access code - the
+	// end of that stop. (Reads that have used up their login budget and have no session to go on in
+	// put off the next round itself until a login may be made.)
+	if next := later(c.nat.next, c.nat.stopUntil); !next.IsZero() {
 		s.NATNext = fmtTS(now.Add(time.Until(next)))
 	}
 	return s

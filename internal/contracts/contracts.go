@@ -47,7 +47,28 @@ var (
 	ErrGatewayLoginThrottled = errors.New("gateway: login throttled")
 	ErrGatewayCertRejected   = errors.New("gateway: TLS certificate rejected")
 	ErrGatewayNoAccessCode   = errors.New("gateway: no access code configured")
+	// ErrGatewayLoginNeeded: an authenticated request in a context of WithoutGatewayLogin needed
+	// a login - the client held no session to reuse, or the gateway said that it was gone - and
+	// made none.
+	ErrGatewayLoginNeeded = errors.New("gateway: a login is needed, and none may be made now")
 )
+
+// withoutLoginKey marks a context of WithoutGatewayLogin.
+type withoutLoginKey struct{}
+
+// WithoutGatewayLogin returns a context in which the gateway client's authenticated requests
+// reuse its session but never log in: one that would have to fails with ErrGatewayLoginNeeded
+// before any login form is posted. The NAT reads use it once they have used up their login
+// budget: reads in a session that the gateway keeps go on, and no login is made.
+func WithoutGatewayLogin(ctx context.Context) context.Context {
+	return context.WithValue(ctx, withoutLoginKey{}, true)
+}
+
+// GatewayLoginForbidden reports whether ctx is a context of WithoutGatewayLogin.
+func GatewayLoginForbidden(ctx context.Context) bool {
+	v, _ := ctx.Value(withoutLoginKey{}).(bool)
+	return v
+}
 
 // ------------------------------------------------------------------ ledger
 

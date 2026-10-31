@@ -21,13 +21,18 @@ import (
 // needed one make the next wait an hour, and what a run knows of them outlives it.
 
 // loginEachRead makes the fake gateway answer every NAT read with testNATTable after a login (its
-// login count raised), or - for the reads for which skip says so - in a reused session.
+// login count raised), or - for the reads for which skip says so - in a reused session. A read
+// that needs a login in a context that forbids one (contracts.WithoutGatewayLogin) fails with
+// contracts.ErrGatewayLoginNeeded instead, as the real client does.
 func loginEachRead(r *rig, skip func(n int) bool) {
 	var n atomic.Int64
 	r.gw.mu.Lock()
 	defer r.gw.mu.Unlock()
-	r.gw.natCtx = func(context.Context) (model.NATTable, []byte, error) {
+	r.gw.natCtx = func(ctx context.Context) (model.NATTable, []byte, error) {
 		if i := int(n.Add(1)); skip == nil || !skip(i) {
+			if contracts.GatewayLoginForbidden(ctx) {
+				return model.NATTable{}, nil, fmt.Errorf("gateway: GET nattable.ha: the session is gone: %w", contracts.ErrGatewayLoginNeeded)
+			}
 			r.gw.logins.Add(1)
 		}
 		return testNATTable(), testNATPage, nil
@@ -60,12 +65,14 @@ func TestNATSamplerBacksOffFailures(t *testing.T) {
 	wantNext(t, "a failure after a read that worked", began, r.m.sampleNAT(ctx), interval)
 }
 
-// TestNATSamplerLoginBudget: once the NAT reads needed 6 gateway logins within a day, the rounds
-// make no read - they say why, and the status says when the reads resume and how many logins they
-// needed - until the oldest of those logins is a day old.
+// TestNATSamplerLoginBudget: once the NAT reads needed 6 gateway logins within a day they make no
+// login until the oldest of those logins is a day old: a read in the session that the gateway
+// keeps goes on (the status counts the logins and notes that none is made), and a read that would
+// need one makes none, says why and puts the next round off until a login may be made.
 func TestNATSamplerLoginBudget(t *testing.T) {
 	ctx := context.Background()
-	r, store := connRig(t, func(c *config.Config) { c.Connections.Interval = config.D(4 * time.Minute) })
+	const interval = 4 * time.Minute
+	r, store := connRig(t, func(c *config.Config) { c.Connections.Interval = config.D(interval) })
 	// A login every other read: no two in a row, so only the budget stops them.
 	loginEachRead(r, func(n int) bool { return n%2 == 0 })
 	for range 2*connLoginBudget - 1 {
@@ -78,23 +85,41 @@ func TestNATSamplerLoginBudget(t *testing.T) {
 	if st.NATLogins != connLoginBudget || st.NATProblem != "" {
 		t.Fatalf("status %+v after %d logins", st, connLoginBudget)
 	}
+	// Read 12 is made in read 11's session: it goes on.
 	began := time.Now()
-	next := r.m.sampleNAT(ctx)
-	if n := natCalls(r); n != 2*connLoginBudget-1 {
-		t.Fatalf("read with the login budget used up (%d reads)", n)
+	wantNext(t, "a read in the session with the budget used up", began, r.m.sampleNAT(ctx), interval)
+	if nat, _ := store.reads(); natCalls(r) != 2*connLoginBudget || len(nat) != 2*connLoginBudget {
+		t.Fatalf("%d reads, %d appended: the read in the session did not go on", natCalls(r), len(nat))
 	}
-	wantNext(t, "a round with the budget used up", began, next, 4*time.Minute)
 	st = connStatus(t, r)
-	mustContain(t, "the problem", st.NATProblem, "NAT reads paused: they needed 6 gateway logins within the last 24 hours (at most 6",
-		"they resume at ")
-	if at, ok := parseTS(st.NATNext); !ok || at.Sub(began.Add(connLoginWindow)).Abs() > time.Minute {
-		t.Fatalf("the next read %q, want a day after the first login", st.NATNext)
+	if st.NATLogins != connLoginBudget || st.NATProblem != "" {
+		t.Fatalf("status %+v after the read in the session", st)
 	}
-	// A day after the first login the reads resume.
+	mustContain(t, "the note", st.NATNote, "the NAT reads needed 6 gateway logins within the last 24 hours (at most 6): until ",
+		"they make no login")
+	// Read 13 would need a login: it makes none, and the next round waits until one may be made.
+	began = time.Now()
+	next := r.m.sampleNAT(ctx)
+	if nat, _ := store.reads(); len(nat) != 2*connLoginBudget || r.gw.logins.Load() != connLoginBudget {
+		t.Fatalf("%d appended, %d logins after a read that would have needed a login", len(nat), r.gw.logins.Load())
+	}
+	var oldest time.Time
+	r.m.conns.locked(func() { oldest = r.m.conns.nat.logins[0] })
+	if want := oldest.Add(connLoginWindow); next.Sub(want).Abs() > time.Second {
+		t.Fatalf("the next round at %v, want %v: a day after the first login", next, want)
+	}
+	mustContain(t, "the problem", natProblem(r), "NAT reads paused: they needed 6 gateway logins within the last 24 hours (at most 6",
+		"they resume at ")
+	// A day after the first login the reads may log in again: read 14 in the session, read 15 with
+	// a login.
 	r.m.conns.locked(func() { r.m.conns.nat.logins[0] = time.Now().Add(-connLoginWindow) })
 	r.m.sampleNAT(ctx)
-	if nat, _ := store.reads(); natCalls(r) != 2*connLoginBudget || len(nat) != 2*connLoginBudget {
-		t.Fatalf("%d reads, %d appended, once the oldest login is a day old", natCalls(r), len(nat))
+	r.m.sampleNAT(ctx)
+	if nat, _ := store.reads(); len(nat) != 2*connLoginBudget+2 || r.gw.logins.Load() != connLoginBudget+1 {
+		t.Fatalf("%d appended, %d logins once the oldest login is a day old", len(nat), r.gw.logins.Load())
+	}
+	if p := natProblem(r); p != "" {
+		t.Fatalf("problem %q after the reads resumed", p)
 	}
 }
 

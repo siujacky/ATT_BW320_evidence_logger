@@ -1016,7 +1016,7 @@ func TestNATReadNeverUsesAnUnrecordedPin(t *testing.T) {
 		// lock, which the read would wait for in withGatewayAuth: it must be refused before that.
 		read := make(chan error, 1)
 		go func() {
-			_, _, _, err := r.m.readNAT(ctx)
+			_, _, _, err := r.m.readNAT(ctx, false)
 			read <- err
 		}()
 		if err := await(t, "a NAT read during the confirmation, which must not wait for it", read); !errors.Is(err, errCertConfirming) {

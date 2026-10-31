@@ -195,15 +195,19 @@ func (g *realGateway) NATTable(ctx context.Context) (model.NATTable, []byte, err
 func (g *realGateway) LoginAttempts() uint64 { return g.c.LoginAttempts() }
 
 // realRig is a rig whose gateway client is the real one (code: its access code; policy, when not
-// nil, the login policy it restores and saves), talking to srv, with a connection store; the
-// monitor keeps its state in stateDir and records in led (nil: a new ledger).
-func realRig(t *testing.T, srv *httptest.Server, code string, policy *gateway.LoginPolicy, stateDir string, led *fakeLedger) *rig {
+// nil, the login policy it restores and saves; mods change its options), talking to srv, with a
+// connection store; the monitor keeps its state in stateDir and records in led (nil: a new ledger).
+func realRig(t *testing.T, srv *httptest.Server, code string, policy *gateway.LoginPolicy, stateDir string, led *fakeLedger,
+	mods ...func(*gateway.Options)) *rig {
 	t.Helper()
 	opts := gateway.Options{Host: strings.TrimPrefix(srv.URL, "http://"), Scheme: "http", Timeout: 5 * time.Second,
 		AccessCode: func() (string, error) { return code, nil }}
 	if policy != nil {
 		opts.LoginPolicy = *policy
 		opts.OnLoginPolicy = func(p gateway.LoginPolicy) { *policy = p }
+	}
+	for _, mod := range mods {
+		mod(&opts)
 	}
 	c := testConfig()
 	c.Gateway.EnforceNotificationOff = true
@@ -264,6 +268,85 @@ func TestNATFailureAmongTheSettingsRequests(t *testing.T) {
 		if result != "verified" || on || g.posts() != 1 {
 			t.Fatalf("NAT status %d: the change %q, redirect still on %v, %d logins", status, result, on, g.posts())
 		}
+	}
+}
+
+// TestNATBudgetUsedUpGoesOnInTheSession: with the login budget used up, the NAT reads go on in the
+// real gateway client's session without posting a login form; once the gateway has forgotten the
+// session they stop without one - the next round waits until the oldest login of the budget is a
+// day old, and a round meanwhile sends nothing - and then log in again.
+func TestNATBudgetUsedUpGoesOnInTheSession(t *testing.T) {
+	g, srv := newLoginGateway(t, false)
+	// The client's clock stands still (its session stays reusable) unless the test moves it.
+	var clockMu sync.Mutex
+	clock := time.Now()
+	r := realRig(t, srv, gwTestCode, nil, "", nil, func(o *gateway.Options) {
+		o.Now = func() time.Time {
+			clockMu.Lock()
+			defer clockMu.Unlock()
+			return clock
+		}
+	})
+	ctx := context.Background()
+	natGets := func() int {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		n := 0
+		for _, q := range g.requests {
+			if q == "GET /cgi-bin/nattable.ha" {
+				n++
+			}
+		}
+		return n
+	}
+	r.m.sampleNAT(ctx) // the first read logs in
+	if g.posts() != 1 {
+		t.Fatalf("%d login forms for the first read", g.posts())
+	}
+	// Five logins before it, an hour apart: the budget is used up.
+	now := time.Now()
+	r.m.conns.locked(func() {
+		var before []time.Time
+		for i := connLoginBudget - 1; i > 0; i-- {
+			before = append(before, now.Add(-time.Duration(i)*time.Hour))
+		}
+		r.m.conns.nat.logins = append(before, r.m.conns.nat.logins...)
+	})
+	gets := natGets()
+	began := time.Now()
+	wantNext(t, "a read in the session", began, r.m.sampleNAT(ctx), 4*time.Minute)
+	if g.posts() != 1 || natGets() != gets+1 || natProblem(r) != "" {
+		t.Fatalf("%d login forms, %d NAT GETs, problem %q: want the session reused", g.posts(), natGets()-gets, natProblem(r))
+	}
+	// The gateway forgets its sessions: the next read finds the login page and posts no form.
+	g.mu.Lock()
+	g.sessions = map[string]*loginSession{}
+	g.mu.Unlock()
+	next := r.m.sampleNAT(ctx)
+	var oldest time.Time
+	r.m.conns.locked(func() { oldest = r.m.conns.nat.logins[0] })
+	if want := oldest.Add(connLoginWindow); next.Sub(want).Abs() > time.Second {
+		t.Fatalf("the next round at %v, want %v", next, want)
+	}
+	if g.posts() != 1 {
+		t.Fatalf("%d login forms with the budget used up", g.posts())
+	}
+	mustContain(t, "the problem", natProblem(r), "NAT reads paused: they needed 6 gateway logins")
+	// Without a session, a round sends nothing at all.
+	gets = natGets()
+	r.m.sampleNAT(ctx)
+	if natGets() != gets || g.posts() != 1 {
+		t.Fatalf("a round without a session sent %d NAT GETs and %d login forms", natGets()-gets, g.posts()-1)
+	}
+	// Once the oldest login is a day old (and the client's one-a-minute limit is past), the next
+	// read logs in.
+	r.m.conns.locked(func() { r.m.conns.nat.logins[0] = time.Now().Add(-connLoginWindow) })
+	clockMu.Lock()
+	clock = clock.Add(2 * time.Minute)
+	clockMu.Unlock()
+	r.m.sampleNAT(ctx)
+	if g.posts() != 2 || natProblem(r) != "" {
+		t.Fatalf("%d login forms, problem %q once a login may be made again; want 2 and none", g.posts(), natProblem(r))
 	}
 }
 

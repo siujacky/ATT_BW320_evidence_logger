@@ -323,6 +323,10 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 // the caller gave up: the session works; touch). A request that got no answer at all changes
 // nothing: the session ages out sessionReuse after its last use. The answer that came with such
 // an error is returned with it (body), for the caller to look at.
+//
+// In a context of contracts.WithoutGatewayLogin no login is made: without a session to reuse, or
+// when the gateway says that it is gone, the request fails with contracts.ErrGatewayLoginNeeded
+// (the NAT reads, once they have used up their login budget).
 func (c *Client) authPage(ctx context.Context, page string) (s *authSession, body []byte, err error) {
 	limit := c.bodyCap(page)
 	if s := c.reusableSession(); s != nil {
@@ -335,8 +339,13 @@ func (c *Client) authPage(ctx context.Context, page string) (s *authSession, bod
 		case p.sessionsFull():
 			return nil, nil, c.noteSessionsFull()
 		case p.isLogin(), isLoginRedirect(ex):
-			c.log.Debug("gateway session no longer valid; logging in again", "page", page, "status", ex.status, "login_page", p.isLogin())
 			c.dropSession()
+			if contracts.GatewayLoginForbidden(ctx) {
+				c.log.Debug("gateway session no longer valid; no login may be made now", "page", page, "status", ex.status,
+					"login_page", p.isLogin())
+				return nil, nil, fmt.Errorf("gateway: GET %s.ha: the session is gone: %w", page, contracts.ErrGatewayLoginNeeded)
+			}
+			c.log.Debug("gateway session no longer valid; logging in again", "page", page, "status", ex.status, "login_page", p.isLogin())
 			return c.login(ctx, page)
 		case ex.status != http.StatusOK:
 			c.keep(s)
@@ -349,6 +358,9 @@ func (c *Client) authPage(ctx context.Context, page string) (s *authSession, bod
 		}
 		c.touch(s)
 		return s, ex.body, nil
+	}
+	if contracts.GatewayLoginForbidden(ctx) {
+		return nil, nil, fmt.Errorf("gateway: GET %s.ha: no session to reuse: %w", page, contracts.ErrGatewayLoginNeeded)
 	}
 	return c.login(ctx, page)
 }
