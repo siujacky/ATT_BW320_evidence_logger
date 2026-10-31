@@ -20,6 +20,7 @@ import (
 	"attmonitor/internal/export"
 	"attmonitor/internal/gateway"
 	"attmonitor/internal/ipintel"
+	"attmonitor/internal/lanscan"
 	"attmonitor/internal/ledger"
 	"attmonitor/internal/model"
 	"attmonitor/internal/mongostore"
@@ -64,11 +65,13 @@ type stack struct {
 	// modes only (all nil in the CLI, which reads the page through the running service's API):
 	// conns is the connection store the monitor's samplers write (nil when it cannot be opened),
 	// intel the offline IP database (runMonitor runs it), network the view the dashboard asks,
-	// built over both and the syslog store. None of it is evidence: nothing of it reaches the
-	// ledger, the MongoDB copy or an evidence bundle.
+	// built over both and the syslog store, and scanner the sweeps of the home network by ARP
+	// (docs/dhcp-table.md §6) the monitor makes into the connection store. None of it is evidence:
+	// nothing of it reaches the ledger, the MongoDB copy or an evidence bundle.
 	conns   *connstore.Store
 	intel   *ipintel.DB
 	network *netmap.View
+	scanner *lanscan.Scanner
 }
 
 type stackOptions struct {
@@ -225,6 +228,8 @@ func openStack(o stackOptions) (*stack, error) {
 		Syslog:      s.syslogReceiver(),
 		SyslogStore: s.syslogWriter(),
 		Conns:       s.connStore(),
+		Scanner:     s.lanScanner(),
+		Scans:       s.scanStore(),
 	})
 	if err != nil {
 		s.close()
@@ -358,7 +363,9 @@ func (s *stack) syslogChunks() contracts.SyslogChunkSource {
 // - nothing would otherwise ever delete the oldest samples. The IP database is opened also with
 // geo.enabled off: it then only classifies addresses and names ports, and its status tells the
 // page why organisations and countries are missing.
-// Open reads nothing and downloads nothing; runMonitor runs it.
+// Open reads nothing and downloads nothing; runMonitor runs it. The LAN scanner of the network
+// that holds gateway.host sends nothing either: the monitor sweeps every connections.scan_interval
+// (0: never), and keeps the sweeps in the connection store, from which the Devices view reads them.
 func (s *stack) openNetwork() {
 	cc, gc := s.cfg.Connections, s.cfg.Geo
 	clg := s.log.With("component", "connections")
@@ -387,11 +394,15 @@ func (s *stack) openNetwork() {
 	} else {
 		s.intel = db
 	}
+	s.scanner = lanscan.New(lanscan.Options{Gateway: s.cfg.Gateway.Host, Logger: s.log.With("component", "lanscan")})
 	s.network = netmap.New(netmap.Options{
 		Conns:  s.connStore(),
 		Intel:  s.ipIntel(),
 		Syslog: s.syslogChunks(),
-		Logger: s.log.With("component", "network"),
+		Scans:  s.scanStore(),
+		// The gateway's own answer to a LAN scan counts for nobody (not an unknown address).
+		Gateway: gw,
+		Logger:  s.log.With("component", "network"),
 	})
 }
 
@@ -402,6 +413,23 @@ func (s *stack) connStore() contracts.ConnStore {
 		return nil
 	}
 	return s.conns
+}
+
+// scanStore is the connection store as the keeper of the LAN scans, for the monitor and the network
+// view (nil, an untyped nil, when there is none).
+func (s *stack) scanStore() contracts.ScanStore {
+	if s.conns == nil {
+		return nil
+	}
+	return s.conns
+}
+
+// lanScanner is the sweeper of the home network for the monitor (nil, an untyped nil, in the CLI).
+func (s *stack) lanScanner() contracts.LANScanner {
+	if s.scanner == nil {
+		return nil
+	}
+	return s.scanner
 }
 
 // ipIntel is the IP database for the network view (nil, an untyped nil, when there is none).

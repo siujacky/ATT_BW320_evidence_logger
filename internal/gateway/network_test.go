@@ -66,28 +66,29 @@ var wantNATSynthetic = model.NATTable{
 // wantRealDevices is testdata/gateway/devices_real.html parsed. The IPv6 addresses are in
 // canonical form ("2001:db8:0::100" on the page); no Connection keeps the Wi-Fi network's name
 // ("ATT-EXAMPLE"), and the first device's Connection Speed - the bare template "Mbps duplex" of
-// an Ethernet port that is down - is empty.
+// an Ethernet port that is down - is empty. The Wi-Fi devices that are on have their signal drawn
+// (an image whose text is "Wi-Fi 5 bars"); those that are off have none.
 var wantRealDevices = []model.LANDevice{
 	{MAC: "00:00:5e:00:53:01", Name: "office-pc", LastActivity: "Mon Oct 5 12:01:00 2026", Status: "off",
 		Allocation: "dhcp", Connection: "Ethernet LAN-1"},
 	{MAC: "00:00:5e:00:53:02", Name: "laptop", IPv4: "192.168.1.101",
 		IPv6:         []string{"2001:db8::100", "2001:db8:1::101", "2001:db8:2::102", "fe80::1003"},
-		LastActivity: "Mon Oct 5 12:02:00 2026", Status: "on", Allocation: "dhcp", Connection: "Wi-Fi 5 GHz"},
+		LastActivity: "Mon Oct 5 12:02:00 2026", Status: "on", Allocation: "dhcp", Connection: "Wi-Fi 5 GHz", Signal: 5},
 	{MAC: "00:00:5e:00:53:03", Name: "phone", IPv4: "192.168.1.102", LastActivity: "Mon Oct 5 12:03:00 2026",
 		Status: "off", Allocation: "dhcp", Connection: "Wi-Fi 5 GHz"},
 	{MAC: "00:00:5e:00:53:04", Name: "living-room-tv", IPv4: "192.168.1.103", LastActivity: "Mon Oct 5 12:04:00 2026",
 		Status: "off", Allocation: "dhcp", Connection: "Wi-Fi 2.4 GHz"},
 	{MAC: "00:00:5e:00:53:05", Name: "tablet", IPv4: "192.168.1.104",
 		IPv6:         []string{"2001:db8::104", "2001:db8:1::105", "2001:db8:2::106", "fe80::1007"},
-		LastActivity: "Mon Oct 5 12:05:00 2026", Status: "on", Allocation: "dhcp", Connection: "Wi-Fi 5 GHz"},
+		LastActivity: "Mon Oct 5 12:05:00 2026", Status: "on", Allocation: "dhcp", Connection: "Wi-Fi 5 GHz", Signal: 4},
 	{MAC: "00:00:5e:00:53:06", Name: "printer", LastActivity: "Mon Oct 5 12:06:00 2026", Status: "off",
 		Allocation: "dhcp", Connection: "Wi-Fi 5 GHz"},
 	{MAC: "00:00:5e:00:53:07", Name: "thermostat", IPv4: "192.168.1.105",
 		IPv6:         []string{"2001:db8::108", "2001:db8:1::109", "2001:db8:2::10a", "fe80::100b"},
-		LastActivity: "Mon Oct 5 12:07:00 2026", Status: "on", Allocation: "dhcp", Connection: "Wi-Fi 5 GHz"},
+		LastActivity: "Mon Oct 5 12:07:00 2026", Status: "on", Allocation: "dhcp", Connection: "Wi-Fi 5 GHz", Signal: 4},
 	{MAC: "00:00:5e:00:53:08", Name: "game-console", IPv4: "192.168.1.106",
 		IPv6:         []string{"2001:db8::10c", "2001:db8:1::10d"},
-		LastActivity: "Mon Oct 5 12:08:00 2026", Status: "on", Allocation: "dhcp", Connection: "Wi-Fi 5 GHz"},
+		LastActivity: "Mon Oct 5 12:08:00 2026", Status: "on", Allocation: "dhcp", Connection: "Wi-Fi 5 GHz", Signal: 3},
 }
 
 // compareNAT reports every difference between two NAT tables, session by session.
@@ -638,6 +639,15 @@ func TestParseDevicesVariants(t *testing.T) {
 		out[i] = d
 		return out
 	}
+	// withSignals is the capture with these signals for the Wi-Fi devices that are on (laptop,
+	// tablet, thermostat, game-console).
+	withSignals := func(laptop, tablet, thermostat, console int) []model.LANDevice {
+		out := append([]model.LANDevice(nil), wantRealDevices...)
+		for i, n := range map[int]int{1: laptop, 4: tablet, 6: thermostat, 7: console} {
+			out[i].Signal = n
+		}
+		return out
+	}
 	tests := []devicesVariant{
 		{"CRLF", func(t *testing.T, b []byte) []byte { return bytes.ReplaceAll(b, []byte("\n"), []byte("\r\n")) }, wantRealDevices},
 		{"CR", func(t *testing.T, b []byte) []byte { return bytes.ReplaceAll(b, []byte("\n"), []byte("\r")) }, wantRealDevices},
@@ -692,6 +702,33 @@ func TestParseDevicesVariants(t *testing.T) {
 		}, wantRealDevices},
 		{"a network name that reads like a band or a port", func(t *testing.T, b []byte) []byte {
 			return sub(t, b, `Name: ATT-EXAMPLE`, `Name: 6 GHz Ethernet LAN-9 Wi-Fi`)
+		}, wantRealDevices},
+		{"signal images without their text: the file names give the bars", func(t *testing.T, b []byte) []byte {
+			return sub(t, b, ` alt="Wi-Fi \d bars"`, "")
+		}, wantRealDevices},
+		{"signal images with an empty text", func(t *testing.T, b []byte) []byte {
+			return sub(t, b, `alt="Wi-Fi \d bars"`, `alt=""`)
+		}, wantRealDevices},
+		{"signal images in upper case and unquoted", func(t *testing.T, b []byte) []byte {
+			return sub(t, b, `<img src="(/images/signal-strength-\d-bar\.png)" alt="Wi-Fi (\d) bars" />`, `<IMG SRC=$1 ALT="WI-FI $2 BARS">`)
+		}, wantRealDevices},
+		{"a signal image's text in other words, which wins over its file name", func(t *testing.T, b []byte) []byte {
+			return sub(t, b, `alt="Wi-Fi 5 bars"`, `alt="Signal: 1 bar"`)
+		}, withDevice(1, func(d *model.LANDevice) { d.Signal = 1 })},
+		{"a number of bars the page never draws", func(t *testing.T, b []byte) []byte {
+			return sub(t, b, `alt="Wi-Fi 5 bars"`, `alt="Wi-Fi 9 bars"`)
+		}, withDevice(1, func(d *model.LANDevice) { d.Signal = 0 })},
+		{"images that draw no signal", func(t *testing.T, b []byte) []byte {
+			return sub(t, b, `<img src="/images/signal-strength-\d-bar\.png" alt="Wi-Fi \d bars" />`, `<img src="/images/wifi.png" alt="Wi-Fi" />`)
+		}, withSignals(0, 0, 0, 0)},
+		{"an image that draws nothing before the signal", func(t *testing.T, b []byte) []byte {
+			return sub(t, b, `Wi-Fi <img src="/images/signal-strength-5-bar\.png"`, `Wi-Fi <img src="/images/spacer.gif" alt="" /><img src="/images/signal-strength-5-bar.png"`)
+		}, wantRealDevices},
+		{"a second signal image in the cell", func(t *testing.T, b []byte) []byte {
+			return sub(t, b, `alt="Wi-Fi 5 bars" />`, `alt="Wi-Fi 5 bars" /><img src="/images/signal-strength-1-bar.png" alt="Wi-Fi 1 bars" />`)
+		}, wantRealDevices},
+		{"a signal image outside the Connection Type cell", func(t *testing.T, b []byte) []byte {
+			return sub(t, b, "\nMon Oct 5 12:01:00 2026\n", "\nMon Oct 5 12:01:00 2026 <img src=\"/images/signal-strength-2-bar.png\" alt=\"Wi-Fi 2 bars\" />\n")
 		}, wantRealDevices},
 		{"a block that names no device", func(t *testing.T, b []byte) []byte {
 			return sub(t, b, ruleRow+secondMAC, ruleRow+`<tr><th scope="row">Status</th><td>on</td></tr>`+
@@ -785,6 +822,40 @@ func TestConnectionSummary(t *testing.T) {
 	for _, tt := range tests {
 		if got := connectionSummary(tt.lines); got != tt.want {
 			t.Errorf("connectionSummary(%q) = %q, want %q", tt.lines, got, tt.want)
+		}
+	}
+}
+
+// TestWiFiBars: the bars of a signal image, from its text, else its file name; 0 for an image
+// that draws no signal, and for a number of bars the page never draws.
+func TestWiFiBars(t *testing.T) {
+	for _, tt := range []struct {
+		alt, src string
+		want     int
+	}{
+		{"Wi-Fi 5 bars", "/images/signal-strength-5-bar.png", 5},
+		{"Wi-Fi 4 bars", "/images/signal-strength-4-bar.png", 4},
+		{"Wi-Fi 1 bar", "", 1},
+		{"WI-FI 2 BARS", "", 2},
+		{"Signal: 3-bar", "", 3},
+		{"wifi 2bars", "", 2},
+		{"Wi-Fi 3 bars", "/images/signal-strength-5-bar.png", 3}, // the text wins
+		{"", "/images/signal-strength-2-bar.png", 2},
+		{"", "/images/Signal_Strength_1_Bars.GIF", 1},
+		{"Wi-Fi", "/images/signal-strength-4-bar.png", 4}, // a text without bars: the file name
+		{"", "signal-strength-3-bar.png?v=2", 3},
+		{"Wi-Fi 0 bars", "", 0},
+		{"Wi-Fi 6 bars", "/images/signal-strength-5-bar.png", 0}, // the text says what the page never draws
+		{"Wi-Fi 12 bars", "", 0},
+		{"Wi-Fi 123 bars", "", 0},
+		{"5 GHz", "/images/wifi.png", 0},
+		{"", "/images/signal-strength-9-bar.png", 0},
+		{"", "/images/att_logo.png", 0},
+		{"crowbars 5", "", 0},
+		{"", "", 0},
+	} {
+		if got := wifiBars(tt.alt, tt.src); got != tt.want {
+			t.Errorf("wifiBars(%q, %q) = %d, want %d", tt.alt, tt.src, got, tt.want)
 		}
 	}
 }

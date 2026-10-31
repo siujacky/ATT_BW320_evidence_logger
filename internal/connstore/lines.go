@@ -43,6 +43,13 @@ type devLine struct {
 	Devices []model.LANDevice `json:"devices"`
 }
 
+// scanLine is one LAN scan as a line of a scan- file: "t", when the sweep began, then the scan's
+// own members (model.LANScan's JSON, whose "at" is t again).
+type scanLine struct {
+	T string `json:"t"`
+	model.LANScan
+}
+
 // errLineTooLong is returned for a read whose line would exceed maxLine.
 var errLineTooLong = fmt.Errorf("connstore: a read takes more than %d MiB as a line", maxLine>>20)
 
@@ -71,6 +78,16 @@ func encodeDevices(t time.Time, devices []model.LANDevice) ([]byte, error) {
 	l := devLine{T: formatTime(t), Devices: devices}
 	if l.Devices == nil {
 		l.Devices = []model.LANDevice{}
+	}
+	return marshalLine(&l)
+}
+
+// encodeScan encodes the LAN scan begun at t as a line (with its line feed); its "at" is t.
+func encodeScan(t time.Time, scan model.LANScan) ([]byte, error) {
+	l := scanLine{T: formatTime(t), LANScan: scan}
+	l.At = l.T
+	if l.Hosts == nil {
+		l.Hosts = []model.LANHost{}
 	}
 	return marshalLine(&l)
 }
@@ -229,6 +246,23 @@ func decodeDevices(line []byte) (time.Time, []model.LANDevice, error) {
 		l.Devices = []model.LANDevice{}
 	}
 	return t, l.Devices, nil
+}
+
+// decodeScan decodes a scan line (without its line feed). The scan's At is the line's time.
+func decodeScan(line []byte) (time.Time, model.LANScan, error) {
+	var l scanLine
+	if err := json.Unmarshal(line, &l); err != nil {
+		return time.Time{}, model.LANScan{}, err
+	}
+	t, ok := parseTime(l.T)
+	if !ok {
+		return time.Time{}, model.LANScan{}, errors.New("the scan's time is missing or not valid")
+	}
+	l.At = formatTime(t)
+	if l.Hosts == nil {
+		l.Hosts = []model.LANHost{}
+	}
+	return t, l.LANScan, nil
 }
 
 // timePrefix is how every line the store writes begins: its "t" member comes first.

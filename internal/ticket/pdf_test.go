@@ -14,7 +14,7 @@ import (
 )
 
 func TestFileURL(t *testing.T) {
-	if got := fileURL(`C:\Users\Dell\AppData\Local\Temp\a b\ticket.html`); filepath.Separator == '\\' && got != "file:///C:/Users/Dell/AppData/Local/Temp/a%20b/ticket.html" {
+	if got := fileURL(`C:\Users\owner\AppData\Local\Temp\a b\ticket.html`); filepath.Separator == '\\' && got != "file:///C:/Users/owner/AppData/Local/Temp/a%20b/ticket.html" {
 		t.Errorf("fileURL = %q", got)
 	}
 	if got := fileURL("/tmp/x#1.html"); !strings.HasPrefix(got, "file:///") || strings.Contains(got, "#") {

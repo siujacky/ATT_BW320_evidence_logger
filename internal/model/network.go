@@ -52,6 +52,10 @@ type LANDevice struct {
 	Speed        string `json:"speed,omitempty"`         // "Connection Speed", as shown ("" when it holds no number)
 	Mesh         bool   `json:"mesh,omitempty"`          // "Mesh Client" is "Yes"
 	LastActivity string `json:"last_activity,omitempty"` // as shown (the gateway's local time)
+	// Signal is the Wi-Fi signal the page draws for a wireless device, in bars (1-5, from its
+	// signal image's text "Wi-Fi N bars"); 0 when the page shows none (a wired device, or a device
+	// that is off). Reads stored before the field existed have none either.
+	Signal int `json:"signal,omitempty"`
 }
 
 // ------------------------------------------------------------------ connection store
@@ -86,6 +90,10 @@ type ConnDevice struct {
 	// distinct flows than the connection store counts singly (ConnAggregate.FlowsLeftOut) leaves
 	// out the lightest.
 	LeftOut int `json:"left_out,omitempty"`
+	// Open counts its sessions in the newest NAT read of the period (0 when that read showed none
+	// of its): the Devices tab's connections open now. With a device filter it is
+	// ConnAggregate.OpenDevice.
+	Open int `json:"open,omitempty"`
 }
 
 // ConnFlow is one (device, remote address, port, protocol, direction) of the NAT samples of a period.
@@ -208,6 +216,15 @@ type ConnSamplerStatus struct {
 	DevicesAt      string `json:"devices_at,omitempty"`
 	Devices        int    `json:"devices"`
 	DevicesProblem string `json:"devices_problem,omitempty"`
+	// The LAN scan (docs/dhcp-table.md §6): ScanInterval is the configured interval ("" when the
+	// scans are off); ScanAt is when the newest scan that worked began and ScanHosts how many
+	// addresses answered it; ScanProblem says why the newest attempt failed or was not made
+	// ("" when it worked); ScanNext is when the next is due.
+	ScanInterval string `json:"scan_interval,omitempty"`
+	ScanAt       string `json:"scan_at,omitempty"`
+	ScanHosts    int    `json:"scan_hosts"`
+	ScanProblem  string `json:"scan_problem,omitempty"`
+	ScanNext     string `json:"scan_next,omitempty"`
 	// Store is the connection store's volume and limits (nil without a store).
 	Store *ConnStoreUsage `json:"store,omitempty"`
 }
@@ -441,4 +458,222 @@ type NetworkStatus struct {
 	// that the service could not use as written, each with what it uses instead (config.Warnings;
 	// left out when there is none). They never keep the service from starting.
 	ConfigWarnings []string `json:"config_warnings,omitempty"`
+}
+
+// ------------------------------------------------------------------ the Network page's Devices tab
+
+// Issue levels of a NetIssue.
+const (
+	IssueCritical = "critical" // something is wrong and needs attention (an address two devices claim)
+	IssueWarning  = "warning"  // worth a look (weak Wi-Fi, a slow link, many blocked packets)
+	IssueInfo     = "info"     // a fact that explains other figures (off, a changed address)
+)
+
+// Issue codes of a NetIssue.
+const (
+	IssueAddressShared  = "address_shared"  // another device claims the same IPv4 address in the newest Device List read
+	IssueAddressChanged = "address_changed" // the device held more than one IPv4 address in the period
+	IssueOffline        = "offline"         // the newest Device List read shows the device off
+	IssueWeakWiFi       = "weak_wifi"       // the gateway draws its Wi-Fi signal with 2 bars or fewer
+	IssueSlowLink       = "slow_link"       // a wired link at 10 Mb/s or at half duplex
+	IssueBlocked        = "blocked"         // the gateway's firewall dropped many of its packets in the period
+	IssueUnlisted       = "unlisted"        // a LAN address seen in the NAT table, the firewall or a LAN scan that no Device List read names
+	IssueNoAnswer       = "no_answer"       // the gateway shows the device on, but it did not answer the newest LAN scan
+	IssueScanMAC        = "scan_mac"        // the newest LAN scan found the device's IPv4 address answered by another MAC address
+	IssueScanAddr       = "scan_addr"       // the device answered the newest LAN scan at another IPv4 address than the gateway lists
+)
+
+// NetIssue is one thing worth knowing about a device or an address, in plain words.
+type NetIssue struct {
+	Code  string `json:"code"`
+	Level string `json:"level"`
+	Text  string `json:"text"` // e.g. "192.168.1.71 is also claimed by laptop (00:00:5e:00:53:02)"
+}
+
+// NetLANDevice is one device of the gateway's Device List - its DHCP table - as the newest read
+// shows it, with what the period's samples say about it. An entry without a MAC address is keyed
+// "ip:" and its IPv4 address, else its first IPv6 address (the key the Connections tab knows it
+// by), or "name:<name>" when it gives no address either; a key the newest read gives twice ends
+// in "#2", "#3", ... from its second entry on, so that every key of the list is unique.
+type NetLANDevice struct {
+	Key          string   `json:"key"` // "mac:<mac>", or "ip:<address>" when the list gives no MAC
+	Name         string   `json:"name,omitempty"`
+	MAC          string   `json:"mac,omitempty"`
+	IPv4         string   `json:"ipv4,omitempty"`
+	IPv6         []string `json:"ipv6,omitempty"`
+	Status       string   `json:"status,omitempty"`     // "on" or "off", as the newest read shows it
+	Allocation   string   `json:"allocation,omitempty"` // "dhcp" or "static", as shown
+	Connection   string   `json:"connection,omitempty"` // "Ethernet LAN-1", "Wi-Fi 5 GHz", ...
+	Speed        string   `json:"speed,omitempty"`
+	Signal       int      `json:"signal,omitempty"` // Wi-Fi bars 1-5 (0: none shown)
+	Mesh         bool     `json:"mesh,omitempty"`
+	LastActivity string   `json:"last_activity,omitempty"` // as the gateway shows it
+	// Seen is when the newest read that showed the device on was made (RFC 3339 UTC; "" when no
+	// read of the period showed it on); OnReads and Reads count the period's Device List reads
+	// that showed it on and that listed it at all.
+	Seen    string `json:"seen,omitempty"`
+	OnReads int    `json:"on_reads"`
+	Reads   int    `json:"reads"`
+	// Addresses are the IPv4 addresses the device held in the period, newest first.
+	Addresses []string `json:"addresses,omitempty"`
+	// Open: its sessions in the period's newest NAT read (NetDevicesView.NATAt); Sites: the
+	// distinct remote addresses it reached in the period (the connection samples).
+	Open  int `json:"open"`
+	Sites int `json:"sites"`
+	// Blocked: the packets it sent that the gateway's firewall dropped in the period; BlockedIn:
+	// the dropped packets from the Internet addressed to it (the syslog).
+	Blocked   int `json:"blocked"`
+	BlockedIn int `json:"blocked_in"`
+	// The period's LAN scans (NetDevicesView.Scans): ScanAddr is the IPv4 address it answered the
+	// newest of them at ("" when it did not answer it), ScanSeen when it last answered one (""
+	// when it answered none) and ScanHits how many of them it answered.
+	ScanAddr string     `json:"scan_addr,omitempty"`
+	ScanSeen string     `json:"scan_seen,omitempty"`
+	ScanHits int        `json:"scan_hits"`
+	Issues   []NetIssue `json:"issues"`
+}
+
+// NetUnknownAddr is a LAN address the period's NAT samples, firewall drops or LAN scans show that
+// no Device List read of the period names: a device the gateway does not list, or one that held
+// the address before or after the reads.
+type NetUnknownAddr struct {
+	Addr      string `json:"addr"`
+	First     string `json:"first,omitempty"` // first and last time it was seen (RFC 3339 UTC)
+	Last      string `json:"last,omitempty"`
+	Open      int    `json:"open"`
+	Sites     int    `json:"sites"`
+	Blocked   int    `json:"blocked"`
+	BlockedIn int    `json:"blocked_in"`
+	// MAC is the MAC address that answered for it in the newest LAN scan of the period that found
+	// it, and ScanSeen when that scan began ("" when no scan found it).
+	MAC      string     `json:"mac,omitempty"`
+	ScanSeen string     `json:"scan_seen,omitempty"`
+	Issues   []NetIssue `json:"issues"`
+}
+
+// NetAddrUse says which device held an IPv4 address in the Device List reads of a period: the
+// DHCP history, to tell which device an address meant at a given time.
+type NetAddrUse struct {
+	Addr   string `json:"addr"`
+	Device string `json:"device"` // NetLANDevice.Key
+	Name   string `json:"name,omitempty"`
+	MAC    string `json:"mac,omitempty"`
+	First  string `json:"first"` // the first and the last read that showed it with the address
+	Last   string `json:"last"`
+	Reads  int    `json:"reads"`
+	// Shared counts the reads of those in which another device that was on claimed the address
+	// too: an address conflict at that time (0: none).
+	Shared int `json:"shared,omitempty"`
+}
+
+// NetDeviceTotals are the Devices tab's summary tiles.
+type NetDeviceTotals struct {
+	Listed  int `json:"listed"`  // devices in the newest Device List read
+	Online  int `json:"online"`  // of them, shown on
+	WiFi    int `json:"wifi"`    // of them, on Wi-Fi
+	Wired   int `json:"wired"`   // of them, on Ethernet
+	Issues  int `json:"issues"`  // devices and unknown addresses with a warning or critical issue
+	Unknown int `json:"unknown"` // unknown LAN addresses (NetUnknownAddr)
+	Scanned int `json:"scanned"` // addresses that answered the newest LAN scan of the period
+}
+
+// NetDevicesView is GET /api/network/devices: the gateway's Device List - which device has which
+// address - with each device's issues, the LAN addresses no read names, and the address history
+// of [From, To).
+type NetDevicesView struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+	// ListAt is when the newest Device List read was made ("" before the first); Reads counts the
+	// period's reads.
+	ListAt string `json:"list_at,omitempty"`
+	Reads  int    `json:"reads"`
+	// NATReads counts the period's NAT table reads - 0: the devices' open connections and sites
+	// are not known (no access code stored, the reads paused) - and NATAt is when the newest of
+	// them was made: the devices' Open counts its sessions.
+	NATReads int              `json:"nat_reads"`
+	NATAt    string           `json:"nat_at,omitempty"`
+	Totals   NetDeviceTotals  `json:"totals"`
+	Devices  []NetLANDevice   `json:"devices"`
+	Unknown  []NetUnknownAddr `json:"unknown"`
+	// Addresses is the period's IPv4 address history, by address then first use.
+	Addresses []NetAddrUse `json:"addresses"`
+	// Scans counts the period's LAN scans; Scan sums up the newest of them (nil when none).
+	Scans int          `json:"scans"`
+	Scan  *NetScanInfo `json:"scan,omitempty"`
+}
+
+// NetScanInfo sums up a LAN scan for the Devices tab.
+type NetScanInfo struct {
+	At       string `json:"at"` // when it began (RFC 3339 UTC)
+	Subnet   string `json:"subnet"`
+	Asked    int    `json:"asked"`
+	Answered int    `json:"answered"`
+	TookMs   int64  `json:"took_ms"`
+	Problem  string `json:"problem,omitempty"`
+}
+
+// NetDeviceDetail is GET /api/network/device: one device of the Devices tab, or one unknown LAN
+// address, over [From, To) - its addresses and who else held them, the LAN scans as it answered
+// them, and its syslog messages (docs/dhcp-table.md §7).
+type NetDeviceDetail struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+	// Device is the device asked for (key=), as NetDevicesView lists it; Unknown the unknown
+	// address asked for (addr=). One of the two is set.
+	Device  *NetLANDevice   `json:"device,omitempty"`
+	Unknown *NetUnknownAddr `json:"unknown,omitempty"`
+	// Addresses: who held the device's IPv4 addresses (or the unknown address) in the period and
+	// when - the device itself and any other (NetAddrUse.Device tells them apart).
+	Addresses []NetAddrUse `json:"addresses"`
+	// Scans: the period's LAN scans, newest first, with the address it answered each at.
+	Scans []NetScanSeen `json:"scans"`
+	// Match is what its syslog messages are found by: its IPv4 addresses while it held them, its
+	// IPv6 addresses and its MAC address (netmap says what; the web layer reads the syslog store).
+	Match []NetSyslogTerm `json:"match"`
+	// Syslog: the gateway's syslog messages of the period that Match finds, newest first, at most
+	// the request's limit; SyslogTruncated says that more matched.
+	Syslog          []SyslogEntry `json:"syslog"`
+	SyslogTruncated bool          `json:"syslog_truncated"`
+	// SyslogError says why the syslog messages could not be read ("" when they were; also when no
+	// syslog is kept - Syslog is then empty, and GET /api/network/status has no syslog).
+	SyslogError string `json:"syslog_error,omitempty"`
+}
+
+// NetScanSeen is one LAN scan as a device answered it: when it began, and the IPv4 address the
+// device answered at ("" when it did not answer).
+type NetScanSeen struct {
+	At   string `json:"at"`
+	Addr string `json:"addr,omitempty"`
+}
+
+// NetSyslogTerm is something a device's syslog messages name it by: an IPv4 or IPv6 address or a
+// MAC address, and - for an IPv4 address, which other devices may hold at other times - the
+// times the device held it (a message received outside [From, To) names another device).
+type NetSyslogTerm struct {
+	Kind string `json:"kind"`           // "ipv4", "ipv6" or "mac"
+	Text string `json:"text"`           // the address as messages write it (lower case)
+	From string `json:"from,omitempty"` // RFC 3339 UTC; "" = from the period's start
+	To   string `json:"to,omitempty"`   // "" = to the period's end
+}
+
+// ------------------------------------------------------------------ the LAN scan
+
+// LANScan is one sweep of the home network (docs/dhcp-table.md §6): every address of the PC's own
+// IPv4 network asked by ARP who has it, and the ones that answered, with the MAC address that
+// answered. The monitor makes one every connections.scan_interval and keeps it in the connection
+// store. Not evidence.
+type LANScan struct {
+	At      string    `json:"at"`                // when the sweep began (RFC 3339 UTC)
+	TookMs  int64     `json:"took_ms"`           // how long it took
+	Subnet  string    `json:"subnet"`            // the network swept, e.g. "192.168.1.0/24"
+	Self    string    `json:"self,omitempty"`    // this PC's address in it
+	Asked   int       `json:"asked"`             // addresses asked
+	Hosts   []LANHost `json:"hosts"`             // the addresses that answered, in address order
+	Problem string    `json:"problem,omitempty"` // why the sweep stopped short ("" when it asked every address)
+}
+
+// LANHost is an address that answered a LAN scan, and the MAC address that answered for it.
+type LANHost struct {
+	IP  string `json:"ip"`
+	MAC string `json:"mac"` // lower case, colon-separated
 }

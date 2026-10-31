@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -15,20 +16,23 @@ import (
 )
 
 // The Network page (docs/syslog-map-graphic.md): which device on the home network talked to
-// which remote address, from samples of the gateway's NAT table, and what the gateway's
-// firewall dropped, from its syslog. None of it is evidence: the endpoints only read the views
-// the monitor builds (contracts.NetworkView) and never write anything.
+// which remote address, from samples of the gateway's NAT table, what the gateway's firewall
+// dropped, from its syslog, and the gateway's Device List - its DHCP table - with each device's
+// issues (docs/dhcp-table.md). None of it is evidence: the endpoints only read the views the
+// monitor builds (contracts.NetworkView) and never write anything.
 
-// Limits and defaults of GET /api/network/connections and /api/network/firewall.
+// Limits and defaults of GET /api/network/connections, /api/network/firewall and
+// /api/network/devices.
 const (
 	// MaxNetworkSpan bounds the period of one request, as for GET /api/syslog: the views add up
 	// every NAT sample or syslog message of the period.
 	MaxNetworkSpan = 31 * 24 * time.Hour
 	// DefaultNetworkRange is the period read when neither range nor from/to is given.
 	DefaultNetworkRange = "24h"
-	// MaxNetworkLimit caps the table rows of one answer (limit=): connections, and the LAN
-	// devices' packets the firewall dropped. A larger limit is read as this one, as /api/records
-	// and /api/syslog do; without a limit the view chooses its default.
+	// MaxNetworkLimit caps the table rows of one answer (limit=): connections, the LAN devices'
+	// packets the firewall dropped, and the LAN addresses no Device List read names. A larger
+	// limit is read as this one, as /api/records and /api/syslog do; without a limit the view
+	// chooses its default.
 	MaxNetworkLimit = 1000
 	// MaxNetworkDeviceChars bounds the device filter: a device key ("mac:00:00:5e:00:53:01",
 	// "ip:192.168.1.20", "gateway") as the answer's devices list it.
@@ -101,6 +105,65 @@ func (s *Server) handleNetworkFirewall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, completeFirewall(fw, q))
+}
+
+// handleNetworkDevices serves GET /api/network/devices?range=|from=&to=&limit=: the gateway's
+// Device List - its DHCP table: which device has which address - with each device's issues, the
+// LAN addresses no Device List read names (at most limit of them) and the period's address
+// history (docs/dhcp-table.md). Same validation, limits and errors as GET /api/network/firewall
+// (a device filter is refused: the view lists every device); 404 without a network view.
+func (s *Server) handleNetworkDevices(w http.ResponseWriter, r *http.Request) {
+	if s.network == nil {
+		writeError(w, http.StatusNotFound, msgNoNetwork)
+		return
+	}
+	q, err := parseNetworkQuery(r.URL.Query(), s.now(), false)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), networkTimeout)
+	defer cancel()
+	dv, err := s.network.Devices(ctx, q)
+	if err != nil {
+		s.writeErr(w, "network devices", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, completeDevices(dv, q))
+}
+
+// completeDevices is the answer of GET /api/network/devices, completed as completeConnections
+// completes the connections: the period filled in when the view left it out, every list present
+// (empty rather than null, the issues of each device and address too) and at most rowCap(q)
+// unknown addresses (Totals.Unknown still counts them all). A list whose issues it completes is
+// copied first: the view may keep what it returned.
+func completeDevices(dv model.NetDevicesView, q contracts.NetQuery) model.NetDevicesView {
+	if dv.From == "" && !q.From.IsZero() {
+		dv.From = q.From.UTC().Format(time.RFC3339Nano)
+	}
+	if dv.To == "" && !q.To.IsZero() {
+		dv.To = q.To.UTC().Format(time.RFC3339Nano)
+	}
+	dv.Devices = nonNil(dv.Devices)
+	if slices.ContainsFunc(dv.Devices, func(d model.NetLANDevice) bool { return d.Issues == nil }) {
+		dv.Devices = slices.Clone(dv.Devices)
+		for i := range dv.Devices {
+			dv.Devices[i].Issues = nonNil(dv.Devices[i].Issues)
+		}
+	}
+	dv.Unknown = nonNil(dv.Unknown)
+	if n := rowCap(q); len(dv.Unknown) > n {
+		dv.Unknown = dv.Unknown[:n]
+	}
+	if slices.ContainsFunc(dv.Unknown, func(u model.NetUnknownAddr) bool { return u.Issues == nil }) {
+		dv.Unknown = slices.Clone(dv.Unknown)
+		for i := range dv.Unknown {
+			dv.Unknown[i].Issues = nonNil(dv.Unknown[i].Issues)
+		}
+	}
+	dv.Totals.Unknown = max(dv.Totals.Unknown, len(dv.Unknown))
+	dv.Addresses = nonNil(dv.Addresses)
+	return dv
 }
 
 // handleNetworkStatus serves GET /api/network/status: the connection store, the IP database

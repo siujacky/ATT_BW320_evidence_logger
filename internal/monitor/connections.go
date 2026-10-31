@@ -114,6 +114,13 @@ const (
 	connHoldPoll = 250 * time.Millisecond
 	// connFailReport: how often failing reads are reported again in the operational log.
 	connFailReport = 6 * time.Hour
+	// connScanFirst delays the first LAN scan after the start (scans.go) - which also waits for the
+	// Device List sampler's first round: the Devices tab compares a scan with the Device List read
+	// before it.
+	connScanFirst = 3 * time.Minute
+	// connScanTimeout bounds a sweep in the monitor: the scanner ends one after 2 minutes by itself
+	// (lanscan.Timeout, keeping what answered by then); this is the backstop.
+	connScanTimeout = 2*time.Minute + 30*time.Second
 	// The gateway client's login policy (docs/DESIGN.md §2), for a refusal that does not say when
 	// its cooldown ends: one login attempt a minute, none for 5 minutes after "all web server
 	// sessions are in use", none for an hour at most after 3 rejected logins.
@@ -168,9 +175,23 @@ type connSamplers struct {
 
 	natLog, devLog, pruneLog logGate
 
-	mu  sync.Mutex // guards nat and dev; never held while another lock is taken
-	nat natState
-	dev devState
+	// The LAN scan (scans.go, docs/dhcp-table.md §6): the scanner and the store its sweeps are
+	// appended to (nil either: no sweeps), connections.scan_interval (0: none), the tunables
+	// scanFirst (connScanFirst) and scanTimeout (connScanTimeout), and the sweeps' log gate.
+	// devRound is closed once the Device List sampler's first round has been made: the first sweep
+	// waits for it.
+	scanner                contracts.LANScanner
+	scans                  contracts.ScanStore
+	scanInterval           time.Duration
+	scanFirst, scanTimeout time.Duration
+	scanLog                logGate
+	devRound               chan struct{}
+	devRoundOnce           sync.Once
+
+	mu   sync.Mutex // guards nat, dev and scan; never held while another lock is taken
+	nat  natState
+	dev  devState
+	scan scanState
 	// saveMu serializes the writes of natStateFile (saveNATState).
 	saveMu sync.Mutex
 }
@@ -223,29 +244,38 @@ type rawCopy struct {
 }
 
 // newConnSamplers returns the samplers for a connection store (nil without one) with the
-// configuration's intervals - its defaults for a zero value (a hand-built configuration). A read
-// may take a login and the page (natTimeout: three gateway request timeouts) or one page
-// (devTimeout: one, and some slack, like a one-page snapshot).
-func newConnSamplers(store contracts.ConnStore, c config.ConnectionsConfig, gwTimeout time.Duration) *connSamplers {
+// configuration's intervals - its defaults for a zero value (a hand-built configuration), but for
+// connections.scan_interval, whose 0 means no sweeps of the home network (nor are there any
+// without a scanner and a scan store). A read may take a login and the page (natTimeout: three
+// gateway request timeouts) or one page (devTimeout: one, and some slack, like a one-page
+// snapshot).
+func newConnSamplers(store contracts.ConnStore, scanner contracts.LANScanner, scans contracts.ScanStore, c config.ConnectionsConfig,
+	gwTimeout time.Duration) *connSamplers {
 	if store == nil {
 		return nil
 	}
 	d := config.Default().Connections
 	return &connSamplers{
-		store:       store,
-		enabled:     c.Enabled,
-		interval:    durOr(c.Interval, d.Interval.Duration),
-		devInterval: durOr(c.DevicesInterval, d.DevicesInterval.Duration),
-		natTimeout:  3 * gwTimeout,
-		devTimeout:  gwTimeout + 5*time.Second,
-		natFirst:    connNATFirst,
-		devFirst:    connDevicesFirst,
-		busyRetry:   connBusyRetry,
-		authRetry:   connAuthRetry,
-		rawEvery:    connRawEvery,
-		holdPoll:    connHoldPoll,
-		pruneEvery:  connPruneEvery,
-		nat:         natState{inUse: -1, available: -1},
+		store:        store,
+		enabled:      c.Enabled,
+		interval:     durOr(c.Interval, d.Interval.Duration),
+		devInterval:  durOr(c.DevicesInterval, d.DevicesInterval.Duration),
+		natTimeout:   3 * gwTimeout,
+		devTimeout:   gwTimeout + 5*time.Second,
+		natFirst:     connNATFirst,
+		devFirst:     connDevicesFirst,
+		busyRetry:    connBusyRetry,
+		authRetry:    connAuthRetry,
+		rawEvery:     connRawEvery,
+		holdPoll:     connHoldPoll,
+		pruneEvery:   connPruneEvery,
+		nat:          natState{inUse: -1, available: -1},
+		scanner:      scanner,
+		scans:        scans,
+		scanInterval: max(c.ScanInterval.Duration, 0),
+		scanFirst:    connScanFirst,
+		scanTimeout:  connScanTimeout,
+		devRound:     make(chan struct{}),
 	}
 }
 
@@ -757,7 +787,8 @@ func (m *Monitor) restoreNATState(now time.Time) {
 // ---------------------------------------------------------------------------- the Device List
 
 // devicesLoop runs the Device List sampler (sampleDevices): devFirst after the start, then every
-// connections.devices_interval.
+// connections.devices_interval. Its first round, whatever its outcome, lets the first LAN scan
+// begin (devRound).
 func (m *Monitor) devicesLoop(ctx context.Context) {
 	c := m.conns
 	next := time.Now().Add(c.devFirst)
@@ -767,6 +798,7 @@ func (m *Monitor) devicesLoop(ctx context.Context) {
 		}
 		next = time.Now().Add(c.devInterval)
 		m.safely("connections", func() { m.sampleDevices(ctx) })
+		c.devRoundOnce.Do(func() { close(c.devRound) })
 	}
 }
 
@@ -869,10 +901,11 @@ func (m *Monitor) samplerHold() string {
 	return ""
 }
 
-// samplerRead runs read, a sampler's request to the gateway, unless the gateway is needed for
-// evidence already (samplerHeld). Its context ends with ctx, after timeout, and as soon as the
-// gateway is needed for evidence (holdWatch): the read's error is then samplerHeld. The caller
-// holds the gateway lock.
+// samplerRead runs read, a sampler's request to the gateway - or the LAN scan's sweep -, unless
+// the gateway is needed for evidence already (samplerHeld). Its context ends with ctx, after
+// timeout, and as soon as the gateway is needed for evidence (holdWatch): the read's error is then
+// samplerHeld. The caller of a request to the gateway holds the gateway lock (a sweep, which does
+// not use the gateway's web server, does not take it).
 func (m *Monitor) samplerRead(ctx context.Context, timeout time.Duration, read func(context.Context) error) error {
 	if why := m.samplerHold(); why != "" {
 		return samplerHeld{why: why}
@@ -1121,8 +1154,8 @@ func later(a, b time.Time) time.Time {
 // ---------------------------------------------------------------------------- status
 
 // connStatus returns Status.Connections: the samplers' newest reads and problems, when the next
-// NAT read is due, and the connection store's volume; nil without a connection store. It takes
-// the samplers' lock and the store's own, never mu.
+// NAT read and the next LAN scan are due, and the connection store's volume; nil without a
+// connection store. It takes the samplers' lock and the store's own, never mu.
 func (m *Monitor) connStatus() *model.ConnSamplerStatus {
 	c := m.conns
 	if c == nil {
@@ -1158,6 +1191,17 @@ func (m *Monitor) connStatus() *model.ConnSamplerStatus {
 	// put off the next round itself until a login may be made.)
 	if next := later(c.nat.next, c.nat.stopUntil); !next.IsZero() {
 		s.NATNext = fmtTS(now.Add(time.Until(next)))
+	}
+	// The LAN scan, while it is made ("" for its interval otherwise: no sweeps).
+	if m.scansOn() {
+		s.ScanInterval = c.scanInterval.String()
+		s.ScanHosts, s.ScanProblem = c.scan.hosts, c.scan.problem
+		if !c.scan.at.IsZero() {
+			s.ScanAt = fmtTS(c.scan.at)
+		}
+		if !c.scan.next.IsZero() {
+			s.ScanNext = fmtTS(now.Add(time.Until(c.scan.next)))
+		}
 	}
 	return s
 }

@@ -771,6 +771,72 @@ details.syslog-raw[open] > summary { margin-bottom: 6px; }
 .net-reason { white-space: normal; }
 .net-conns-foot .link-btn { font-size: 13px; }
 
+/* the Devices tab: the gateway's Device List (its DHCP table) */
+.tbl.net-devs { min-width: 1150px; } /* narrower, the table scrolls in its box, the names kept in view */
+.tbl.net-devs th, .tbl.net-devs td { padding: 6px; }
+/* Its headers of several words wrap ("Last seen / on", "Blocked / out/in"), so the twelve columns
+   fit a desktop window with the issues in view. */
+.tbl.net-devs thead th { white-space: normal; vertical-align: bottom; }
+.tbl.net-devs th .th-sort { white-space: normal; text-align: inherit; }
+.tbl.net-devs td { vertical-align: middle; }
+.tbl.net-devs tbody tr { cursor: pointer; }
+.tbl.net-devs tr.is-off td { color: var(--text-2); }
+.tbl.net-devs tr.is-off .dev-open { color: var(--text-2); }
+.tbl.net-devs td.dev-name { min-width: 8.5em; max-width: 16em; overflow-wrap: anywhere; }
+.dev-open { font-weight: 650; text-align: left; text-decoration: none; color: var(--link); }
+.dev-open:hover { text-decoration: underline; }
+.dev-st { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.dev-st-odd { white-space: normal; overflow-wrap: anywhere; min-width: 5em; max-width: 8em; }
+.dev-state { display: inline-block; width: 10px; height: 10px; border-radius: 50%; flex: none; }
+.dev-state.is-on { background: var(--good); }
+.dev-state.is-off { border: 2px solid var(--muted); }
+.dev-state.is-unknown { width: 10px; height: 2px; border-radius: 1px; background: var(--muted); }
+.dev-conn-name, .dev-speed { white-space: nowrap; }
+.tbl.net-devs td.dev-ip { min-width: 8.5em; }
+.tbl.net-devs td.dev-ip > .mono:first-child { white-space: nowrap; }
+.wbars { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; vertical-align: middle; }
+.wbars-svg { width: 19px; height: 12px; flex: none; }
+.wb-on { fill: var(--s1); }
+.wb-off { fill: var(--surface-3); stroke: var(--axis); stroke-width: 0.6; }
+.wbars-n { font-size: 12px; color: var(--text-2); font-variant-numeric: tabular-nums; }
+.dev-issues-cell .chips { max-width: 15em; }
+.dev-panel {
+  margin: 0 0 12px; padding: 10px 14px; border-radius: 8px;
+  border: 1px solid var(--border-strong); border-left: 5px solid var(--link); background: var(--info-bg);
+  display: grid; gap: 4px; overflow-wrap: anywhere;
+}
+.dev-panel p { margin: 0; }
+.dev-panel-title { font-weight: 700; }
+.dev-panel p.dev-panel-sub { font-size: 13px; color: var(--text-2); margin-top: 4px; }
+.dev-panel-list { margin: 0; padding-left: 20px; }
+.dev-panel-list li { margin: 2px 0; }
+.dev-panel .link-btn { font-weight: 650; text-decoration: none; }
+.dev-panel .link-btn:hover { text-decoration: underline; }
+.dev-issues { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.dev-issues li { overflow-wrap: anywhere; }
+.dev-issues .sub { margin-top: 2px; }
+.dev-v6, .dev-links { list-style: none; margin: 0; padding: 0; }
+.dev-links li + li { margin-top: 4px; }
+.dev-scan-line { margin-top: 4px; }
+.tbl.net-devs td.dev-scan { white-space: nowrap; }
+.tbl.net-unk tbody tr { cursor: pointer; }
+.unk-open { font-weight: 650; text-decoration: none; color: var(--link); }
+.unk-open:hover { text-decoration: underline; }
+.dev-scans { list-style: none; margin: 8px 0 0; padding: 0; font-size: 14px; }
+.dev-scans li + li { margin-top: 2px; }
+.dev-unk-issue { display: block; }
+.dev-unk-issue .sub { margin-top: 2px; max-width: 34em; }
+.dev-unk-links a { white-space: nowrap; }
+/* The name stays in view while the table scrolls sideways under it - at any width, as the table
+   is wider than its card below about 1220 px -, set apart by a line once it is scrolled. */
+/* (It sticks 1px past the edge, its padding 1px wider: on a screen where the edge falls between
+   two pixels, nothing that scrolls under it shows in the pixel left over.) */
+.tbl.net-devs td.dev-name, .tbl.net-devs th.dev-name { position: sticky; left: -1px; z-index: 2; background: var(--surface); padding-left: 7px; }
+.tbl.net-devs thead th.dev-name { z-index: 3; }
+.tbl.net-devs tbody tr:hover td.dev-name { background: var(--surface-2); }
+.dev-scroll.is-scrolled .tbl.net-devs td.dev-name, .dev-scroll.is-scrolled .tbl.net-devs th.dev-name { box-shadow: 1px 0 0 var(--axis); }
+.dev-gap { margin: 6px 0 0; }
+
 .sk-hint { display: none; margin: 6px 0 0; font-size: 12.5px; color: var(--text-2); }
 @media (max-width: 700px) {
   .sk-hint { display: block; }
@@ -913,6 +979,9 @@ html.detail-open body { overflow: visible; }
   .bar-fill, .dev-dot { background: CanvasText; }
   .sk-band { stroke: CanvasText; }
   .map-svg path { stroke: CanvasText; }
+  .dev-state.is-on, .dev-state.is-unknown { background: CanvasText; }
+  .dev-state.is-off { border-color: CanvasText; }
+  .wb-on { fill: CanvasText; }
 }
 @media print {
   .topbar, .footer, .skip-link, .btn, .legend button, .seg, .sum-more, .status-more { display: none !important; }

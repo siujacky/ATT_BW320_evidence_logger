@@ -5,24 +5,28 @@ import (
 	"time"
 )
 
-// kind is what a file holds: NAT table reads or Device List reads.
+// kind is what a file holds: NAT table reads, Device List reads or LAN scans.
 type kind uint8
 
 const (
 	kindNAT kind = iota
 	kindDevices
+	kindScan
 	numKinds
 )
 
 // kindPrefix is the start of the file names of each kind. The monitor writes other files into
 // the same directory (last-nattable.html, last-devices.html): only names that parse as one of
 // the store's own (parseFileName) are ever touched.
-var kindPrefix = [numKinds]string{"nat-", "devices-"}
+var kindPrefix = [numKinds]string{"nat-", "devices-", "scan-"}
 
 // String names the kind in logs and errors.
 func (k kind) String() string {
-	if k == kindNAT {
+	switch k {
+	case kindNAT:
 		return "nat"
+	case kindScan:
+		return "scan"
 	}
 	return "devices"
 }

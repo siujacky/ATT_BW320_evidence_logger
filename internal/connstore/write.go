@@ -62,6 +62,29 @@ func (s *Store) AppendDevices(t time.Time, devices []model.LANDevice) error {
 	})
 }
 
+// AppendScan adds one LAN scan (contracts.ScanStore), begun at t (the zero time: now), to the scan
+// file of t's UTC day, like AppendNAT; the scan's At becomes t. It becomes the scan LastScan
+// returns unless that one is newer - and not dated after now, as with AppendDevices.
+func (s *Store) AppendScan(t time.Time, scan model.LANScan) error {
+	t = s.when(t).UTC()
+	if !validTime(t) {
+		return fmt.Errorf("connstore: a LAN scan at %s: the time is outside the years 2000-2199", formatTime(t))
+	}
+	line, err := encodeScan(t, scan)
+	if err != nil {
+		s.noteResult(opAppend(kindScan), err)
+		return err
+	}
+	kept := cloneScan(scan)
+	kept.At = formatTime(t)
+	now := s.now()
+	return s.append(kindScan, t, line, func() {
+		if !s.hasScan || !t.Before(s.lastScanAt) || s.lastScanAt.After(now) {
+			s.lastScan, s.lastScanAt, s.hasScan = kept, t, true
+		}
+	})
+}
+
 // opAppend names the appends of a kind in Usage().Error.
 func opAppend(k kind) string { return "append " + k.String() }
 

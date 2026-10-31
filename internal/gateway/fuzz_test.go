@@ -89,6 +89,9 @@ func FuzzNetworkPages(f *testing.F) {
 	f.Add([]byte("<title>Device List</title><table><tr><th>MAC Address<td>00-00-5E-00-53-01<tr><th>IPv4 Address / Name<td>192.168.1.1 / a/b" +
 		"<tr><th>Connection Type<td><pre>Wi-Fi\r2.4GHz\nName: x</pre><tr><td><hr><tr><th>IPv6 Address<td>fe80::1%br0</table>"))
 	f.Add([]byte("<table><tr><th>Name<td>a<tr><th>Name<td>b<tr><th>MAC<td>00:00:00:00:00:00<tr><th>Connection Speed<td>Mbps\tduplex</table>"))
+	f.Add([]byte("<title>Device List</title><table><tr><th>MAC Address<td>00:00:5e:00:53:01<tr><th>Connection Type<td><pre>Wi-Fi " +
+		"<img alt=\"Wi-Fi 99 bars\" src=/images/signal-strength-3-bar.png><IMG SRC=signal-strength-7-bar.png ALT><img alt=2bar alt=4bar>" +
+		"5 GHz</pre><tr><th>Last Activity<td>x<script><img alt='Wi-Fi 1 bar'></script></table>"))
 	f.Fuzz(func(t *testing.T, body []byte) {
 		nat, err := ParseNATTable(body)
 		checkNATResult(t, body, nat, err)
@@ -155,8 +158,8 @@ var reMACForm = regexp.MustCompile(`^[0-9a-f]{2}(:[0-9a-f]{2}){5}$`)
 // checkDevicesResult checks what ParseDevices returned for body: an error is a documented one,
 // without devices; otherwise every device names itself somehow, its MAC (lower case, colon
 // separated, not all zeros), IPv4 and IPv6 addresses (canonical, each once) are well formed, its
-// connection summary holds no "label: value" line, its speed has a number, and there are no more
-// devices than body has room for rows.
+// connection summary holds no "label: value" line, its speed has a number, its Wi-Fi signal is
+// 0 to 5 bars, and there are no more devices than body has room for rows.
 func checkDevicesResult(t testing.TB, body []byte, devices []model.LANDevice, err error) {
 	t.Helper()
 	if err != nil {
@@ -198,6 +201,9 @@ func checkDevicesResult(t testing.TB, body []byte, devices []model.LANDevice, er
 		}
 		if d.Speed != "" && !strings.ContainsAny(d.Speed, "0123456789") {
 			t.Fatalf("ParseDevices: speed %q", d.Speed)
+		}
+		if d.Signal < 0 || d.Signal > maxBars {
+			t.Fatalf("ParseDevices: signal %d bars", d.Signal)
 		}
 		if n := len(d.Name) + len(d.Status) + len(d.Allocation) + len(d.Speed) + len(d.LastActivity); n > maxTextBytes(body) {
 			t.Fatalf("ParseDevices: %d bytes of text from %d", n, len(body))

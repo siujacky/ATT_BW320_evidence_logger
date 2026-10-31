@@ -25,7 +25,7 @@ type summary struct {
 func (s *summary) weight() int64 { return int64(len(s.devs) + len(s.flows)) }
 
 // newestRead is the newest read of a summary: its time and totals, and its sessions by device key
-// (for a device filter's own count: ConnAggregate.OpenDevice).
+// (each device's ConnDevice.Open, and a device filter's own count: ConnAggregate.OpenDevice).
 type newestRead struct {
 	t                      int64
 	inUse, available, open int
@@ -527,7 +527,7 @@ func (m *merger) result(ctx context.Context, out model.ConnAggregate) (model.Con
 	out.Devices = make([]model.ConnDevice, 0, len(devs))
 	for _, d := range devs {
 		cd := model.ConnDevice{Key: d.key, Name: d.name, MAC: d.mac, Connection: d.conn, Samples: d.samples, Weight: d.weight,
-			LeftOut: d.leftOut}
+			LeftOut: d.leftOut, Open: m.newest.devs[d.key]}
 		if d.lan.Is4() {
 			cd.IPv4 = d.lan.String()
 		}

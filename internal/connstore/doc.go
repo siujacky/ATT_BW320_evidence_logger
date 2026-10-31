@@ -1,8 +1,10 @@
 // Package connstore keeps the samples behind the dashboard's Network page
 // (docs/syslog-map-graphic.md): the monitor's reads of the gateway's NAT table (every
-// connections.interval, 4 minutes by default) and of its Device List (every 15 minutes), in
-// daily files, for connections.keep_days within connections.keep_mb. Aggregate turns the reads
-// of a period into which device talked to which remote address, port and protocol.
+// connections.interval, 4 minutes by default) and of its Device List (every 15 minutes), and its
+// sweeps of the home network by ARP (the LAN scans, every connections.scan_interval, an hour by
+// default: docs/dhcp-table.md §6), in daily files, for connections.keep_days within
+// connections.keep_mb. Aggregate turns the reads of a period into which device talked to which
+// remote address, port and protocol.
 //
 // None of it is evidence. These files describe the household's own traffic, not the ISP's
 // faults: they are never written to the ledger (which can never delete anything, and would keep
@@ -16,6 +18,7 @@
 //	nat-YYYY-MM-DD.jsonl          the NAT table reads of the day, one line each, appended
 //	                              (written and fsynced by every AppendNAT)
 //	devices-YYYY-MM-DD.jsonl      the Device List reads of the day (AppendDevices)
+//	scan-YYYY-MM-DD.jsonl         the LAN scans of the day (AppendScan)
 //	<name>.jsonl.gz               the same, gzip, once the day is over
 //	<name>.jsonl.gz.tmp           a compressed copy being written (deleted by Open)
 //
@@ -48,7 +51,13 @@
 //
 //	{"t":"2026-10-06T08:00:00.123456789Z","devices":[{"mac":"00:00:5e:00:53:01","name":"laptop",...}]}
 //
-// with the devices as model.LANDevice encodes them.
+// with the devices as model.LANDevice encodes them. A LAN scan:
+//
+//	{"t":"2026-10-06T08:00:00.123456789Z","at":"2026-10-06T08:00:00.123456789Z","took_ms":8200,
+//	 "subnet":"192.168.1.0/24","self":"192.168.1.71","asked":254,
+//	 "hosts":[{"ip":"192.168.1.64","mac":"00:00:5e:00:53:01"},...]}
+//
+// with the scan's members as model.LANScan encodes them ("at" is "t" again: when the sweep began).
 //
 // # Crash safety
 //
@@ -61,7 +70,7 @@
 //
 // # Retention
 //
-// Prune deletes whole days (both kinds), oldest first: each day that ended keep_days days or
+// Prune deletes whole days (every kind), oldest first: each day that ended keep_days days or
 // more ago, then the oldest days while the files kept exceed keep_mb MiB (compressed days at
 // their stored size). Today and later days are never deleted. The monitor calls Prune every hour,
 // whether or not its samplers run (with connections.enabled off nothing is appended, yet the
@@ -84,9 +93,10 @@
 //
 // One process writes the store: the monitor, whose ledger lock keeps a second one away (Open
 // repairs, then compresses and prunes in the background: the CLI must not open the store while the
-// service runs). The writing methods (AppendNAT, AppendDevices, Prune, Close, Open's background
-// work and the timer Open sets for the age limit) are serialized; any number of goroutines may
-// read meanwhile (Aggregate, Devices, EachDevices, Usage) without waiting for them. A reader
+// service runs). The writing methods (AppendNAT, AppendDevices, AppendScan, Prune, Close, Open's
+// background work and the timer Open sets for the age limit) are serialized; any number of
+// goroutines may read meanwhile (Aggregate, Devices, EachDevices, EachScan, LastScan, Usage)
+// without waiting for them. A reader
 // works from a snapshot of the index: it reads a plain file only up to its complete, fsynced
 // lines (never a line being written). The writer marks a day (an odd generation of its index
 // entry) while it replaces its compressed file, and a reader whose day changed generation while it

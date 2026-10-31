@@ -16,7 +16,8 @@ type parsed struct {
 	proto    string
 	src, dst string // "" when not stated or not an address
 	spt, dpt uint16
-	n        int // repeats
+	n        int  // repeats
+	toLAN    bool // an inbound packet toward a LAN interface
 }
 
 // parseText parses text with fresh code tables and describes the result.
@@ -27,7 +28,7 @@ func parseText(text string) parsed {
 	if kind != lineDrop {
 		return p
 	}
-	p.dir, p.reason, p.proto, p.spt, p.dpt = d.dir, c.reasons.name(d.reason), c.protos.name(d.proto), d.spt, d.dpt
+	p.dir, p.reason, p.proto, p.spt, p.dpt, p.toLAN = d.dir, c.reasons.name(d.reason), c.protos.name(d.proto), d.spt, d.dpt, d.toLAN
 	if d.srcOK {
 		p.src = netip.AddrFrom16(d.src).Unmap().String()
 	}
@@ -48,13 +49,17 @@ func TestParseTheGatewaysLines(t *testing.T) {
 		{"outbound from the LAN", lineOutbound, parsed{kind: lineDrop, dir: dirOut, reason: "POLICY", proto: "tcp",
 			src: "192.168.1.64", dst: "192.0.2.44", spt: 51544, dpt: 443}},
 		{"inbound toward the LAN", lineToLAN, parsed{kind: lineDrop, dir: dirIn, reason: "OTHER-DoS", proto: "udp",
-			src: "192.0.2.17", dst: "192.168.1.64", spt: 443, dpt: 60512}},
+			src: "192.0.2.17", dst: "192.168.1.64", spt: 443, dpt: 60512, toLAN: true}},
 		{"sent by the gateway", lineGateway, parsed{kind: lineDrop, dir: dirLocal, reason: "POLICY", proto: "udp",
 			src: "198.51.100.1", dst: "203.0.113.5", spt: 123, dpt: 123}},
 		{"ping", linePing, parsed{kind: lineDrop, dir: dirIn, reason: "POLICY-ICMP-ECHO", proto: "icmp",
 			src: "203.0.113.140", dst: "198.51.100.1"}},
 		{"IPv6", lineV6, parsed{kind: lineDrop, dir: dirIn, reason: "POLICY-INPUT-GEN-DISCARD", proto: "icmpv6",
 			src: "2001:db8:1::1", dst: "2001:db8:2::1"}},
+		{"IPv6 inbound toward a Wi-Fi radio", head + "action=DROP reason=POLICY IN=veip0.0 OUT=wl1 SRC=2001:db8:9::7 DST=2001:db8:5::64 PROTO=TCP SPT=40000 DPT=22",
+			parsed{kind: lineDrop, dir: dirIn, reason: "POLICY", proto: "tcp", src: "2001:db8:9::7", dst: "2001:db8:5::64", spt: 40000, dpt: 22, toLAN: true}},
+		{"LAN to LAN is not toward the LAN from outside", head + "action=DROP IN=br0 OUT=br1 SRC=192.168.1.5 DST=192.168.1.6 PROTO=UDP DPT=5353",
+			parsed{kind: lineDrop, dir: dirLocal, proto: "udp", src: "192.168.1.5", dst: "192.168.1.6", dpt: 5353}},
 		{"syslog-ng repeat", lineRepeat3, parsed{kind: lineRepeat, n: 3}},
 		{"another program", lineDHCP, parsed{kind: lineOther}},
 

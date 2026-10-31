@@ -65,7 +65,10 @@ const (
 // ErrClosed is returned by the writing methods after Close.
 var ErrClosed = errors.New("connstore: the store is closed")
 
-var _ contracts.ConnStore = (*Store)(nil)
+var (
+	_ contracts.ConnStore = (*Store)(nil)
+	_ contracts.ScanStore = (*Store)(nil)
+)
 
 // Options configures Open. Zero values select the defaults.
 type Options struct {
@@ -91,8 +94,9 @@ type Options struct {
 }
 
 // Store is the connection store (contracts.ConnStore): the NAT table and Device List reads in
-// daily files. It is safe for one writer (the monitor, which calls AppendNAT, AppendDevices and
-// Prune) and any number of concurrent readers (Aggregate, Devices, EachDevices, Usage).
+// daily files - and the LAN scans (contracts.ScanStore), in daily files of their own. It is safe
+// for one writer (the monitor, which calls AppendNAT, AppendDevices, AppendScan and Prune) and any
+// number of concurrent readers (Aggregate, Devices, EachDevices, EachScan, LastScan, Usage).
 type Store struct {
 	dir string
 	log *slog.Logger
@@ -139,12 +143,18 @@ type Store struct {
 	mib int64
 	// lastPrune is when the retention limits were last applied (zero: due at the next append).
 	lastPrune time.Time
-	// oldest and newest are the times of the oldest and the newest read kept (either kind).
+	// oldest and newest are the times of the oldest and the newest read or scan kept (any kind).
 	oldest, newest time.Time
 	// devices is the newest Device List read (by its time; one dated after the clock gives way to
 	// the next read stored: see AppendDevices) and devicesAt that time.
 	devices   []model.LANDevice
 	devicesAt time.Time
+	// lastScan is the newest LAN scan (by its time, chosen as the Device List read is: see
+	// AppendScan) and lastScanAt that time; hasScan is false before the first, and once the day
+	// that held it was deleted with no scan left.
+	lastScan   model.LANScan
+	lastScanAt time.Time
+	hasScan    bool
 	// failures are the operations whose newest attempt failed (Usage().Error), by operation.
 	failures map[string]failure
 	// warned lists the problems logged already, by file and problem, so that a damaged file
@@ -248,6 +258,28 @@ func cloneDevices(devices []model.LANDevice) []model.LANDevice {
 		out[i].IPv6 = slices.Clone(out[i].IPv6)
 	}
 	return out
+}
+
+// LastScan returns the newest LAN scan kept (by the time it began; false before the first), as
+// AppendScan chose it - a scan dated after the clock, made while it was ahead, gives way to the next
+// one stored, and is passed over by Open while a day up to today has one. Its At is when it began.
+// The scan is the caller's own.
+func (s *Store) LastScan() (model.LANScan, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.hasScan {
+		return model.LANScan{}, false
+	}
+	return cloneScan(s.lastScan), true
+}
+
+// cloneScan returns a copy of scan that shares nothing with it.
+func cloneScan(scan model.LANScan) model.LANScan {
+	scan.Hosts = slices.Clone(scan.Hosts)
+	if scan.Hosts == nil {
+		scan.Hosts = []model.LANHost{}
+	}
+	return scan
 }
 
 // SetRetention changes the retention limits: no day whose reads are all more than keepDays days

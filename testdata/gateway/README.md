@@ -79,8 +79,10 @@ One table; each device is a block of `<th scope="row">` label rows, the blocks s
 row holding only `<hr class="reshr">`. Labels: *MAC Address*, *IPv4 Address / Name* (or just
 *Name* for a device without an IPv4 address), *Last Activity*, *Status*, *Allocation*,
 *Connection Type* (a `<pre>` of `<br>`-separated lines: "Wi-Fi", the band and radio, "Type:
-Home", "Name: *the Wi-Fi network's name*"; or "Ethernet LAN-1"), *Connection Speed*, *Mesh
-Client*, then repeated *IPv6 Address* / *Type* / *Valid Lifetime* / *Preferred Lifetime* groups.
+Home", "Name: *the Wi-Fi network's name*"; or "Ethernet LAN-1"; a Wi-Fi device that is on also has
+its signal drawn after "Wi-Fi": `<img src="/images/signal-strength-5-bar.png" alt="Wi-Fi 5 bars" />`,
+which the parser reads as `Signal`), *Connection Speed*, *Mesh Client*, then repeated *IPv6 Address*
+/ *Type* / *Valid Lifetime* / *Preferred Lifetime* groups.
 The gateway's own sloppy markup is kept: the Connection Speed rows of Wi-Fi devices are
 `<th>Connection Speed</th></td></tr>` with no value cell, and the wired device that is off shows
 the bare template `Mbps\tduplex` (a tab between the words). The page also carries a form with a

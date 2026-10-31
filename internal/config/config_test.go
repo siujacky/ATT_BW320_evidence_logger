@@ -288,6 +288,21 @@ func TestNetworkSettingsNeverStopTheLoad(t *testing.T) {
 			[]string{"connections.devices_interval is 1m0s, below the minimum: 5m0s is used"}},
 		{`"connections":{"devices_interval":"48h"}`, conns(func(c *ConnectionsConfig) { c.DevicesInterval = D(24 * time.Hour) }), d.Geo,
 			[]string{"connections.devices_interval is 48h0m0s, above the maximum: 24h0m0s is used"}},
+		// The LAN scan's interval: 0 is no sweeps (kept, nothing to say); below 0 the default.
+		{`"connections":{"scan_interval":"5m"}`, conns(func(c *ConnectionsConfig) { c.ScanInterval = D(15 * time.Minute) }), d.Geo,
+			[]string{"connections.scan_interval is 5m0s, below the minimum: 15m0s is used"}},
+		{`"connections":{"scan_interval":"25h"}`, conns(func(c *ConnectionsConfig) { c.ScanInterval = D(24 * time.Hour) }), d.Geo,
+			[]string{"connections.scan_interval is 25h0m0s, above the maximum: 24h0m0s is used"}},
+		{`"connections":{"scan_interval":"0s"}`, conns(func(c *ConnectionsConfig) { c.ScanInterval = D(0) }), d.Geo, nil},
+		{`"connections":{"scan_interval":0}`, conns(func(c *ConnectionsConfig) { c.ScanInterval = D(0) }), d.Geo, nil},
+		{`"connections":{"scan_interval":"-1h"}`, d.Connections, d.Geo,
+			[]string{"connections.scan_interval is -1h0m0s, not 0 (no sweeps of the home network) or 15m0s to 24h0m0s: the default, 1h0m0s, is used"}},
+		{`"connections":{"scan_interval":"hourly"}`, d.Connections, d.Geo,
+			[]string{`connections.scan_interval is not a duration such as "1h0m0s": the default, 1h0m0s, is used`}},
+		{`"connections":{"enabled":false,"scan_interval":"1m"}`,
+			conns(func(c *ConnectionsConfig) { c.Enabled, c.ScanInterval = false, D(15*time.Minute) }), d.Geo,
+			[]string{"connections.scan_interval is 1m0s, below the minimum: 15m0s is used"}},
+		{`"connections":{"scan_interval":"2h30m"}`, conns(func(c *ConnectionsConfig) { c.ScanInterval = D(150 * time.Minute) }), d.Geo, nil},
 		{`"connections":{"keep_days":0}`, d.Connections, d.Geo,
 			[]string{"connections.keep_days is 0, not 1 to 3650: the default, 30, is used"}},
 		{`"connections":{"keep_days":-5}`, d.Connections, d.Geo,
@@ -478,6 +493,9 @@ func TestValidateChecksNetworkSections(t *testing.T) {
 		"url, query":       func(c *Config) { c.Geo.URLv4 = "https://mirror.example.invalid/v4.tsv.gz?token=x" },
 		"url, empty query": func(c *Config) { c.Geo.URLv6 = "https://mirror.example.invalid/v6.tsv.gz?" },
 		"keep_days, off":   func(c *Config) { c.Connections.Enabled, c.Connections.KeepDays = false, 0 },
+		"scan_interval":    func(c *Config) { c.Connections.ScanInterval = D(14 * time.Minute) },
+		"scan_interval 1d": func(c *Config) { c.Connections.ScanInterval = D(24*time.Hour + time.Second) },
+		"scan_interval -1": func(c *Config) { c.Connections.ScanInterval = D(-time.Hour) },
 		"keep_mb":          func(c *Config) { c.Connections.KeepMB = 5 },
 		"refresh":          func(c *Config) { c.Geo.Refresh = D(time.Hour) },
 		"url, geo off":     func(c *Config) { c.Geo.Enabled, c.Geo.URLv4 = false, "http://example.invalid/x" },
@@ -491,5 +509,53 @@ func TestValidateChecksNetworkSections(t *testing.T) {
 		if err := Save(filepath.Join(t.TempDir(), FileName), c); err == nil {
 			t.Errorf("%s: saved", name)
 		}
+	}
+}
+
+// TestScanInterval: the LAN scan (docs/dhcp-table.md §6) sweeps every hour by default - also for a
+// config.json written before the setting existed, whose connections section does not name it - and
+// 0 switches it off: kept as 0 through Load and Save, without a warning. Validate takes 0 or 15
+// minutes to 24 hours.
+func TestScanInterval(t *testing.T) {
+	if d := Default().Connections.ScanInterval.Duration; d != time.Hour {
+		t.Fatalf("default %v, want 1h", d)
+	}
+	older := `{"version":1,"connections":{"enabled":true,"interval":"4m0s","devices_interval":"15m0s","keep_days":30,"keep_mb":200,"reverse_dns":true}}`
+	c, err := Load(writeConfig(t, older))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Connections.ScanInterval.Duration != time.Hour || len(c.Warnings()) != 0 {
+		t.Fatalf("a config.json without scan_interval: %v, warnings %q", c.Connections.ScanInterval, c.Warnings())
+	}
+	p := writeConfig(t, `{"version":1,"connections":{"scan_interval":"0s"}}`)
+	off, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if off.Connections.ScanInterval.Duration != 0 || len(off.Warnings()) != 0 {
+		t.Fatalf("scan_interval 0: %v, warnings %q", off.Connections.ScanInterval, off.Warnings())
+	}
+	if err := Save(p, off); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(p)
+	if err != nil || !strings.Contains(string(raw), `"scan_interval": "0s"`) {
+		t.Fatalf("saved %s (%v)", raw, err)
+	}
+	if again, err := Load(p); err != nil || again.Connections.ScanInterval.Duration != 0 || len(again.Warnings()) != 0 {
+		t.Fatalf("after Save: %+v %q %v", again.Connections, again.Warnings(), err)
+	}
+	for _, d := range []time.Duration{0, MinConnScanInterval, 3 * time.Hour, MaxConnScanInterval} {
+		c := Default()
+		c.Connections.ScanInterval = D(d)
+		if err := c.Validate(); err != nil {
+			t.Errorf("%v refused: %v", d, err)
+		}
+	}
+	bad := Default()
+	bad.Connections.ScanInterval = D(time.Minute)
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "connections.scan_interval must be 0 (no sweeps of the home network) or 15m0s to 24h0m0s") {
+		t.Errorf("1m: %v", err)
 	}
 }

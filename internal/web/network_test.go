@@ -1,9 +1,10 @@
 package web
 
-// GET /api/network/connections, /api/network/firewall and /api/network/status (docs/
-// syslog-map-graphic.md §2.2): the parameters are validated before the view is asked, the view's
-// answer is passed on (completed, and bounded), its errors are mapped as the other endpoints'
-// are, the work is bounded in time, and a monitor without the view answers 404.
+// GET /api/network/connections, /api/network/firewall, /api/network/devices and
+// /api/network/status (docs/syslog-map-graphic.md §2.2, docs/dhcp-table.md §2): the parameters
+// are validated before the view is asked, the view's answer is passed on (completed, and
+// bounded), its errors are mapped as the other endpoints' are, the work is bounded in time, and a
+// monitor without the view answers 404.
 
 import (
 	"context"
@@ -35,11 +36,16 @@ type fakeNetwork struct {
 	mu     sync.Mutex
 	conns  model.NetConnections
 	fw     model.NetFirewall
+	devs   model.NetDevicesView
 	status model.NetworkStatus
-	err    error // answered by Connections and Firewall
-	block  bool  // Connections and Firewall wait for their context to end
+	err    error // answered by Connections, Firewall, Devices and Device
+	block  bool  // Connections, Firewall, Devices and Device wait for their context to end
 	calls  []netCall
 	ctxErr error // the context error a blocked call saw
+	// detail is what Device answers, and asked the key and address of each of its calls
+	// (networkdevice_test.go).
+	detail model.NetDeviceDetail
+	asked  [][2]string
 }
 
 func (f *fakeNetwork) record(ctx context.Context, what string, q contracts.NetQuery) error {
@@ -77,6 +83,15 @@ func (f *fakeNetwork) Firewall(ctx context.Context, q contracts.NetQuery) (model
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.fw, nil
+}
+
+func (f *fakeNetwork) Devices(ctx context.Context, q contracts.NetQuery) (model.NetDevicesView, error) {
+	if err := f.record(ctx, "devices", q); err != nil {
+		return model.NetDevicesView{}, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.devs, nil
 }
 
 func (f *fakeNetwork) NetworkStatus() model.NetworkStatus {
@@ -196,6 +211,79 @@ func TestNetworkFirewallEndpoint(t *testing.T) {
 	}
 }
 
+// testDevices is a small, complete answer of the Devices view (documentation addresses only).
+func testDevices() model.NetDevicesView {
+	return model.NetDevicesView{
+		From: "2026-10-04T03:20:00Z", To: "2026-10-05T03:20:00Z", ListAt: "2026-10-05T03:10:00Z", Reads: 96,
+		NATReads: 360, NATAt: "2026-10-05T03:18:00Z",
+		Totals: model.NetDeviceTotals{Listed: 2, Online: 1, WiFi: 1, Wired: 1, Issues: 2, Unknown: 1},
+		Devices: []model.NetLANDevice{
+			{Key: "mac:00:00:5e:00:53:02", Name: "laptop", MAC: "00:00:5e:00:53:02", IPv4: "192.168.1.71", IPv6: []string{"2001:db8::71"},
+				Status: "on", Allocation: "dhcp", Connection: "Wi-Fi 2.4 GHz", Signal: 1, Seen: "2026-10-05T03:10:00Z", OnReads: 96, Reads: 96,
+				Addresses: []string{"192.168.1.71", "192.168.1.64"}, Open: 12, Sites: 40, Blocked: 3, BlockedIn: 1,
+				Issues: []model.NetIssue{{Code: model.IssueWeakWiFi, Level: model.IssueWarning, Text: "Its Wi-Fi signal is weak: the gateway draws it with 1 bar of 5 (Wi-Fi 2.4 GHz)."},
+					{Code: model.IssueAddressChanged, Level: model.IssueInfo, Text: "It held 2 IPv4 addresses in this period, the newest first: 192.168.1.71, 192.168.1.64."}}},
+			{Key: "mac:00:00:5e:00:53:01", Name: "office-pc", MAC: "00:00:5e:00:53:01", Status: "off", Allocation: "dhcp", Connection: "Ethernet LAN-1",
+				LastActivity: "Mon Oct 5 12:01:00 2026", Reads: 96, Issues: []model.NetIssue{{Code: model.IssueOffline, Level: model.IssueInfo,
+					Text: "The newest Device List read shows it off, and no read of this period showed it on."}}},
+		},
+		Unknown: []model.NetUnknownAddr{{Addr: "192.168.1.150", First: "2026-10-04T10:00:00Z", Last: "2026-10-05T03:00:00Z", Open: 2, Sites: 3,
+			Issues: []model.NetIssue{{Code: model.IssueUnlisted, Level: model.IssueWarning, Text: "No Device List read of this period names 192.168.1.150."}}}},
+		Addresses: []model.NetAddrUse{
+			{Addr: "192.168.1.64", Device: "mac:00:00:5e:00:53:02", Name: "laptop", MAC: "00:00:5e:00:53:02", First: "2026-10-04T03:10:00Z",
+				Last: "2026-10-04T20:00:00Z", Reads: 68},
+			{Addr: "192.168.1.71", Device: "mac:00:00:5e:00:53:02", Name: "laptop", MAC: "00:00:5e:00:53:02", First: "2026-10-04T20:15:00Z",
+				Last: "2026-10-05T03:10:00Z", Reads: 28, Shared: 1},
+		},
+	}
+}
+
+// TestNetworkDevicesEndpoint: GET /api/network/devices passes the period and the limit to the view
+// and its answer on as given, bounded in time; a device filter is refused (the view lists every
+// device).
+func TestNetworkDevicesEndpoint(t *testing.T) {
+	hs, nv := netHarness(t)
+	nv.devs = testDevices()
+	rec := hs.get("/api/network/devices?range=7d&limit=50")
+	wantStatus(t, rec, http.StatusOK)
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json; charset=utf-8" {
+		t.Errorf("Content-Type = %q", ct)
+	}
+	assertSecurityHeaders(t, rec.Header(), false)
+	if got := decode[model.NetDevicesView](t, rec); !jsonEqual(got, nv.devs) {
+		t.Errorf("answer not passed on as given:\n got %+v\nwant %+v", got, nv.devs)
+	}
+	for _, want := range []string{`"nat_reads":360`, `"nat_at":"2026-10-05T03:18:00Z"`, `"shared":1`, `"signal":1`, `"blocked_in":1`} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Errorf("answer lacks %s: %s", want, rec.Body.String())
+		}
+	}
+	calls := nv.takeCalls()
+	if len(calls) != 1 || calls[0].what != "devices" {
+		t.Fatalf("calls = %+v", calls)
+	}
+	if q := calls[0].q; !q.From.Equal(netNow.Add(-7*24*time.Hour)) || !q.To.Equal(netNow) || q.Range != "7d" || q.Limit != 50 || q.Device != "" {
+		t.Errorf("query = %+v", q)
+	}
+	if d := calls[0].deadline; d <= 0 || d > networkTimeout {
+		t.Errorf("the view had %v until its deadline, want at most %v", d, networkTimeout)
+	}
+	// From and to as for the other views.
+	wantStatus(t, hs.get("/api/network/devices?from=2026-10-05T01:20:00Z&to=2026-10-05T03:20:00Z"), http.StatusOK)
+	if calls := nv.takeCalls(); len(calls) != 1 || !calls[0].q.From.Equal(netNow.Add(-2*time.Hour)) || !calls[0].q.To.Equal(netNow) ||
+		calls[0].q.Range != "" || calls[0].q.Limit != 0 {
+		t.Errorf("calls = %+v", calls)
+	}
+	wantStatus(t, hs.serve(hs.request(http.MethodHead, "/api/network/devices", nil, nil)), http.StatusOK)
+	nv.takeCalls()
+	if msg := wantJSONError(t, hs.get("/api/network/devices?device=gateway"), http.StatusBadRequest); !strings.Contains(msg, "device") {
+		t.Errorf("message = %q", msg)
+	}
+	if calls := nv.takeCalls(); len(calls) != 0 {
+		t.Errorf("an invalid request reached the view: %+v", calls)
+	}
+}
+
 // TestNetworkQueryParameters: the period, the device filter and the limit, as parseNetworkQuery
 // reads them.
 func TestNetworkQueryParameters(t *testing.T) {
@@ -276,8 +364,8 @@ func TestNetworkQueryParameters(t *testing.T) {
 		{"device=" + strings.Repeat("k", MaxNetworkDeviceChars+1), "device must be a device key"},
 	} {
 		t.Run("bad "+tc.query, func(t *testing.T) {
-			for _, path := range []string{"/api/network/connections", "/api/network/firewall"} {
-				if strings.HasPrefix(tc.query, "device=") && path == "/api/network/firewall" {
+			for _, path := range []string{"/api/network/connections", "/api/network/firewall", "/api/network/devices"} {
+				if strings.HasPrefix(tc.query, "device=") && path != "/api/network/connections" {
 					continue // refused there for being a device filter at all
 				}
 				rec := hs.get(path + "?" + tc.query)
@@ -322,6 +410,45 @@ func TestNetworkAnswersAreCompletedAndBounded(t *testing.T) {
 	}
 	if strings.Contains(body, "null") {
 		t.Errorf("firewall answer holds null: %s", body)
+	}
+	rec = hs.get("/api/network/devices?range=1h")
+	wantStatus(t, rec, http.StatusOK)
+	body = rec.Body.String()
+	for _, want := range []string{`"from":"2026-10-05T02:20:00Z"`, `"to":"2026-10-05T03:20:00Z"`, `"devices":[]`, `"unknown":[]`,
+		`"addresses":[]`, `"reads":0`, `"nat_reads":0`, `"totals":{"listed":0,"online":0,"wifi":0,"wired":0,"issues":0,"unknown":0,"scanned":0}`,
+		`"scans":0`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("devices answer lacks %s: %s", want, body)
+		}
+	}
+	if strings.Contains(body, "null") {
+		t.Errorf("devices answer holds null: %s", body)
+	}
+	// Issues left nil are sent as [], without changing what the view returned.
+	nv.devs = model.NetDevicesView{Devices: []model.NetLANDevice{{Key: "mac:00:00:5e:00:53:01"}}, Unknown: []model.NetUnknownAddr{{Addr: "192.168.1.150"}}}
+	body = hs.get("/api/network/devices").Body.String()
+	if !strings.Contains(body, `"key":"mac:00:00:5e:00:53:01","on_reads":0,"reads":0,"open":0,"sites":0,"blocked":0,"blocked_in":0,"scan_hits":0,"issues":[]`) ||
+		!strings.Contains(body, `"addr":"192.168.1.150","open":0,"sites":0,"blocked":0,"blocked_in":0,"issues":[]`) || strings.Contains(body, "null") {
+		t.Errorf("devices answer: %s", body)
+	}
+	if nv.devs.Devices[0].Issues != nil || nv.devs.Unknown[0].Issues != nil {
+		t.Error("completing the answer changed the view's own lists")
+	}
+	// At most the limit of unknown addresses; the total still counts them all.
+	unknown := make([]model.NetUnknownAddr, 1500)
+	for i := range unknown {
+		unknown[i] = model.NetUnknownAddr{Addr: fmt.Sprintf("10.0.%d.%d", i/250, 1+i%250), Issues: []model.NetIssue{}}
+	}
+	for _, tc := range []struct {
+		query        string
+		listed, told int
+		total        int
+	}{{"", MaxNetworkLimit, 1500, 1500}, {"?limit=20", 20, 1500, 1500}, {"?limit=100000", MaxNetworkLimit, 1500, 1500}, {"?limit=5", 5, 2, 5}} {
+		nv.devs = model.NetDevicesView{Unknown: unknown, Totals: model.NetDeviceTotals{Unknown: tc.told}}
+		dv := decode[model.NetDevicesView](t, hs.get("/api/network/devices"+tc.query))
+		if len(dv.Unknown) != tc.listed || dv.Totals.Unknown != max(tc.total, tc.listed) || dv.Unknown[0].Addr != "10.0.0.1" {
+			t.Errorf("devices%s: %d unknown of %d", tc.query, len(dv.Unknown), dv.Totals.Unknown)
+		}
 	}
 
 	rows := make([]model.NetConnRow, 1500)
@@ -380,7 +507,8 @@ func TestNetworkEndpointsErrors(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			hs, nv := netHarness(t)
 			nv.err = tc.err
-			for _, ep := range []struct{ path, op string }{{"/api/network/connections", "network connections"}, {"/api/network/firewall", "network firewall"}} {
+			for _, ep := range []struct{ path, op string }{{"/api/network/connections", "network connections"}, {"/api/network/firewall", "network firewall"},
+				{"/api/network/devices", "network devices"}} {
 				rec := hs.get(ep.path)
 				msg := wantJSONError(t, rec, tc.code)
 				if !strings.Contains(msg, tc.contains) {
@@ -398,7 +526,7 @@ func TestNetworkEndpointsErrors(t *testing.T) {
 	// request's own context) and the view sees its context end.
 	hs, nv := netHarness(t)
 	nv.block = true
-	for _, path := range []string{"/api/network/connections", "/api/network/firewall"} {
+	for _, path := range []string{"/api/network/connections", "/api/network/firewall", "/api/network/devices"} {
 		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 		wantJSONError(t, hs.serve(hs.request(http.MethodGet, path, nil, nil).WithContext(ctx)), http.StatusGatewayTimeout)
 		cancel()
@@ -418,8 +546,8 @@ func TestNetworkEndpointsErrors(t *testing.T) {
 
 func TestNetworkEndpointsWithoutView(t *testing.T) {
 	hs := newHarness(t)
-	for _, path := range []string{"/api/network/connections", "/api/network/firewall", "/api/network/status",
-		"/api/network/connections?range=bogus"} { // 404 before the parameters are looked at
+	for _, path := range []string{"/api/network/connections", "/api/network/firewall", "/api/network/devices", "/api/network/status",
+		"/api/network/connections?range=bogus", "/api/network/devices?device=x"} { // 404 before the parameters are looked at
 		rec := hs.get(path)
 		if msg := wantJSONError(t, rec, http.StatusNotFound); !strings.Contains(msg, "Network page is not available") {
 			t.Errorf("%s: message = %q", path, msg)
@@ -476,7 +604,7 @@ func TestNetworkStatusEndpoint(t *testing.T) {
 func TestNetworkEndpointsSecurity(t *testing.T) {
 	hs, nv := netHarness(t)
 	nv.conns = testConnections()
-	for _, path := range []string{"/api/network/connections", "/api/network/firewall", "/api/network/status"} {
+	for _, path := range []string{"/api/network/connections", "/api/network/firewall", "/api/network/devices", "/api/network/status"} {
 		t.Run(path, func(t *testing.T) {
 			for _, host := range []string{"evil.example:8320", "127.0.0.1.nip.io:8320", "192.168.1.71:8320"} {
 				req := hs.request(http.MethodGet, path, nil, nil)

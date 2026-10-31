@@ -438,7 +438,7 @@ func TestSecureDataDirJunctionInsideNotFollowed(t *testing.T) {
 func TestCheckNotCritical(t *testing.T) {
 	cs := criticalSet{
 		trees: []string{`C:\Windows`},
-		dirs:  []string{`C:\Program Files`, `C:\ProgramData`, `C:\Users`, `C:\Users\Dell`},
+		dirs:  []string{`C:\Program Files`, `C:\ProgramData`, `C:\Users`, `C:\Users\owner`},
 	}
 	tests := []struct {
 		path    string
@@ -461,9 +461,9 @@ func TestCheckNotCritical(t *testing.T) {
 		{`C:\Program Files`, "protected folder"},
 		{`C:\Program Files\ATT Monitor`, ""},
 		{`C:\Users`, "protected folder"},
-		{`C:\users\dell`, "protected folder"},
-		{`C:\Users\Dell\..`, "protected folder"}, // cleaned to C:\Users
-		{`C:\Users\Dell\ATTMonitor`, ""},
+		{`C:\users\OWNER`, "protected folder"},
+		{`C:\Users\owner\..`, "protected folder"}, // cleaned to C:\Users
+		{`C:\Users\owner\ATTMonitor`, ""},
 		{`\\server\share\ATTMonitor`, ""},
 		{`D:\Evidence\ATTMonitor`, ""},
 	}

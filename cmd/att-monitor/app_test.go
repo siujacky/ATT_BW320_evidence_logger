@@ -172,6 +172,22 @@ func TestOpenStackNetwork(t *testing.T) {
 		st.Store.KeepMB != 200 {
 		t.Fatalf("Status.connections %+v", st)
 	}
+	// The LAN scan: the scanner of gateway.host's network (it sends nothing until the monitor
+	// sweeps, every hour by default), and the connection store keeps the sweeps.
+	if s.scanner == nil || s.lanScanner() == nil || s.scanStore() == nil || st.ScanInterval != "1h0m0s" || st.ScanAt != "" {
+		t.Fatalf("console: scanner %v, scan store %v; Status.connections %+v", s.scanner, s.scanStore(), st)
+	}
+	scan := model.LANScan{Subnet: "192.168.1.0/24", Self: "192.168.1.71", Asked: 254,
+		Hosts: []model.LANHost{{IP: "192.168.1.71", MAC: "00:00:5e:00:53:71"}}}
+	if err := s.scanStore().AppendScan(now().UTC().Add(-time.Minute), scan); err != nil {
+		t.Fatal(err)
+	}
+	if m, _ := filepath.Glob(filepath.Join(paths.Connections, "scan-*.jsonl")); len(m) != 1 {
+		t.Fatalf("scan files in %s: %v", paths.Connections, m)
+	}
+	if last, ok := s.conns.LastScan(); !ok || len(last.Hosts) != 1 {
+		t.Fatalf("the scan kept: %+v, %v", last, ok)
+	}
 	ns := s.network.NetworkStatus()
 	if ns.Store == nil || ns.IPIntel == nil || !ns.IPIntel.Enabled || !ns.IPIntel.Download || !ns.IPIntel.ReverseDNS || ns.IPIntel.Loaded ||
 		ns.Syslog == nil || ns.Syslog.KeepMB != 64 {
@@ -205,8 +221,9 @@ func TestOpenStackNetwork(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.close()
-	if c.conns != nil || c.intel != nil || c.network != nil || c.connStore() != nil || c.ipIntel() != nil || c.networkView() != nil {
-		t.Fatalf("cli: store %v, IP database %v, view %v", c.conns, c.intel, c.network)
+	if c.conns != nil || c.intel != nil || c.network != nil || c.connStore() != nil || c.ipIntel() != nil || c.networkView() != nil ||
+		c.scanner != nil || c.lanScanner() != nil || c.scanStore() != nil {
+		t.Fatalf("cli: store %v, IP database %v, view %v, scanner %v", c.conns, c.intel, c.network, c.scanner)
 	}
 	if st := c.mon.Status(); st.Connections != nil {
 		t.Errorf("the CLI's monitor has samplers: %+v", st.Connections)

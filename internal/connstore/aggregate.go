@@ -33,9 +33,9 @@ type sumEntry struct {
 // newest at or before it, else the first after it - or, when that read does not list the address,
 // the next read within devNextWithin (a device that has just joined). With q.Device, Devices and
 // Flows hold that device only; Samples, First, Last and the newest read's totals stay those of
-// every read. At most maxFlows flows are counted one by one, the heaviest: should the period hold
-// more, the lightest are left out (FlowsLeftOut; their sessions count in their device's weight
-// and LeftOut).
+// every read. Each device's Open counts its sessions in the newest read of the period. At most
+// maxFlows flows are counted one by one, the heaviest: should the period hold more, the lightest
+// are left out (FlowsLeftOut; their sessions count in their device's weight and LeftOut).
 //
 // Its work is bounded: a whole past UTC day inside the period comes from a cache of day
 // summaries (keyed by the day's file names, sizes and modification times, and the Device List

@@ -7,13 +7,15 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"attmonitor/internal/model"
 )
 
 // opPrune names the retention in Usage().Error.
 const opPrune = "prune"
 
 // Prune applies the retention limits at now (the zero time: the current time). It deletes whole
-// days, oldest first, with every file of the day of both kinds: each day that ended KeepDays
+// days, oldest first, with every file of the day of every kind: each day that ended KeepDays
 // days or more before now (all its reads are older than that), then, while the files kept take
 // more than KeepMB MiB (compressed days at their stored size), the oldest days left. The day of
 // now and later days are never deleted. A file that another program holds is deleted later; its
@@ -163,7 +165,7 @@ func (s *Store) prune(now time.Time) error {
 	return nil
 }
 
-// deleteDay deletes the files of both kinds of day d (bytes of them, beyond the limit why). Its
+// deleteDay deletes the files of every kind of day d (bytes of them, beyond the limit why). Its
 // files leave the index at once; one that another program holds is deleted later (s.wmu held).
 func (s *Store) deleteDay(d day, bytes int64, why string) {
 	for k := range numKinds {
@@ -188,8 +190,17 @@ func (s *Store) deleteDay(d day, bytes int64, why string) {
 		delete(s.retryAt, fileKey{kind: k, day: d})
 		delete(s.failures, opCompress(k, d))
 		s.forgetWarnings(k, d)
+		// The newest LAN scan is no longer kept once its day is gone: LastScan gives the newest of
+		// those left (as a rule none: the days go oldest first, and today's never).
+		lastGone := k == kindScan && s.hasScan && dayOf(s.lastScanAt) == d
+		if lastGone {
+			s.lastScan, s.lastScanAt, s.hasScan = model.LANScan{}, time.Time{}, false
+		}
 		s.mu.Unlock()
 		s.dropCached(k, d)
+		if lastGone {
+			s.loadLastScan(dayOf(s.now()))
+		}
 	}
 	s.log.Info("connection store: deleted a day beyond the retention limits", "day", d.String(), "bytes", bytes, "limit", why)
 }

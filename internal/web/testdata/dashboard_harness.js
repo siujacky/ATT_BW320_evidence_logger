@@ -15,7 +15,12 @@
  * and left, then the Syslog page's retention form), "gwsyslog" (the control of the gateway's
  * Syslog setting on the Syslog page and in the overview's syslog details), "gwsyslogon" /
  * "gwsyslogoff" (one change of that setting on the Syslog page), "network" (the Network page
- * only, used as networkSteps does), "networktabs" (its two tabs as they first show), "details"
+ * only, used as networkSteps does), "networktabs" (its three tabs as they first show), "devices"
+ * (its Devices tab used in full: devicesSteps), "devicesdeep" (the page loaded at a device's
+ * details on the Devices tab, $HARNESS_HASH: devicesDeepScenario), "devicesstale" (a device's
+ * details while the page's refresh fails: devicesStaleScenario; the server must offer
+ * /demo/network), "devicesfix" (the Devices tab where a review found it wanting:
+ * devicesFixScenario; /demo/network, /demo/syslog, /demo/devlog), "details"
  * (each card's details opened and closed every way, a status update while they are open, an
  * AT&T outage: detailsScenario; the server must offer /demo/state), "deeplink" (the page
  * loaded with the address of a card's details, $HARNESS_HASH: deepLinkScenario), "deepfail" (the
@@ -574,6 +579,7 @@ const selection = { isCollapsed: true, anchorNode: null, focusNode: null, toStri
 
 function selectText(node) {
   Object.assign(selection, { isCollapsed: !node, anchorNode: node || null, focusNode: node || null });
+  document.dispatchEvent(new FakeEvent('selectionchange')); // as a browser does
 }
 
 /** fireLongTimers runs the pending timers of a second or more (each once). */
@@ -1446,6 +1452,441 @@ async function networkSteps() {
   capture('network firewall 1h');
 }
 
+/** devicesSteps uses the Network page's Devices tab as a reader does (docs/dhcp-table.md §3): the
+ *  tab as it first shows ("devices"); the find box with a name, an IPv4 address (the address panel:
+ *  a reused address, then two claiming one, then one no device of the list held), a MAC address
+ *  written with dashes, a part of an IPv6 address, a text nothing matches, then nothing; the table
+ *  sorted by its columns; each of four devices' details opened - with Enter or Space on its name,
+ *  a click on its name, a click elsewhere on its row - and closed - with Esc, the close button, the
+ *  backdrop, Back -, the address, the history, the keyboard focus and the scroll lock noted before,
+ *  while open and after (facts.devices.steps); a link in the details to the other device of an
+ *  address conflict, followed (facts.devices.link); the details open across the page's refresh
+ *  every minute, with the focus in them (facts.devices.refresh); a period chosen with the find box
+ *  holding text (facts.devices.period). */
+async function devicesSteps() {
+  await visit('#/network/devices?range=24h');
+  capture('devices');
+  const out = {};
+  const findBox = () => view().querySelector('input[name="find"]');
+  const type = async (text) => {
+    const b = findBox();
+    if (!b) {
+      errors.push('the Devices tab has no find box');
+      return;
+    }
+    b.focus();
+    b.value = text;
+    b.dispatchEvent(new FakeEvent('input'));
+    await tick(250);
+    await settle();
+  };
+  for (const [name, text] of [['name', 'printer'], ['ipv4', '192.168.1.80'], ['conflict', '192.168.1.068'], ['nobody', '192.168.1.99'],
+    ['unknown', '192.168.1.90'], ['mac', '00-00-5e-00-53-0a'], ['ipv6', '7a10:5a3c'], ['none', 'no such device']]) {
+    await type(text);
+    capture('devices find ' + name);
+  }
+  out.findHash = location.hash;
+  out.findFocus = focusOf();
+  await type('');
+  out.clearedHash = location.hash;
+  for (const label of ['Name', 'IPv4', 'Last seen on', 'Status']) {
+    const b = view().querySelectorAll('button.th-sort').find((x) => x.textContent.startsWith(label));
+    if (!b) {
+      errors.push('the Devices tab has no sort button ' + label);
+      continue;
+    }
+    b.focus();
+    b.click();
+    await tick(20);
+    capture('devices sort ' + label);
+  }
+  // Back to the default order: by the issues, the most first (the header is drawn again each time).
+  for (let i = 0; i < 2; i++) {
+    const b = view().querySelectorAll('button.th-sort').find((x) => x.textContent.startsWith('Issues'));
+    if (!b || b.closest('th').getAttribute('aria-sort') === 'descending') break;
+    b.click();
+    await tick(20);
+  }
+  capture('devices sorted back');
+
+  const state = () => {
+    const dlg = detailDialog();
+    return { hash: location.hash, length: hist.entries.length, index: hist.index, focus: focusOf(), open: !!dlg,
+      locked: document.documentElement.classList.contains('detail-open'), modals: modals.length, title: dlg ? dlg.querySelector('h2').textContent : '' };
+  };
+  const nameButton = (name) => view().querySelectorAll('button.dev-open').find((b) => b.textContent.trim() === name) || null;
+  const steps = [];
+  for (const [name, how, close] of [['Printer', 'enter', 'escape'], ['Laptop', 'space', 'close'], ['Smart speaker', 'click', 'backdrop'], ['Game console', 'row', 'back']]) {
+    const b = nameButton(name);
+    if (!b) {
+      errors.push('the Devices tab has no row for ' + name);
+      continue;
+    }
+    const before = state();
+    if (how === 'enter') await pressKeyOn(b, 'Enter');
+    else if (how === 'space') await pressKeyOn(b, ' ');
+    else if (how === 'click') {
+      b.focus();
+      b.click();
+      await settle();
+    } else {
+      // A click on the row's MAC address cell (not on its name).
+      const td = b.closest('tr').querySelectorAll('td')[3];
+      td.dispatchEvent(new FakeEvent('click', { bubbles: true }));
+      await settle();
+    }
+    const opened = state();
+    capture('device ' + name);
+    await closeDetail(close);
+    steps.push({ name, how, close, before, opened, after: state() });
+  }
+  out.steps = steps;
+
+  // The printer's details name the other device that claims its address: its link opens that
+  // device's details (an address, as any link: Back goes back to the printer's).
+  const printer = nameButton('Printer');
+  if (printer) {
+    printer.focus();
+    printer.click();
+    await settle();
+    const links = detailDialog() ? detailDialog().querySelectorAll('a') : [];
+    out.links = links.map((a) => [a.textContent.trim(), a.getAttribute('href') || '']);
+    const link = links.find((a) => a.textContent.trim() === 'Security camera') || null;
+    out.link = { found: !!link };
+    if (link) {
+      await visit(link.getAttribute('href'));
+      capture('device linked');
+      out.link.after = state();
+      await back();
+      out.link.back = state();
+      await closeDetail('escape');
+      out.link.closed = state();
+    }
+  }
+
+  // An unknown address's details: its row's address opens them, as a device's name does; closed,
+  // the focus is back on that address.
+  const unk = view().querySelectorAll('button.unk-open').find((b) => b.textContent.trim() === '192.168.1.50') || null;
+  if (unk) {
+    const before = state();
+    unk.focus();
+    unk.click();
+    await settle();
+    const opened = state();
+    capture('device unknown');
+    await closeDetail('escape');
+    out.unknown = { before, opened, after: state() };
+  } else {
+    errors.push('the unknown addresses have no row for 192.168.1.50');
+  }
+
+  // The details open across the page's refresh every minute: the same dialog, the focus kept.
+  const laptop = nameButton('Laptop');
+  if (laptop) {
+    laptop.focus();
+    laptop.click();
+    await settle();
+    const dlg = detailDialog();
+    const link = dlg ? dlg.querySelectorAll('a').find((a) => a.textContent.startsWith('Show its connections')) : null;
+    if (link) link.focus();
+    const before = focusOf();
+    await refresh();
+    out.refresh = { sameDialog: !!dlg && detailDialog() === dlg, focusBefore: before, focus: focusOf(), hash: location.hash };
+    await closeDetail('escape');
+  }
+
+  // A period chosen with the find box holding text: both stay in the address.
+  await type('laptop');
+  radio('7d');
+  await settle();
+  capture('devices 7d');
+  out.period = { hash: location.hash, find: findBox() ? findBox().value : '' };
+  facts.devices = out;
+}
+
+/** hostileDevicesSteps shows the Devices tab with hostile data ("network devices"): the address
+ *  panel of the address two devices claim, their names in it ("network devices find"), and every
+ *  device's details, each checked as it shows (the first row's captured, "network device first",
+ *  and those of the device whose status is hostile too, "network device status"). */
+async function hostileDevicesSteps() {
+  await visit('#/network/devices?range=24h');
+  capture('network devices');
+  const box = view().querySelector('input[name="find"]');
+  if (box) {
+    box.value = '192.168.1.68';
+    box.dispatchEvent(new FakeEvent('input'));
+    await tick(250);
+    await settle();
+    capture('network devices find');
+    box.value = '';
+    box.dispatchEvent(new FakeEvent('input'));
+    await tick(250);
+    await settle();
+  }
+  const names = view().querySelectorAll('button.dev-open').map((b) => b.getAttribute('data-key'));
+  const odd = view().querySelectorAll('tr').find((tr) => tr.querySelector('.dev-state.is-unknown') && tr.querySelector('button.dev-open'));
+  const oddKey = odd ? odd.querySelector('button.dev-open').getAttribute('data-key') : '';
+  if (!oddKey) errors.push('no device of the Devices tab shows a status that is neither on nor off');
+  for (let i = 0; i < names.length; i++) {
+    const b = view().querySelectorAll('button.dev-open').find((x) => x.getAttribute('data-key') === names[i]);
+    if (!b) continue;
+    b.focus();
+    b.click();
+    await settle();
+    if (i === 0) capture('network device first');
+    else if (names[i] === oddKey) capture('network device status');
+    else checkDocument('device ' + i);
+    await pressEscape();
+  }
+}
+
+/** devicesStaleScenario: a device's details open while the Network page's refresh fails
+ *  (/demo/network?state=unavailable: its views fail), twice, then works again (facts.devicesStale).
+ *  The server must offer /demo/network. */
+async function devicesStaleScenario() {
+  await visit('#/network/devices?range=24h');
+  const b = view().querySelectorAll('button.dev-open').find((x) => x.textContent.trim() === 'Printer');
+  if (!b) {
+    errors.push('the Devices tab has no row for Printer');
+    return;
+  }
+  b.focus();
+  b.click();
+  await settle();
+  const out = { before: detailOf() };
+  await fetch(new URL('/demo/network?state=unavailable', base));
+  await refresh();
+  out.failed = detailOf();
+  const dlg = detailDialog();
+  const note = dlg ? dlg.querySelector('.detail-stale') : null;
+  await refresh();
+  out.sameNote = !!note && !!detailDialog() && detailDialog().querySelector('.detail-stale') === note;
+  out.sameDialog = !!dlg && detailDialog() === dlg;
+  await fetch(new URL('/demo/network', base));
+  await refresh();
+  out.back = detailOf();
+  out.focus = focusOf();
+  facts.devicesStale = out;
+}
+
+/** devicesFixScenario checks the Devices tab where a review found it wanting (facts.devicesFix):
+ *  the address panel of an address an entry that is on and one that is off are listed with, and of
+ *  one two entries that are off are (state "panel"); of an address only the LAN scans saw, and of
+ *  one a MAC address no read names answered for (state "fixedguest"), with that address's details;
+ *  the unknown addresses found by their MAC address; the Scan column's times, and its words when
+ *  the newest scan is too old to compare (state "stalescan"); the syslog caveats of the tab and of a
+ *  device's details (the gateway sending its log elsewhere, the receiver off, the syslog kept
+ *  starting after the period does); the tables' sideways scroll across the refresh; a message's
+ *  datagram opened across a refresh that brings a newer message, while text is selected in the
+ *  details and once it no longer is; the details a link names that the period does not have; a
+ *  site counted in the singular. The server must offer /demo/network, /demo/syslog and
+ *  /demo/devlog (devicesServer). */
+async function devicesFixScenario() {
+  const out = {};
+  const demo = async (path) => { await fetch(new URL(path, base)); };
+  const norm = (t) => String(t || '').replace(/\s+/g, ' ').trim();
+  const findBox = () => view().querySelector('input[name="find"]');
+  const type = async (text) => {
+    const b = findBox();
+    if (!b) {
+      errors.push('the Devices tab has no find box');
+      return;
+    }
+    b.focus();
+    b.value = text;
+    b.dispatchEvent(new FakeEvent('input'));
+    await tick(250);
+    await settle();
+  };
+  const panel = () => {
+    const p = view().querySelector('.dev-panel');
+    const keys = p ? p.querySelectorAll('[data-fk]').map((e) => e.getAttribute('data-fk')) : [];
+    const live = document.getElementById('live');
+    return { text: p && !p.hidden ? norm(p.textContent) : '', keys, unique: new Set(keys).size === keys.length, live: live ? norm(live.textContent) : '' };
+  };
+  const row = (name) => view().querySelectorAll('button.dev-open').find((b) => b.textContent.trim() === name);
+  const scanCells = () => {
+    const cells = {};
+    for (const name of ['Printer', 'Doorbell', 'Office PC', 'Tablet', 'E-reader']) {
+      const b = row(name);
+      const td = b ? b.closest('tr').querySelector('td.dev-scan') : null;
+      cells[name] = td ? norm(td.textContent) : null;
+    }
+    return cells;
+  };
+  const open = async (name) => {
+    const b = row(name);
+    if (!b) {
+      errors.push('the Devices tab has no row for ' + name);
+      return null;
+    }
+    b.focus();
+    b.click();
+    await settle();
+    return detailDialog();
+  };
+
+  // Entries that are off claim no address: on and off, then two off.
+  await demo('/demo/network?state=panel');
+  await visit('#/network/devices?range=24h');
+  await type('192.168.1.71');
+  out.onOff = panel();
+  await type('192.168.1.80');
+  out.offOff = panel();
+
+  // An address only the LAN scans saw; the unknown addresses found by a MAC address.
+  await demo('/demo/network');
+  await refresh();
+  await type('192.168.1.50');
+  out.scanOnly = panel();
+  const unknownRows = () => view().querySelectorAll('button.unk-open').map((b) => b.textContent.trim());
+  await type('00-00-5e-00-53-21');
+  out.unknownByMAC = unknownRows();
+  await type('0000.5e00.5321');
+  out.unknownByMACDots = unknownRows();
+  await type('');
+
+  // An address a MAC address no read names answered for, which the reads give to devices of the list.
+  await demo('/demo/network?state=fixedguest');
+  await refresh();
+  await type('192.168.1.80');
+  out.named = panel();
+  const pnl = view().querySelector('.dev-panel');
+  const its = pnl ? pnl.querySelectorAll('button').find((b) => b.textContent.trim() === 'Its details') : null;
+  if (its) {
+    its.focus();
+    its.click();
+    await settle();
+    capture('devices fix named');
+    await closeDetail('escape');
+    out.namedFocus = focusOf();
+  } else {
+    errors.push('the address panel has no link to the unknown address’s details');
+  }
+  await type('');
+
+  // The Scan column: answered at the scan's time; then a newest scan too old to compare.
+  await demo('/demo/network');
+  await refresh();
+  out.scanCells = scanCells();
+  await demo('/demo/network?state=stalescan');
+  await refresh();
+  out.staleCells = scanCells();
+  const line = view().querySelector('.dev-scan-line');
+  out.staleLine = line ? norm(line.textContent) : '';
+  await demo('/demo/network');
+  await refresh();
+
+  // The syslog caveats: the gateway sends its log elsewhere; the receiver is off; the syslog kept
+  // starts after the period does.
+  await demo('/demo/syslog?state=elsewhere');
+  await refresh();
+  capture('devices fix elsewhere');
+  if (await open('Printer')) {
+    capture('devices fix elsewhere printer');
+    await closeDetail('escape');
+  }
+  await demo('/demo/syslog?state=disabled');
+  await refresh();
+  capture('devices fix receiver off');
+  await demo('/demo/syslog');
+  await refresh();
+  radio('30d');
+  await settle();
+  capture('devices fix 30d');
+  if (await open('Printer')) {
+    capture('devices fix 30d printer');
+    await closeDetail('escape');
+  }
+  radio('24h');
+  await settle();
+
+  // The tables' sideways scroll across the refresh every minute.
+  const others = () => view().querySelectorAll('.table-scroll').find((x) => !x.classList.contains('dev-scroll')) || null;
+  const devScroll = view().querySelector('.dev-scroll');
+  const unkScroll = others();
+  if (devScroll) devScroll.scrollLeft = 140;
+  if (unkScroll) unkScroll.scrollLeft = 60;
+  await refresh();
+  const unkAfter = others();
+  out.scroll = { same: !!devScroll && view().querySelector('.dev-scroll') === devScroll, left: devScroll ? devScroll.scrollLeft : -1,
+    unknownLeft: unkAfter ? unkAfter.scrollLeft : -1, unknownFound: !!unkScroll, unknownNew: !!unkAfter && unkAfter !== unkScroll };
+
+  // A message's datagram opened, a newer message arriving while text is selected in the details,
+  // then the selection gone.
+  const dlg = await open('Printer');
+  const raws = () => (detailDialog() ? detailDialog().querySelectorAll('details.syslog-raw') : []);
+  const first = raws()[0] || null;
+  if (dlg && first) {
+    first.open = true;
+    first.dispatchEvent(new FakeEvent('toggle'));
+    const key = first.getAttribute('data-fk');
+    const keys = raws().map((d) => d.getAttribute('data-fk'));
+    const body = dlg.querySelector('.detail-body');
+    const sel = body ? body.querySelector('p') : null;
+    selectText(sel);
+    await demo('/demo/devlog?addr=192.168.1.68');
+    await refresh();
+    const during = { kept: !!sel && document.contains(sel), messages: raws().length };
+    selectText(null);
+    await settle();
+    const after = raws();
+    out.datagram = {
+      key, keys, unique: new Set(keys).size === keys.length, during,
+      after: { redrawn: !!sel && !document.contains(sel), messages: after.length, open: after.filter((d) => d.open).map((d) => d.getAttribute('data-fk')),
+        top: after.length ? after[0].getAttribute('data-fk') : '', topOpen: after.length ? after[0].open : null },
+    };
+    await closeDetail('escape');
+  } else {
+    errors.push('the printer’s details show no syslog message');
+  }
+
+  // A device with a single site.
+  const one = view().querySelectorAll('tr.dev-row').find((tr) => norm(tr.querySelectorAll('td')[9].textContent) === '1');
+  if (one) {
+    const b = one.querySelector('button.dev-open');
+    b.focus();
+    b.click();
+    await settle();
+    capture('devices fix one site');
+    await closeDetail('escape');
+  } else {
+    errors.push('no device of the Device List reached a single site');
+  }
+
+  // The details a link names that the period does not have: a device, then an address; the next
+  // details opened take the note away.
+  const missing = () => {
+    const m = view().querySelector('.dev-missing');
+    return m && !m.hidden ? norm(m.textContent) : '';
+  };
+  await visit('#/network/devices?range=24h&detail=' + encodeURIComponent('mac:00:00:5e:00:53:99'));
+  out.missingDevice = { text: missing(), open: !!detailDialog(), hash: location.hash };
+  await visit('#/network/devices?range=24h&detail=' + encodeURIComponent('addr:192.168.1.123'));
+  out.missingAddress = { text: missing(), open: !!detailDialog() };
+  if (await open('Printer')) {
+    out.missingAfterOpen = missing();
+    await closeDetail('escape');
+  }
+  facts.devicesFix = out;
+}
+
+/** devicesDeepScenario starts with the page loaded at a device's details ($HARNESS_HASH: the
+ *  Devices tab's address with detail=<key>): they open once the devices are read, and the address
+ *  keeps naming them; closed, they replace the address with the tab's (facts.devicesDeep). */
+async function devicesDeepScenario() {
+  await settle();
+  capture('devices deep');
+  const opened = { hash: location.hash, length: hist.entries.length, index: hist.index, focus: focusOf(), open: !!detailDialog() };
+  if (!opened.open) { // details the period does not have: the tab says so
+    facts.devicesDeep = { opened };
+    return;
+  }
+  await closeDetail('close');
+  capture('devices deep closed');
+  facts.devicesDeep = { opened, closed: { hash: location.hash, length: hist.entries.length, index: hist.index, focus: focusOf(), open: !!detailDialog() } };
+}
+
 /** summaryScenario captures the Overview's summary ("overview") and the details of each card
  *  $HARNESS_DETAILS names (comma-separated), each as "overview <key>", opened with a click and
  *  closed with Esc. */
@@ -1695,6 +2136,10 @@ async function run() {
     capture('deep fail');
     return;
   }
+  if (scenario === 'devicesdeep') { // the page loaded at a device's details on the Devices tab ($HARNESS_HASH)
+    await devicesDeepScenario();
+    return;
+  }
   await visit('#/');
   capture('overview');
   if (scenario === 'summary') {
@@ -1731,11 +2176,25 @@ async function run() {
     await networkSteps();
     return;
   }
-  if (scenario === 'networktabs') { // both tabs of the Network page as they first show
+  if (scenario === 'networktabs') { // the tabs of the Network page as they first show
     await visit('#/network?range=24h');
     capture('network');
     await visit('#/network/firewall?range=24h');
     capture('network firewall');
+    await visit('#/network/devices?range=24h');
+    capture('network devices');
+    return;
+  }
+  if (scenario === 'devices') { // the Network page's Devices tab, used in full
+    await devicesSteps();
+    return;
+  }
+  if (scenario === 'devicesstale') { // a device's details while the refresh fails (/demo/network)
+    await devicesStaleScenario();
+    return;
+  }
+  if (scenario === 'devicesfix') { // the Devices tab where a review found it wanting (devicesServer)
+    await devicesFixScenario();
     return;
   }
   if (scenario === 'gwsyslog') {
@@ -1811,15 +2270,18 @@ async function run() {
     capture('syslog search');
   }
 
-  // The Network page: used in full with hostile data, else its two tabs as they first show
-  // (TestDashboardNetworkPage uses it in full with the demo's own data).
+  // The Network page: used in full with hostile data, else its tabs as they first show
+  // (TestDashboardNetworkPage and TestDashboardDevicesTab use it in full with the demo's own data).
   if (scenario === 'hostile') {
     await networkSteps();
+    await hostileDevicesSteps();
   } else {
     await visit('#/network?range=24h');
     capture('network');
     await visit('#/network/firewall?range=24h');
     capture('network firewall');
+    await visit('#/network/devices?range=24h');
+    capture('network devices');
   }
 
   await visit('#/evidence');

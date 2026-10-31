@@ -190,8 +190,13 @@ type ConnectionsConfig struct {
 	Interval Duration `json:"interval"`
 	// DevicesInterval is the time between two Device List reads (5 min to 24 h, default 15 min).
 	DevicesInterval Duration `json:"devices_interval"`
-	KeepDays        int      `json:"keep_days"`
-	KeepMB          int      `json:"keep_mb"`
+	// ScanInterval is the time between two sweeps of the home network (docs/dhcp-table.md §6: 15
+	// min to 24 h, default 1 h; 0: no sweeps): every address of this PC's own IPv4 network - that
+	// of its interface that holds gateway.host - is asked by ARP who has it, once. Nothing leaves
+	// the home network, and nothing else is sent to the devices (no ping, no port).
+	ScanInterval Duration `json:"scan_interval"`
+	KeepDays     int      `json:"keep_days"`
+	KeepMB       int      `json:"keep_mb"`
 	// ReverseDNS looks up the reverse DNS (PTR) names of the public addresses the dashboard shows,
 	// through this computer's resolver, a few at a time; the names are cached.
 	ReverseDNS bool `json:"reverse_dns"`
@@ -221,6 +226,8 @@ const (
 	MaxConnInterval        = 4 * time.Minute
 	MinConnDevicesInterval = 5 * time.Minute
 	MaxConnDevicesInterval = 24 * time.Hour
+	MinConnScanInterval    = 15 * time.Minute // connections.scan_interval: 0 (no sweeps), or within these
+	MaxConnScanInterval    = 24 * time.Hour
 	MaxConnKeepDays        = 3650
 	MinConnKeepMB          = 10
 	MaxConnKeepMB          = 1 << 20 // 1 TiB
@@ -356,6 +363,7 @@ func Default() *Config {
 			Enabled:         true,
 			Interval:        D(4 * time.Minute),
 			DevicesInterval: D(15 * time.Minute),
+			ScanInterval:    D(time.Hour),
 			KeepDays:        30,
 			KeepMB:          200,
 			ReverseDNS:      true,
@@ -538,8 +546,9 @@ func setMember[T any](dst *T, name string, v json.RawMessage) error {
 // normalizeNetwork brings the settings of the Network page into the ranges the monitor works with
 // (the limits above), whether or not their section is enabled - the retention limits apply also with
 // the samplers off, and every value is recorded with the configuration: a value of 0 or less (or
-// "") becomes the default, one below the minimum the minimum, one above the maximum the maximum,
-// and a download URL that is not an https:// URL without credentials, query or fragment the default
+// "") becomes the default - but connections.scan_interval 0, which means no sweeps of the home
+// network, stays 0 -, one below the minimum the minimum, one above the maximum the maximum, and a
+// download URL that is not an https:// URL without credentials, query or fragment the default
 // URL. It returns a warning for each change.
 func (c *Config) normalizeNetwork() []string {
 	d := Default()
@@ -553,12 +562,30 @@ func (c *Config) normalizeNetwork() []string {
 		interval,
 		clampSetting("connections.devices_interval", &cc.DevicesInterval.Duration, d.Connections.DevicesInterval.Duration,
 			MinConnDevicesInterval, MaxConnDevicesInterval),
+		scanIntervalSetting(&cc.ScanInterval.Duration, d.Connections.ScanInterval.Duration),
 		clampSetting("connections.keep_days", &cc.KeepDays, d.Connections.KeepDays, 1, MaxConnKeepDays),
 		clampSetting("connections.keep_mb", &cc.KeepMB, d.Connections.KeepMB, MinConnKeepMB, MaxConnKeepMB),
 		geoURLSetting("geo.url_v4", &g.URLv4, d.Geo.URLv4),
 		geoURLSetting("geo.url_v6", &g.URLv6, d.Geo.URLv6),
 		clampSetting("geo.refresh", &g.Refresh.Duration, d.Geo.Refresh.Duration, MinGeoRefresh, MaxGeoRefresh),
 	}, func(w string) bool { return w == "" })
+}
+
+// scanIntervalSetting brings connections.scan_interval (*v; def: its default) into its range as
+// normalizeNetwork says: 0 - no sweeps - stays, a value below 0 becomes the default, one below
+// MinConnScanInterval that minimum and one above MaxConnScanInterval that maximum. It returns the
+// warning, "" when *v was 0 or in range.
+func scanIntervalSetting(v *time.Duration, def time.Duration) string {
+	const name = "connections.scan_interval"
+	switch was := *v; {
+	case was == 0:
+		return ""
+	case was < 0:
+		*v = def
+		return fmt.Sprintf("%s is %v, not 0 (no sweeps of the home network) or %v to %v: the default, %v, is used",
+			name, was, MinConnScanInterval, MaxConnScanInterval, def)
+	}
+	return clampSetting(name, v, def, MinConnScanInterval, MaxConnScanInterval)
 }
 
 // clampSetting brings *v into [lo, hi] as normalizeNetwork says (def: the default) and returns the
@@ -803,6 +830,10 @@ func validateConnections(s ConnectionsConfig) []string {
 	}
 	if s.DevicesInterval.Duration < MinConnDevicesInterval || s.DevicesInterval.Duration > MaxConnDevicesInterval {
 		errs = append(errs, "connections.devices_interval must be "+MinConnDevicesInterval.String()+" to "+MaxConnDevicesInterval.String())
+	}
+	if d := s.ScanInterval.Duration; d != 0 && (d < MinConnScanInterval || d > MaxConnScanInterval) {
+		errs = append(errs, "connections.scan_interval must be 0 (no sweeps of the home network) or "+MinConnScanInterval.String()+
+			" to "+MaxConnScanInterval.String())
 	}
 	if s.KeepDays < 1 || s.KeepDays > MaxConnKeepDays {
 		errs = append(errs, fmt.Sprintf("connections.keep_days must be 1-%d", MaxConnKeepDays))

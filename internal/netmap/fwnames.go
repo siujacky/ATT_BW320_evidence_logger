@@ -36,6 +36,17 @@ type devNamer struct {
 	reads []namedRead // oldest first
 	devs  []namedDev  // by number; devs[0] is unused
 	byKey map[string]int32
+
+	// A month holds thousands of reads of the same few dozen entries, most of them naming every
+	// address as the read before: what add needs is kept from one read to the next - the read's
+	// claims and numbers (claimed, scratch, order; a read kept apart gets a copy of its numbers)
+	// and the number of each MAC address as listed and of each address of an entry without one
+	// (byMAC, byAddr), so that a key is spelt once.
+	claimed map[[16]byte]model.LANDevice
+	scratch map[[16]byte]int32
+	order   [][16]byte
+	byMAC   map[string]int32
+	byAddr  map[[16]byte]int32
 }
 
 // namedRead is one Device List read: when it was made, and the device number of each address.
@@ -52,23 +63,23 @@ type namedDev struct {
 }
 
 func newDevNamer() *devNamer {
-	return &devNamer{devs: []namedDev{{}}, byKey: map[string]int32{}}
+	return &devNamer{devs: []namedDev{{}}, byKey: map[string]int32{}, claimed: map[[16]byte]model.LANDevice{},
+		scratch: map[[16]byte]int32{}, byMAC: map[string]int32{}, byAddr: map[[16]byte]int32{}}
 }
 
 // add adds a read made at (Unix nanoseconds). Where two devices claim an address, the first that
 // is on wins, as in the connection store. A read that names every address as the read before it
 // does is not kept apart.
 func (n *devNamer) add(at int64, devices []model.LANDevice) {
-	addrs := map[[16]byte]int32{}
-	claimed := map[[16]byte]model.LANDevice{}
+	clear(n.claimed)
 	claim := func(s string, d model.LANDevice) {
 		a, ok := lanAddr(s)
 		if !ok {
 			return
 		}
 		k := a.As16()
-		if had, taken := claimed[k]; !taken || !strings.EqualFold(had.Status, "on") && strings.EqualFold(d.Status, "on") {
-			claimed[k] = d
+		if had, taken := n.claimed[k]; !taken || !strings.EqualFold(had.Status, "on") && strings.EqualFold(d.Status, "on") {
+			n.claimed[k] = d
 		}
 	}
 	for _, d := range devices {
@@ -82,25 +93,50 @@ func (n *devNamer) add(at int64, devices []model.LANDevice) {
 		}
 	}
 	// By address, so that the numbers do not depend on the order of a map.
-	for _, k := range slices.SortedFunc(maps.Keys(claimed), func(x, y [16]byte) int { return bytes.Compare(x[:], y[:]) }) {
-		d := claimed[k]
-		key := "ip:" + netip.AddrFrom16(k).Unmap().String()
-		if d.MAC != "" {
-			key = "mac:" + strings.ToLower(d.MAC)
-		}
-		num, ok := n.byKey[key]
-		if !ok {
-			num = int32(len(n.devs))
-			n.byKey[key] = num
-			n.devs = append(n.devs, namedDev{key: key})
-		}
-		addrs[k] = num
+	n.order = n.order[:0]
+	for k := range n.claimed {
+		n.order = append(n.order, k)
+	}
+	slices.SortFunc(n.order, func(x, y [16]byte) int { return bytes.Compare(x[:], y[:]) })
+	clear(n.scratch)
+	for _, k := range n.order {
+		d := n.claimed[k]
+		num := n.number(k, d.MAC)
+		n.scratch[k] = num
 		n.devs[num].name = d.Name // the newest read's name (reads come oldest first)
 	}
-	if last := len(n.reads) - 1; last >= 0 && n.reads[last].at <= at && maps.Equal(n.reads[last].addrs, addrs) {
+	if last := len(n.reads) - 1; last >= 0 && n.reads[last].at <= at && maps.Equal(n.reads[last].addrs, n.scratch) {
 		return
 	}
-	n.reads = append(n.reads, namedRead{at: at, addrs: addrs})
+	n.reads = append(n.reads, namedRead{at: at, addrs: maps.Clone(n.scratch)})
+}
+
+// number returns the number of the device with the MAC address mac (as listed; "" for none) at
+// the address k: by its key "mac:<mac>", else "ip:<address>" - numbering a device not seen yet.
+func (n *devNamer) number(k [16]byte, mac string) int32 {
+	if mac != "" {
+		if num, ok := n.byMAC[mac]; ok {
+			return num
+		}
+	} else if num, ok := n.byAddr[k]; ok {
+		return num
+	}
+	key := "ip:" + netip.AddrFrom16(k).Unmap().String()
+	if mac != "" {
+		key = "mac:" + strings.ToLower(mac)
+	}
+	num, ok := n.byKey[key]
+	if !ok {
+		num = int32(len(n.devs))
+		n.byKey[key] = num
+		n.devs = append(n.devs, namedDev{key: key})
+	}
+	if mac != "" {
+		n.byMAC[mac] = num
+	} else {
+		n.byAddr[k] = num
+	}
+	return num
 }
 
 // lanAddr parses a Device List address ("192.168.1.64", "2001:db8::1", or one with a prefix
@@ -137,6 +173,36 @@ func (n *devNamer) device(lan [16]byte, rx int64) int32 {
 	})
 	// reads[i-1] is the newest read at or before rx; before the first read, the first one.
 	return n.reads[max(i-1, 0)].addrs[lan]
+}
+
+// devNextWithin is how much later than a dropped packet the next Device List read may come and
+// still name the packet's LAN address when the read in effect does not: the connection store names
+// the addresses of the NAT reads the same way (a device that has just joined is most likely the
+// one the next read lists at its address; the Device List is read every 15 minutes).
+const devNextWithin = 20 * time.Minute
+
+// deviceOrNext is device, but for an address that the read in effect at rx does not name it
+// returns the device that the next read names there, when that read was made within
+// devNextWithin after rx (the Devices view: as the connection store names the NAT reads'
+// addresses). The next read is the next one kept apart (add): a read in between named every
+// address as the one in effect did, this one neither.
+func (n *devNamer) deviceOrNext(lan [16]byte, rx int64) int32 {
+	if n == nil || len(n.reads) == 0 {
+		return 0
+	}
+	i, _ := slices.BinarySearchFunc(n.reads, rx, func(r namedRead, t int64) int {
+		if r.at <= t {
+			return -1
+		}
+		return 1
+	})
+	if num := n.reads[max(i-1, 0)].addrs[lan]; num != 0 {
+		return num
+	}
+	if i < len(n.reads) && i > 0 && n.reads[i].at-rx <= int64(devNextWithin) {
+		return n.reads[i].addrs[lan]
+	}
+	return 0
 }
 
 // describe returns the key and the name of the device numbered num at the address lan: the

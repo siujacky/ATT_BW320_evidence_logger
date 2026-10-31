@@ -524,6 +524,53 @@ func TestOpenDeviceUnderAFilter(t *testing.T) {
 	}
 }
 
+// TestOpenByDevice: every device of an aggregate says how many sessions it had in the newest NAT
+// read of the period (ConnDevice.Open, the Devices tab's connections open now) - 0 for one that
+// read did not show - whether the period's days come from the cache or are read line by line,
+// and under a device filter too (where it is OpenDevice). A period that ends before the newest
+// read counts its own newest one.
+func TestOpenByDevice(t *testing.T) {
+	h := newHarness(t, at(1, 12, 0), Options{})
+	h.devices(at(0, 9, 0), device(10, 1, "test-laptop", ""), device(11, 2, "test-phone", ""))
+	h.nat(at(0, 10, 0), tcp(10, 1, "203.0.113.5", 443), tcp(11, 2, "198.51.100.7", 443), tcp(11, 3, "198.51.100.8", 443))
+	h.nat(at(0, 20, 0), tcp(10, 1, "203.0.113.5", 443), tcp(10, 4, "203.0.113.6", 443), tcp(12, 5, "192.0.2.80", 80))
+	h.nat(at(1, 10, 0), tcp(11, 2, "198.51.100.7", 443), session("udp", gatewayIP, 33000, "192.0.2.53", 53))
+	open := func(a model.ConnAggregate) map[string]int {
+		got := map[string]int{}
+		for _, d := range a.Devices {
+			got[d.Key] = d.Open
+		}
+		return got
+	}
+	for _, tc := range []struct {
+		name     string
+		from, to time.Time
+		want     map[string]int
+	}{
+		{"two days, the first from the cache", day0, at(2, 0, 0),
+			map[string]int{macKey(1): 0, macKey(2): 1, "ip:" + lanIP(12): 0, gatewayKey: 1}},
+		{"the first day alone (cached)", day0, at(1, 0, 0), map[string]int{macKey(1): 2, macKey(2): 0, "ip:" + lanIP(12): 1}},
+		{"part of the first day", at(0, 9, 0), at(0, 11, 0), map[string]int{macKey(1): 1, macKey(2): 2}},
+	} {
+		a := h.agg(tc.from, tc.to)
+		checkConsistent(t, a)
+		if got := open(a); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("%s: open %v, want %v", tc.name, got, tc.want)
+		}
+		for key, n := range tc.want {
+			f := h.aggDevice(tc.from, tc.to, key)
+			if d := findDevice(t, f, key); d.Open != n || f.OpenDevice != n {
+				t.Errorf("%s, %s alone: open %d (OpenDevice %d), want %d", tc.name, key, d.Open, f.OpenDevice, n)
+			}
+		}
+	}
+	// The same after a restart, when every past day is summarized anew.
+	h.reopen()
+	if got := open(h.agg(day0, at(1, 0, 0))); got[macKey(1)] != 2 || got["ip:"+lanIP(12)] != 1 {
+		t.Errorf("after reopening: open %v", got)
+	}
+}
+
 // TestGatewayLANAddressIsTheGateway: with Options.Gateway set, the sessions on the gateway's own LAN
 // address - the gateway sending its syslog to a computer, a device reaching its web pages - count
 // for the gateway (key "gateway", like its sessions from its public address), never as a device of

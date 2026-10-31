@@ -19,20 +19,22 @@ import (
 	"attmonitor/internal/web"
 )
 
-// The dashboard's Network page on the command line (docs/syslog-map-graphic.md, docs/DESIGN.md
-// §19):
+// The dashboard's Network page on the command line (docs/syslog-map-graphic.md, docs/dhcp-table.md,
+// docs/DESIGN.md §19):
 //
-//	att-monitor network [--range 1h|24h|7d|30d | --from TIME --to TIME] [--device KEY] [--firewall]
-//	                    [--limit N] [--json] [--data DIR]
+//	att-monitor network [--range 1h|24h|7d|30d | --from TIME --to TIME]
+//	                    [--device KEY | --firewall | --devices [--key KEY | --addr ADDRESS]] [--limit N] [--json] [--data DIR]
 //
 // The running service builds the page's views: it alone opens the connection store, which has a
 // single writer, and it keeps the IP database and the views' caches. The command therefore asks
-// its API - GET /api/network/connections, or /api/network/firewall with --firewall, and
-// /api/network/status for the samplers - and prints a short summary in this PC's local time.
-// None of it is evidence.
+// its API - GET /api/network/connections, or /api/network/firewall with --firewall, or
+// /api/network/devices with --devices (/api/network/device with --key or --addr: one device's
+// details), and /api/network/status for the samplers - and prints a short summary in this PC's
+// local time. None of it is evidence.
 
 // networkUsage is the usage of the network command.
-const networkUsage = "usage: att-monitor network [--range 1h|24h|7d|30d | --from TIME --to TIME] [--device KEY] [--firewall] [--limit N] [--json] [--data DIR]"
+const networkUsage = "usage: att-monitor network [--range 1h|24h|7d|30d | --from TIME --to TIME] " +
+	"[--device KEY | --firewall | --devices [--key KEY | --addr ADDRESS]] [--limit N] [--json] [--data DIR]"
 
 // Sizes of the summary.
 const (
@@ -51,8 +53,9 @@ const (
 func cmdNetwork(args []string) error { return networkCommand(os.Stdout, args) }
 
 // networkCommand runs `att-monitor network …`, writing to out: the connections of the period
-// (which device talked to which site, from the samples of the gateway's NAT table) or, with
-// --firewall, what the gateway's firewall dropped (from its syslog). Wrong arguments are refused
+// (which device talked to which site, from the samples of the gateway's NAT table), with
+// --firewall what the gateway's firewall dropped (from its syslog), or with --devices the
+// gateway's Device List - its DHCP table - with each device's issues. Wrong arguments are refused
 // before the service is asked.
 func networkCommand(out io.Writer, args []string) error {
 	fs, data := newFlags("network")
@@ -62,8 +65,15 @@ func networkCommand(out io.Writer, args []string) error {
 	to := fs.String("to", "", "the end of the period (default now); a date alone includes that whole day, as far as it has gone")
 	device := fs.String("device", "", "only this device's connections: its key, as the list of devices shows it (mac:…, ip:…, gateway)")
 	firewall := fs.Bool("firewall", false, "what the gateway's firewall dropped (from its syslog) instead of the connections")
-	limit := fs.Int("limit", networkDefaultLimit, fmt.Sprintf("table rows: the most seen connections, or the blocked outbound destinations with the most packets (1 to %d)", web.MaxNetworkLimit))
-	asJSON := fs.Bool("json", false, "print the service's answer (GET /api/network/connections, or /firewall) as JSON")
+	devices := fs.Bool("devices", false, "the gateway's Device List - its DHCP table: which device has which address, "+
+		"with each device's issues - instead of the connections")
+	key := fs.String("key", "", "with --devices: that device's details and its syslog messages (its MAC address, or its key as the "+
+		"DHCP table's --json lists it: mac:…, ip:…, name:…)")
+	addr := fs.String("addr", "", "with --devices: the details and syslog messages of that unknown address (an IPv4 address)")
+	limit := fs.Int("limit", networkDefaultLimit, fmt.Sprintf("table rows: the most seen connections, the blocked outbound destinations with the most packets, "+
+		"or with --devices the LAN addresses no Device List read names (1 to %d); with --key or --addr the syslog messages (1 to %d)",
+		web.MaxNetworkLimit, web.MaxDeviceSyslogLimit))
+	asJSON := fs.Bool("json", false, "print the service's answer (GET /api/network/connections, /firewall, /devices or /device) as JSON")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -74,9 +84,27 @@ func networkCommand(out io.Writer, args []string) error {
 	if err != nil {
 		return err
 	}
+	if *devices && *firewall {
+		return errors.New("--devices and --firewall are two views of the Network page: give one of them")
+	}
+	detail, err := deviceDetailArgs(*devices, *key, *addr)
+	if err != nil {
+		return err
+	}
+	if detail != nil {
+		if *limit < 1 || *limit > web.MaxDeviceSyslogLimit {
+			return fmt.Errorf("--limit must be 1 to %d with --key or --addr (the syslog messages)", web.MaxDeviceSyslogLimit)
+		}
+		for k, v := range detail {
+			q[k] = v
+		}
+	}
 	if *device != "" {
 		if *firewall {
 			return errors.New("--device: the firewall view is not per device (the syslog names addresses, not devices); leave out --device or --firewall")
+		}
+		if *devices {
+			return errors.New("--device: the Devices view lists every device (each with its key); leave out --device or --devices")
 		}
 		if !deviceKeyOK(*device) {
 			return fmt.Errorf("--device: a device key, as the list of devices shows it (mac:…, ip:…, gateway): at most %d printable characters, no spaces",
@@ -97,6 +125,20 @@ func networkCommand(out io.Writer, args []string) error {
 			paths.Connections, paths.Syslog)
 	}
 	ctx := background()
+	if detail != nil {
+		return deviceDetailCommand(out, api, q, *asJSON)
+	}
+	if *devices {
+		var dv model.NetDevicesView
+		if err := api.do(ctx, http.MethodGet, "/api/network/devices?"+q.Encode(), nil, &dv); err != nil {
+			return devicesError(err)
+		}
+		if *asJSON {
+			return writeJSON(out, dv)
+		}
+		printDevices(out, dv, networkStatus(api))
+		return nil
+	}
 	if *firewall {
 		var fw model.NetFirewall
 		if err := api.do(ctx, http.MethodGet, "/api/network/firewall?"+q.Encode(), nil, &fw); err != nil {

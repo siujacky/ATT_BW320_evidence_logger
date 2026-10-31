@@ -114,8 +114,8 @@ func TestDashboardOverviewSummary(t *testing.T) {
 		"Light received from ")
 	wantCard(t, ov, "traffic", "info:Live", "b/s down", "b/s up", "Today ", "WAN download from ", "WAN download, last "+nb("24 h"))
 	wantCard(t, ov, "link", "good:Connected", "Wi-Fi 5 GHz", "Signal "+nb("86 %")+" · receive 1201 / send "+nb("1201 Mb/s"), "Route to the Internet: through the AT&T gateway")
-	wantCard(t, ov, "network", ov.card(t, "network").Chip, "connections open · 8 devices listed", "Most used: Google", "packets blocked by the firewall in 24 h",
-		" inbound probes from ")
+	wantCard(t, ov, "network", ov.card(t, "network").Chip, "connections open16 devices listed · 5 with issues · 3 unknown addresses", "Most used: Google",
+		"packets blocked by the firewall in 24 h", " inbound probes from ")
 	if c := ov.card(t, "network"); !regexp.MustCompile(`^info:Read .+ ago$`).MatchString(c.Chip) {
 		t.Errorf("the Network card's chip: %q", c.Chip)
 	}
@@ -150,9 +150,10 @@ func TestDashboardOverviewSummary(t *testing.T) {
 			"Fiber receive power vs the gateway’s own thresholds"},
 		"traffic": {"Live traffic", "flow meter · every 5 s", "Bits per second through the AT&T gateway", "WAN volume per day"},
 		"link":    {"Adapter", "Wi-Fi (Wi-Fi)", "Access point", "Route to the Internet", "All 5 destinations leave through the AT&T gateway"},
-		"network": {"The gateway’s NAT table and Device List", "NAT tableread ", "Device List8 devices listed", "Devices, last 24 hours (sites reached)",
+		"network": {"The gateway’s NAT table and Device List", "NAT tableread ", "Device List16 devices listed", "The gateway’s Device List, last 24 hours",
+			"Address conflict", "Devices, last 24 hours (sites reached)",
 			"Office PC", "Most used organisations, last 24 hours (sites)", "The gateway’s firewall, last 24 hours", "Inbound", "Most probed services",
-			"Connections and Firewall tabs."},
+			"Connections, Firewall and Devices tabs."},
 		"syslog":   {"Receiverlistening on UDP 0.0.0.0:514", "Gateway setting", "Kept by att-monitoryes", "Stop sending", "are on the Syslog page."},
 		"evidence": {"Ledger head", "Signing key", "Last time-stamp", "Not yet time-stamped", "on the Evidence page"},
 		"monitor":  {"Version", "Running as", "service", "Cycles", "Clock vs time.windows.com", "Clock vs time.google.com"},

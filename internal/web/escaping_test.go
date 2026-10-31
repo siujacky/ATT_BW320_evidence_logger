@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,6 +31,7 @@ import (
 	"testing"
 	"time"
 
+	"attmonitor/internal/contracts"
 	"attmonitor/internal/model"
 )
 
@@ -578,6 +580,7 @@ func TestDashboardRendersHostileDataAsText(t *testing.T) {
 		"overview network", "overview syslog", "overview monitor",
 		"incidents", "incident export", "gateway", "syslog", "syslog more", "syslog severity", "syslog search",
 		"network", "network device", "network search", "network tables", "network firewall",
+		"network devices", "network devices find", "network device first", "network device status",
 		"evidence", "records", "records from genesis", "records config_state"}
 	for name := range rep.Views {
 		if strings.HasPrefix(name, "incident ") && name != "incident export" {
@@ -607,6 +610,20 @@ func TestDashboardRendersHostileDataAsText(t *testing.T) {
 		if v, ok := rep.Views["overview "+key]; !ok || v.Detail == nil || !v.Detail.Open {
 			t.Errorf("the %s details were not opened", key)
 		}
+	}
+	// The Devices tab: the gateway's names, connections, speeds, allocations, last activities, a
+	// status and the issues' sentences, all as text - in the table, the address panel and a device's
+	// details, whose title and line of context are made of them.
+	for _, name := range []string{"network device first", "network device status"} {
+		if d := rep.Views[name].Detail; d == nil || !d.Open || d.Key != "device" || d.Markers == 0 || !strings.Contains(d.Title, hostileMarker) {
+			t.Errorf("%s: the device's details are not open or do not show the hostile names: %+v", name, d)
+		}
+	}
+	if d := rep.Views["network device status"].Detail; d == nil || !strings.HasPrefix(d.Context, "on "+hostileMarker+" · ") {
+		t.Errorf("the hostile status is not shown as it is: %+v", d)
+	}
+	if v := rep.Views["network devices find"]; !strings.Contains(v.Text, "Address 192.168.1.68") || !strings.Contains(v.Text, "Printer "+hostileMarker) {
+		t.Errorf("the address panel with hostile names: %.600q", v.Text)
 	}
 	// The certificate banner and the Gateway page's certificate card are drawn from the
 	// certificate state, next to the hostile condition message.
@@ -839,5 +856,59 @@ func TestDashboardCertificateFallsBackToConditionRecord(t *testing.T) {
 	}
 	if !requested(rep, "POST", "/api/gateway/trust-cert") {
 		t.Error("no successful POST /api/gateway/trust-cert")
+	}
+}
+
+// lookalikeNames is the demo world with device names a crafted entry makes look like others: the
+// Security camera named "Pri", a soft hyphen, "nter"; the NAS named "Printer" and two tag
+// characters - invisible, each would look like the Printer.
+type lookalikeNames struct{ *demoWorld }
+
+func (l lookalikeNames) Devices(ctx context.Context, q contracts.NetQuery) (model.NetDevicesView, error) {
+	dv, err := l.demoWorld.Devices(ctx, q)
+	for i := range dv.Devices {
+		switch dv.Devices[i].Name {
+		case "Security camera":
+			dv.Devices[i].Name = "Pri­nter"
+		case "NAS":
+			dv.Devices[i].Name = "Printer\U000E0041\U000E007F"
+		}
+	}
+	return dv, err
+}
+
+// TestDashboardShowsLookalikeNamesApart: a soft hyphen and the tag characters (U+E0000 to
+// U+E007F), which do not show, are written as escapes in a device's name - in the DHCP table and
+// in the title of its details -, so that a crafted name does not look the same as another.
+func TestDashboardShowsLookalikeNamesApart(t *testing.T) {
+	requireNode(t)
+	w := newDemoWorld(time.Now())
+	srv := newDemoServer(t, w, nil)
+	srv.network = lookalikeNames{w}
+	rep := runDashboardOn(t, srv, "networktabs")
+	names, _ := deviceRows(rep.Views["network devices"])
+	bs := string(rune(0x5c))
+	for _, want := range []string{"Printer", "Pri" + bs + "xadnter", "Printer" + bs + "u{e0041}" + bs + "u{e007f}"} {
+		if !slices.Contains(names, want) {
+			t.Errorf("the DHCP table does not show %q: %q", want, names)
+		}
+	}
+	text := rep.Views["network devices"].Text
+	if strings.ContainsRune(text, 0xad) || strings.ContainsFunc(text, func(r rune) bool { return r >= 0xe0000 && r <= 0xe007f }) {
+		t.Errorf("the Devices tab shows a soft hyphen or a tag character as it is: %q", text)
+	}
+	if n := rep.Views["network devices"].Marks["ctl"]; n < 2 {
+		t.Errorf("%d elements of hidden characters, want one for each crafted name", n)
+	}
+
+	for key, title := range map[string]string{demoKey(t, "Security camera"): "Pri" + bs + "xadnter", demoKey(t, "NAS"): "Printer" + bs + "u{e0041}" + bs + "u{e007f}"} {
+		w2 := newDemoWorld(time.Now())
+		srv2 := newDemoServer(t, w2, nil)
+		srv2.network = lookalikeNames{w2}
+		base, _ := startServer(t, srv2)
+		rep := checkedHarness(t, base, "devicesdeep", "HARNESS_HASH=#/network/devices?range=24h&detail="+url.QueryEscape(key))
+		if d := rep.Views["devices deep"].Detail; d == nil || d.Title != title {
+			t.Errorf("the details of %s: %+v, want the title %q", key, d, title)
+		}
 	}
 }

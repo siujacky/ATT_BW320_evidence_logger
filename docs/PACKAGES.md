@@ -110,7 +110,7 @@ func Derive(s *model.GatewaySnapshot, fetchedAt time.Time, loc *time.Location) m
 // shows the target. The monitor calls it to keep the page set (docs/syslog-snmp-traffic.md §3.1).
 // The Network page (docs/DESIGN.md §19), both read only - their forms are never posted:
 func ParseNATTable(body []byte) (model.NATTable, error)   // Diagnostics > NAT Table, by its column labels
-func ParseDevices(body []byte) ([]model.LANDevice, error) // Device > Device List
+func ParseDevices(body []byte) ([]model.LANDevice, error) // Device > Device List (Signal: the Wi-Fi bars its signal image draws)
 var ErrNATPage, ErrDevicesPage error                       // the page is not understood (returned with the page)
 // Client.NATTable: authenticated, through the login policy, in the shared session (within 5 min of the
 // previous authenticated request it costs one GET; a page up to NATMaxBodyBytes, 16 MiB). A read that
@@ -172,6 +172,14 @@ type Options struct {
     // or not the samplers run, it applies the store's retention limits hourly and deletes the raw
     // page copies older than connections.keep_days.
     Conns       contracts.ConnStore
+    // The LAN scan (docs/dhcp-table.md §6; nil either: no sweeps): with Conns, connections.enabled and
+    // connections.scan_interval above 0 the monitor sweeps the home network every scan_interval
+    // (the first time 3 minutes after the start, after the Device List's first round; never while
+    // the gateway is needed for evidence - it sweeps once that ends) and appends each sweep to
+    // Scans; never to the ledger. Status.Connections: scan_interval, scan_at, scan_hosts,
+    // scan_problem, scan_next.
+    Scanner     contracts.LANScanner
+    Scans       contracts.ScanStore
 }
 func New(opts Options) (*Monitor, error)
 func (m *Monitor) Run(ctx context.Context) error // writes monitor_start … monitor_stop
@@ -220,7 +228,7 @@ type Options struct {
     SyslogReader  contracts.SyslogReader      // GET /api/syslog (entries linked to syslog_chunk records via Reader)
     SyslogControl contracts.SyslogControl     // POST /api/syslog/retention, POST /api/gateway/syslog
     LiveTraffic   contracts.LiveTrafficSource // GET /api/traffic/live
-    Network       contracts.NetworkView       // GET /api/network/connections, /firewall, /status (samplers from Status)
+    Network       contracts.NetworkView       // GET /api/network/connections, /firewall, /devices, /status (samplers from Status)
     Version  string
     Logger   *slog.Logger
 }
@@ -235,11 +243,18 @@ const DefaultSyslogLimit = 200; const MaxSyslogLimit = 5000                    /
 const MaxSyslogAnswerBytes = 16 << 20 // GET /api/syslog also ends its list before the message that would take its JSON beyond this
 const DefaultSyslogSpan = 24 * time.Hour; const MaxSyslogSpan = 31 * 24 * time.Hour
 const WarningHeader = "X-ATT-Monitor-Warning"
-// GET /api/network/connections and /firewall: range= (NetworkRanges, ending now) or from=/to=,
-// device= (connections only), limit=; answered within networkTimeout (30 s, tied to the request).
+// GET /api/network/connections, /firewall and /devices: range= (NetworkRanges, ending now) or from=/to=,
+// device= (connections only), limit= (rows; /devices: unknown addresses); answered within networkTimeout
+// (30 s, tied to the request); every list present ([] rather than null), at most limit rows.
 var NetworkRanges = []string{"1h", "24h", "7d", "30d"}; const DefaultNetworkRange = "24h"
 const MaxNetworkSpan = 31 * 24 * time.Hour; const MaxNetworkLimit = 1000; const MaxNetworkDeviceChars = 128
 const NetworkFutureSlack = time.Hour // to may lie this far after the server's clock
+// GET /api/network/device?key=|addr=&range=|from=&to=&limit= (docs/dhcp-table.md §7): the view's Device
+// with the syslog messages its Match finds (SyslogReader.Query, newest first, chunk records as for
+// /api/syslog; IPv4 whole and within its times, IPv6 canonical or full, MAC in either notation and in the
+// firewall's MAC= field); exactly one of key and addr (IPv4); 404 worded when the period knows neither.
+const DefaultDeviceSyslogLimit = 100; const MaxDeviceSyslogLimit = 500 // limit= of /api/network/device
+const MaxNetworkDeviceKeyBytes = 512                                  // key=: text without control characters
 ```
 
 ## internal/export
@@ -397,15 +412,46 @@ type Options struct {
 }
 func Open(dir string, opts Options) (*Store, error) // config.Paths.Connections; creates it; repairs; compresses past days and prunes in the background
 // *Store implements contracts.ConnStore: AppendNAT, AppendDevices, Aggregate, Devices, Prune,
-// SetRetention, Usage. Aggregate counts at most 200,000 flows one by one (FlowsLeftOut: the rest).
+// SetRetention, Usage. Aggregate counts at most 200,000 flows one by one (FlowsLeftOut: the rest);
+// each ConnDevice's Open is its sessions in the period's newest NAT read.
 func (s *Store) Close() error // closes the files being appended to, waits for Open's background work; reading keeps working
 // The Device List read in effect at from, then the later reads before to, oldest first: netmap's firewall
-// view names each dropped packet's LAN address after the read in effect when it was received.
+// view names each dropped packet's LAN address after the read in effect when it was received, and its
+// Devices view takes the period's reads, address history and conflicts from them.
 func (s *Store) EachDevices(ctx context.Context, from, to time.Time, fn func(at time.Time, devices []model.LANDevice) error) error
+// *Store implements contracts.ScanStore too: the LAN scans (docs/dhcp-table.md §6), in scan- files of
+// their own, compressed, repaired and deleted with the other kinds' by the same rules and limits.
+func (s *Store) AppendScan(t time.Time, scan model.LANScan) error  // t: when the sweep began (the scan's At becomes t)
+func (s *Store) EachScan(ctx context.Context, from, to time.Time, fn func(scan model.LANScan) error) error // began in [from, to) (zero to: no end), oldest first; ErrStop ends it
+func (s *Store) LastScan() (model.LANScan, bool)                    // the newest (chosen as Devices' read is)
 ```
-Files `nat-YYYY-MM-DD.jsonl` and `devices-YYYY-MM-DD.jsonl` per UTC day, gzipped (`.jsonl.gz`) once
-the day is over; files with other names in the folder are never touched. One writer (the monitor:
+Files `nat-YYYY-MM-DD.jsonl`, `devices-YYYY-MM-DD.jsonl` and `scan-YYYY-MM-DD.jsonl` per UTC day,
+gzipped (`.jsonl.gz`) once the day is over; files with other names in the folder are never touched. One writer (the monitor:
 its ledger lock keeps a second one away, so the CLI never opens the store), any number of readers.
+
+## internal/lanscan
+Sweeps the home network by ARP (docs/dhcp-table.md §6, docs/DESIGN.md §19): every address of this
+PC's own IPv4 network - that of its interface that holds the gateway's address - asked who has it, by
+Windows' SendARP (iphlpapi.dll; no administrator rights, no raw socket, nothing else sent, nothing
+leaves the home network). Sends nothing until Scan; keeps nothing.
+```go
+const MaxAddresses = 1024        // the largest network swept (a /22); only private (RFC 1918) networks
+const InFlight = 32              // ARP questions at a time at most
+const Timeout = 2 * time.Minute  // a sweep ends then: what answered is kept, LANScan.Problem says so
+type Options struct {
+    Gateway string           // gateway.host: the network swept is that of this PC's interface that holds it
+    Logger  *slog.Logger
+    Now     func() time.Time // the scans' At (default time.Now)
+}
+func New(o Options) *Scanner // implements contracts.LANScanner
+// Scan: the hosts that answered in address order, MAC addresses lower case and colon separated, this
+// PC's own addresses (never asked) with their interfaces' MAC addresses; a refused network, no
+// interface on the gateway's network or every question failing is an error; when ctx ends, what
+// answered so far and an error wrapping ctx's. Other systems than Windows: ErrUnavailable.
+func (s *Scanner) Scan(ctx context.Context) (model.LANScan, error)
+```
+The platform (the ARP question, the interfaces) is replaceable inside the package, so the tests run
+with fakes; a real sweep only in `TestLiveScan`, with `ATTMON_LIVE_SCAN=1` (it reports counts only).
 
 ## internal/ipintel
 Names addresses and ports without asking anyone (docs/DESIGN.md §19): the offline IPtoASN database
@@ -445,16 +491,28 @@ const DefaultCacheBytes = 64 << 20; const DefaultCacheChunks = 16384 // sealed c
 const DefaultResultTTL = 30 * time.Second                        // a view is reused this long for the same request (a range ending now: by its name)
 var ErrRange error                                               // the period is not valid
 type Options struct {
-    Conns  contracts.ConnStore         // nil: Connections fails (ErrUnavailable)
-    Intel  contracts.IPIntel           // nil: addresses classified only, no organisations, countries, services
-    Syslog contracts.SyslogChunkSource // nil: Firewall fails (ErrUnavailable)
-    Logger *slog.Logger
-    Now    func() time.Time
+    Conns   contracts.ConnStore         // nil: Connections, Devices and Device fail (ErrUnavailable)
+    Intel   contracts.IPIntel           // nil: addresses classified only, no organisations, countries, services
+    Syslog  contracts.SyslogChunkSource // nil: Firewall fails (ErrUnavailable), Devices counts no drop
+    Scans   contracts.ScanStore         // nil: no LAN scan figures (docs/dhcp-table.md §6)
+    Gateway netip.Addr                  // gateway.host: its own answer to a LAN scan is nobody's (zero: not known)
+    Logger  *slog.Logger
+    Now     func() time.Time
     CacheBytes int64; CacheChunks int; ResultTTL time.Duration // 0 → defaults; negative: no cache / no reuse
 }
-func New(o Options) *View // implements contracts.NetworkView: Connections, Firewall, NetworkStatus
-// One connections view and one firewall view are built at a time; organisations are keyed by the
-// name the IP database gives them ("org:google"), else by AS ("as64500").
+func New(o Options) *View // implements contracts.NetworkView: Connections, Firewall, Devices, Device, NetworkStatus
+// One connections view, one firewall view and one devices view are built at a time; organisations are
+// keyed by the name the IP database gives them ("org:google"), else by AS ("as64500"). Devices
+// (docs/dhcp-table.md): the newest Device List read with each device's reads, addresses, open
+// connections, sites, drops out/in, LAN scan answers (scan_addr, scan_seen, scan_hits) and issues
+// (address_shared critical; weak_wifi <= 2 bars, slow_link <= 10 Mb/s or half duplex, blocked >= 100
+// packets per day of the period, unlisted, scan_mac - warnings; address_changed, offline, no_answer, scan_addr - info), the
+// unknown LAN addresses (at most the limit; those of the scans with mac and scan_seen), the period's
+// scans (scans, scan, totals.scanned) and the address history (<= 5,000). Device (docs/dhcp-table.md
+// §7): one device or unknown address of the Devices view built for MaxLimit rows (reused), with its
+// address history, the newest 800 scans as it answered them and its syslog terms (Match: IPv4 holds
+// widened by the Device List interval and clipped to the period, <= 128; IPv6 <= 32; MAC);
+// contracts.ErrNotFound when the period knows neither.
 ```
 
 ## Syslog and traffic contracts
@@ -479,16 +537,22 @@ Defined in `internal/model/network.go`, `internal/contracts` and `internal/confi
 None of these types is ever written to the ledger.
 ```go
 contracts.ConnStore          // AppendNAT, AppendDevices, Aggregate(ctx, ConnQuery), Devices, Prune, SetRetention, Usage (connstore.Store)
+contracts.ScanStore          // AppendScan, EachScan(ctx, from, to, fn), LastScan (connstore.Store)
+contracts.LANScanner         // Scan(ctx) (lanscan.Scanner)
 contracts.IPIntel            // Lookup, Service, PTR, Updated, Status (ipintel.DB)
 contracts.SyslogChunkSource  // Chunks, OpenChunk, EachOpen, Usage (syslogstore.Store)
-contracts.NetworkView        // Connections(ctx, NetQuery), Firewall(ctx, NetQuery), NetworkStatus (netmap.View)
+contracts.NetworkView        // Connections(ctx, NetQuery), Firewall(ctx, NetQuery), Devices(ctx, NetQuery), Device(ctx, NetQuery, key, addr), NetworkStatus (netmap.View)
 contracts.ConnQuery{From, To, Device}; contracts.NetQuery{From, To, Range, Device, Limit}
 contracts.Gateway            // + NATTable, Devices (gateway.Client)
-model.NATSession / NATTable / LANDevice; model.ConnStoreUsage / ConnDevice / ConnFlow / ConnAggregate
-model.IPInfo (Kind: model.IPKind*) / IPIntelStatus; model.ConnSamplerStatus (Status.Connections)
+model.NATSession / NATTable / LANDevice (+ Signal); model.ConnStoreUsage / ConnDevice (+ Open) / ConnFlow / ConnAggregate
+model.IPInfo (Kind: model.IPKind*) / IPIntelStatus; model.ConnSamplerStatus (Status.Connections; + Scan* of the LAN scan)
+model.LANScan / LANHost (a sweep of the home network: kept in the connection store)
 model.NetConnections / NetDevice / NetOrg / NetService / NetLink / NetCountry / NetConnRow / NetTotals
 model.NetFirewall (+ OutboundDevices) / FwHour / FwSource / FwService / FwReason / FwOutRow; model.NetworkStatus (+ ConfigWarnings)
+model.NetDevicesView / NetLANDevice / NetUnknownAddr / NetAddrUse / NetDeviceTotals / NetIssue (model.Issue* levels and codes)
+model.NetScanInfo (the newest scan of a Devices view); model.NetDeviceDetail (+ SyslogError) / NetScanSeen / NetSyslogTerm (GET /api/network/device)
 config.ConnectionsConfig {Enabled, Interval, DevicesInterval, KeepDays, KeepMB, ReverseDNS}
+config.ConnectionsConfig.ScanInterval (default 1h; 15m to 24h; 0: no sweeps), config.MinConnScanInterval / MaxConnScanInterval
 config.GeoConfig {Enabled, Download, URLv4, URLv6, Refresh}; config.Paths.Connections, Paths.Geo
 config.MinConnInterval … MaxGeoRefresh (the settings' limits: Load brings these sections into them)
 (*config.Config).Warnings() []string // what Load replaced in these sections, and by what (never saved)
@@ -518,3 +582,8 @@ its status (`NetworkStatus.ConfigWarnings`).
 `runMonitor` runs `(*ipintel.DB).Run` beside the MongoDB copy, and `stack.close` closes the
 connection store after the monitor stopped. The CLI never opens the connection store (it has one
 writer): `att-monitor network` reads `GET /api/network/*` of the running service.
+The service and console modes also make the LAN scanner (`lanscan.New` with `gateway.host`) and
+pass the connection store as the scan store: `monitor.Options.Scanner` / `Scans` and
+`netmap.Options.Scans`. `att-monitor scan [--json]` sweeps once from the command line (its scanner is
+a replaceable function, so tests never send ARP) and names the addresses after the running service's
+`GET /api/network/devices` when there is one; it stores nothing.

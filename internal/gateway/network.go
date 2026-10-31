@@ -646,7 +646,9 @@ func selectedText(c *formControl) string {
 //   - "Connection Type": a <pre> of lines such as "Wi-Fi", "5 GHz Radio-1", "Type: Home" and
 //     "Name: <the Wi-Fi network's name>", or "Ethernet LAN-1". Connection summarizes it as
 //     "Wi-Fi 5 GHz", "Wi-Fi 2.4 GHz", "Wi-Fi", "Ethernet LAN-1" or "Ethernet" (see
-//     connectionSummary); the Wi-Fi network's name is never kept.
+//     connectionSummary); the Wi-Fi network's name is never kept. For a Wi-Fi device that is on,
+//     the cell also draws the signal as an image, <img src="/images/signal-strength-5-bar.png"
+//     alt="Wi-Fi 5 bars" />: Signal is its bars, 1 to 5 (see wifiBars; 0 without such an image).
 //   - "Connection Speed": as shown, "" when it holds no number (an Ethernet port that is down
 //     shows the bare template "Mbps duplex").
 //   - "Mesh Client": Mesh is true for "Yes".
@@ -799,6 +801,13 @@ func (b *deviceBuilder) set(f deviceField, cells []lineCell) {
 		d.Allocation = value
 	case devConnection:
 		d.Connection = connectionSummary(lines)
+		d.Signal = 0
+		for _, c := range cells {
+			if c.signal > 0 {
+				d.Signal = c.signal
+				break
+			}
+		}
 	case devSpeed:
 		if strings.ContainsAny(value, "0123456789") {
 			d.Speed = value
@@ -928,7 +937,34 @@ var (
 	reLANPort = regexp.MustCompile(`(?i)\bLAN\s*-?\s*(\d{1,2})\b`)
 	// reMedium is what an unknown connection medium may look like to be kept as shown.
 	reMedium = regexp.MustCompile(`^[A-Za-z0-9 ._()/+-]{1,40}$`)
+	// reBarsText finds the bars a signal image's text gives: "Wi-Fi 5 bars" -> "5", "1 Bar" -> "1".
+	reBarsText = regexp.MustCompile(`(?i)\b(\d{1,2})\s*-?\s*bars?\b`)
+	// reBarsFile finds them in the image's file name: "/images/signal-strength-5-bar.png" -> "5".
+	reBarsFile = regexp.MustCompile(`(?i)signal[-_ ]?strength[-_ ]?(\d{1,2})[-_ ]?bars?\b`)
 )
+
+// maxBars is the most bars the Device List draws a Wi-Fi signal with.
+const maxBars = 5
+
+// wifiBars returns the Wi-Fi signal an image of a "Connection Type" cell draws, in bars: from the
+// image's text (its alt attribute, "Wi-Fi 5 bars", which firmware 6.34.7 writes for every signal
+// image), else - an image without that text - from its file name ("signal-strength-5-bar.png").
+// It is 0 for any other image, and for a number of bars the page never draws (0, or more than
+// maxBars): Signal is then "none shown" rather than a figure the page did not give.
+func wifiBars(alt, src string) int {
+	m := reBarsText.FindStringSubmatch(alt)
+	if m == nil {
+		m = reBarsFile.FindStringSubmatch(src)
+	}
+	if m == nil {
+		return 0
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil || n < 1 || n > maxBars {
+		return 0
+	}
+	return n
+}
 
 // connectionSummary summarizes the lines of a "Connection Type" cell: "Wi-Fi" with the band
 // ("Wi-Fi 5 GHz") or "Ethernet" with the port ("Ethernet LAN-1"), else the first line when it
@@ -971,14 +1007,18 @@ func connectionSummary(lines []string) string {
 // ---------------------------------------------------------------- reading cells by line
 
 // The Device List's "Connection Type" cell holds several facts, each on its own line (<br>, or
-// a line break inside its <pre>), one of them the Wi-Fi network's name, which must be left out.
-// scan.go joins a cell's lines into one text, so the Device List's rows are read once more by
-// the reader below, which keeps them apart and also notes the <hr> rows that separate devices.
+// a line break inside its <pre>), one of them the Wi-Fi network's name, which must be left out,
+// and for a Wi-Fi device an image of its signal. scan.go joins a cell's lines into one text and
+// reads no image, so the Device List's rows are read once more by the reader below, which keeps
+// the lines apart, notes the signal an image draws and the <hr> rows that separate devices.
 // Like scan.go it uses the x/net/html tokenizer and reads the page in source order.
 
 // lineCell is a table cell read line by line.
 type lineCell struct {
 	lines []string // visible text lines, white space normalized, empty lines dropped
+	// signal is the Wi-Fi signal the first image in the cell that draws one draws, in bars (see
+	// wifiBars; 0: none). An image's text is never one of the lines.
+	signal int
 }
 
 // text returns the cell's lines joined by spaces.
@@ -1035,13 +1075,44 @@ func readLineRows(body []byte) []lineRow {
 		case html.TextToken:
 			r.onText(string(z.Text()))
 		case html.StartTagToken, html.SelfClosingTagToken:
-			name, _ := z.TagName()
-			r.onStart(string(name), tt == html.SelfClosingTagToken)
+			name, hasAttr := z.TagName()
+			tag := string(name)
+			r.onStart(tag, tt == html.SelfClosingTagToken)
+			if tag == "img" && hasAttr {
+				r.onImage(z)
+			}
 		case html.EndTagToken:
 			name, _ := z.TagName()
 			r.onEnd(string(name))
 		}
 	}
+}
+
+// onImage notes the Wi-Fi signal an image in the open cell draws (wifiBars), from the attributes
+// of the tag the tokenizer is at: the first image that draws one counts. Only the alt and src
+// attributes are read (the first of each); their values are never kept.
+func (r *lineReader) onImage(z *html.Tokenizer) {
+	t := r.top()
+	if r.skip != "" || t == nil || t.cell == nil || t.cell.signal > 0 {
+		return
+	}
+	var alt, src string
+	var hasAlt, hasSrc bool
+	for more := true; more; {
+		var k, v []byte
+		k, v, more = z.TagAttr() // the tokenizer gives the keys in lower case
+		switch string(k) {
+		case "alt":
+			if !hasAlt {
+				alt, hasAlt = string(v), true
+			}
+		case "src":
+			if !hasSrc {
+				src, hasSrc = string(v), true
+			}
+		}
+	}
+	t.cell.signal = wifiBars(alt, src)
 }
 
 func (r *lineReader) top() *lineTable {

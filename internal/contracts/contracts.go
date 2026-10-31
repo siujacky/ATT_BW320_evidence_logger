@@ -358,6 +358,25 @@ type ConnStore interface {
 	Usage() model.ConnStoreUsage
 }
 
+// ScanStore keeps the LAN scans (implemented by connstore.Store: in the connection store's folder,
+// within its retention limits). Not evidence.
+type ScanStore interface {
+	// AppendScan adds one LAN scan (t: when it began).
+	AppendScan(t time.Time, scan model.LANScan) error
+	// EachScan calls fn, oldest first, for each scan kept that began in [from, to). Returning
+	// ErrStop ends it early with a nil error.
+	EachScan(ctx context.Context, from, to time.Time, fn func(scan model.LANScan) error) error
+	// LastScan returns the newest scan kept (false before the first).
+	LastScan() (model.LANScan, bool)
+}
+
+// LANScanner sweeps the home network (implemented by lanscan.Scanner): it asks, by ARP, every
+// address of this PC's own IPv4 network who has it - no packet leaves the network, and nothing is
+// sent to the devices but that question. Windows only (elsewhere ErrUnavailable).
+type LANScanner interface {
+	Scan(ctx context.Context) (model.LANScan, error)
+}
+
 // IPIntel names addresses and ports without asking anyone (implemented by ipintel.DB): the
 // offline IPtoASN database (the address ranges of every network with its AS number, name and
 // country), a table of well-known ports and a cache of reverse DNS names. Safe for concurrent use.
@@ -395,6 +414,15 @@ type NetworkView interface {
 	Connections(ctx context.Context, q NetQuery) (model.NetConnections, error)
 	// Firewall: what the gateway's firewall dropped (the syslog).
 	Firewall(ctx context.Context, q NetQuery) (model.NetFirewall, error)
+	// Devices: the gateway's Device List - its DHCP table: which device has which address - with
+	// each device's issues, the LAN addresses no Device List read names, and the address history
+	// of the period (the Device List reads, the NAT samples and the firewall drops).
+	Devices(ctx context.Context, q NetQuery) (model.NetDevicesView, error)
+	// Device: one device of the Devices tab (key: its NetLANDevice.Key) or one unknown LAN address
+	// (addr) over [q.From, q.To) - its addresses and who else held them, the LAN scans as it
+	// answered them, and what its syslog messages are found by (Match; the web layer reads them
+	// from the syslog store and fills Syslog). ErrNotFound when the period knows neither.
+	Device(ctx context.Context, q NetQuery, key, addr string) (model.NetDeviceDetail, error)
 	// NetworkStatus: the connection store, the IP database and the syslog kept (Samplers is left
 	// nil: the web layer takes it from the monitor's Status; ConfigWarnings is added by the
 	// wiring in cmd/att-monitor, from config.Warnings).

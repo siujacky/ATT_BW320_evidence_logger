@@ -90,6 +90,7 @@ func reference(nats []refNAT, devs []refDev, from, to time.Time, filter string) 
 	}
 	devAccs := map[string]*devAcc{}
 	flowAccs := map[refFlowKey]*flowAcc{}
+	newestOpen := map[string]int{}
 	var newestT time.Time
 	for _, r := range ns {
 		if r.t.Before(from) || !r.t.Before(to) {
@@ -102,9 +103,11 @@ func reference(nats []refNAT, devs []refDev, from, to time.Time, filter string) 
 			out.last = r.t
 		}
 		out.samples++
-		if newestT.IsZero() || !r.t.Before(newestT) {
+		newest := newestT.IsZero() || !r.t.Before(newestT)
+		if newest {
 			newestT = r.t
 			out.inUse, out.avail, out.open = r.nat.InUse, r.nat.Available, len(r.nat.Sessions)
+			clear(newestOpen) // each device's sessions in the newest read (ConnDevice.Open)
 		}
 		dr, next := inEffect(r.t), nextAfter(r.t)
 		seenDev, seenFlow := map[string]bool{}, map[refFlowKey]bool{}
@@ -146,6 +149,9 @@ func reference(nats []refNAT, devs []refDev, from, to time.Time, filter string) 
 				da.d.Samples++
 			}
 			da.d.Weight++
+			if newest {
+				newestOpen[key]++
+			}
 			for _, a := range []struct {
 				v  *string
 				vt *time.Time
@@ -185,6 +191,7 @@ func reference(nats []refNAT, devs []refDev, from, to time.Time, filter string) 
 		if da.lan.Is4() {
 			da.d.IPv4 = da.lan.String()
 		}
+		da.d.Open = newestOpen[k]
 		out.devices[k] = da.d
 	}
 	for k, fa := range flowAccs {

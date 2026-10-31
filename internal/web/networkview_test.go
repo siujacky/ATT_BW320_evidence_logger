@@ -27,9 +27,11 @@ func TestDashboardNetworkPage(t *testing.T) {
 	rep := runDashboard(t, w, "network")
 	contains := viewChecker(t, rep)
 
-	contains("network", "Which device talks to which site, and what the gateway’s firewall blocks.", "Address data: IPtoASN, ",
+	// The devices active: of the gateway's Device List, an address it does not list (192.168.1.90),
+	// and the gateway itself.
+	contains("network", "Which device talks to which site, what the gateway’s firewall blocks, and which device has which address.", "Address data: IPtoASN, ",
 		"NAT table last read ", " · every 4 min",
-		"Devices active", "8 of the 8 in the gateway’s Device List, and the gateway", "remote addresses", "Organisations", "Open now", "connections in the NAT table",
+		"Devices active", "13 of the 16 in the gateway’s Device List, 1 not in it, and the gateway", "remote addresses", "Organisations", "Open now", "connections in the NAT table",
 		"Devices and the sites they reach", "Last 24 hours. Band width: how often the connection was open when the NAT table was read.",
 		"DEVICE", "ORGANISATION", "SERVICE", "Office PC", "Google", "HTTPS", "Other (",
 		"Where the sites are", "Sites per country", "Top countries", "United States", "other countries",
@@ -209,23 +211,34 @@ func TestDashboardNetworkPage(t *testing.T) {
 
 // TestDashboardNetworkStates: what the page says when the samplers are off, the NAT table is not
 // read (logins paused, no access code), nothing was read yet, the IP database is not loaded, the
-// monitor keeps no syslog store, the firewall dropped nothing, or the view fails.
+// monitor keeps no syslog store, the firewall dropped nothing, the Device List was not read yet,
+// or the view fails - on each tab.
 func TestDashboardNetworkStates(t *testing.T) {
 	requireNode(t)
+	const listShown = "Showing all 16 devices of the Device List."
 	for _, tc := range []struct {
 		state   string
 		conn    []string
 		fw      []string
+		dev     []string
 		notConn []string
 		notFw   []string
+		notDev  []string
 	}{
+		// The Device List is read without the NAT table's login: its devices show, none with an
+		// open connection.
 		{state: "nosamples", conn: []string{"The NAT table has not been read yet: the first read is due at", "NAT table not read yet"},
-			notConn: []string{"Devices and the sites they reach"}},
-		{state: "off", conn: []string{"Connections are not being recorded.", "turned off in the configuration (connections.enabled)"}},
+			notConn: []string{"Devices and the sites they reach"},
+			dev:     []string{listShown, "Device List last read ", "The NAT table was not read in this period, so the devices’ open connections and sites are not known."},
+			notDev:  []string{"Open connections are not current."}},
+		{state: "off", conn: []string{"Connections are not being recorded.", "turned off in the configuration (connections.enabled)"},
+			dev: []string{"The Device List is not being read.", "what is shown was recorded before", listShown}},
 		{state: "paused", conn: []string{"The NAT table is not being read.", "Gateway logins are paused", "The newest read is from ",
-			"Open at the last read", "connections in the NAT table at "}, notConn: []string{"Open now"}},
+			"Open at the last read", "connections in the NAT table at "}, notConn: []string{"Open now"},
+			dev: []string{"Open connections are not current.", "The NAT table is not being read: gateway logins are paused", "They are those of its newest read, ", listShown}},
 		{state: "noaccess", conn: []string{"The NAT table is not being read.", "No gateway device access code is stored", "The NAT table has not been read yet."},
-			notConn: []string{"first read is due"}},
+			notConn: []string{"first read is due"}, dev: []string{"Open connections are not current.", "The NAT table is not being read: no gateway device access code is stored", listShown},
+			notDev: []string{"They are those of its newest read"}},
 		{state: "noipdb", conn: []string{"The IP address database is not loaded yet, so organisations and countries are not shown.",
 			"only the files are fetched: no address is sent anywhere", "Last attempt: download ip2asn-v4.tsv.gz", "No IP address database loaded yet", "Unknown"}},
 		{state: "natnote", conn: []string{"The NAT table is read, but not all of it is kept.", "3 rows of the NAT table page left out (not understood).",
@@ -235,18 +248,26 @@ func TestDashboardNetworkStates(t *testing.T) {
 		{state: "busy", conn: []string{"A very busy period. 412 connections were too light to count one by one",
 			"the sites and organisations are at least the numbers shown. A shorter period, or one device, shows more of them."}},
 		// The firewall view is unavailable without a syslog store (503, as netmap's): the tab says why
-		// and what the syslog would show, never the bare error.
+		// and what the syslog would show, never the bare error; the Devices tab counts nothing as
+		// blocked, and says so.
 		{state: "nosyslog", fw: []string{"This att-monitor keeps no syslog store, so there are no firewall messages to show.", "What the syslog can show"},
-			notFw: []string{"network firewall:", "unavailable"}},
+			notFw: []string{"network firewall:", "unavailable"}, dev: []string{"Blocked packets are not counted: this att-monitor keeps no syslog store.", listShown}},
 		{state: "nodrops", fw: []string{"The gateway’s firewall dropped nothing in this period.", "What the syslog can show"}},
-		// Settings in config.json that the service replaced are said on both tabs, not only in the log.
+		// Settings in config.json that the service replaced are said on every tab, not only in the log.
 		{state: "cfgwarn",
 			conn: []string{"Some Network page settings in config.json are not used as written.",
 				"Connections.interval is 10m0s, above the maximum: 4m0s is used.", "Geo.download is not true or false: it is turned off."},
 			fw: []string{"Some Network page settings in config.json are not used as written.",
-				"Connections.interval is 10m0s, above the maximum: 4m0s is used."}},
+				"Connections.interval is 10m0s, above the maximum: 4m0s is used."},
+			dev: []string{"Some Network page settings in config.json are not used as written.", listShown}},
+		// The LAN scans turned off (connections.scan_interval 0): the tab says so, and scans nothing.
+		{state: "noscans", dev: []string{"LAN scans are off (connections.scan_interval is 0).", listShown, "not scanned"}, notDev: []string{"answered", "no answer"}},
+		// No Device List read yet: the tab says when it is read, and how.
+		{state: "nodevices", dev: []string{"Device List not read yet", "The gateway’s Device List has not been read yet. It is read every 15 min, without logging in to the gateway",
+			"Where this comes from"}, notDev: []string{listShown, "Unknown addresses"}},
 		{state: "unavailable", conn: []string{"network connections: connstore: the connection store is closed"},
-			fw: []string{"network firewall: netmap: the syslog store is closed"}},
+			fw:  []string{"network firewall: netmap: the syslog store is closed"},
+			dev: []string{"network devices: connstore: the connection store is closed"}, notDev: []string{listShown}},
 	} {
 		t.Run(tc.state, func(t *testing.T) {
 			t.Parallel()
@@ -258,6 +279,7 @@ func TestDashboardNetworkStates(t *testing.T) {
 			contains := viewChecker(t, rep)
 			contains("network", tc.conn...)
 			contains("network firewall", tc.fw...)
+			contains("network devices", tc.dev...)
 			for _, s := range tc.notConn {
 				if strings.Contains(rep.Views["network"].Text, s) {
 					t.Errorf("the Connections tab shows %q", s)
@@ -266,6 +288,11 @@ func TestDashboardNetworkStates(t *testing.T) {
 			for _, s := range tc.notFw {
 				if strings.Contains(rep.Views["network firewall"].Text, s) {
 					t.Errorf("the Firewall tab shows %q", s)
+				}
+			}
+			for _, s := range tc.notDev {
+				if strings.Contains(rep.Views["network devices"].Text, s) {
+					t.Errorf("the Devices tab shows %q", s)
 				}
 			}
 		})
@@ -529,8 +556,8 @@ console.log(JSON.stringify({ cases, rooms }));
 // (positions and bar widths), and its map ramp and device colours are defined for both themes.
 func TestAppJSNetworkStatic(t *testing.T) {
 	src := appJS(t)
-	for _, want := range []string{"'/api/network/' + tab + '?'", "'/api/network/status'", "'/static/world.json'",
-		"[/^\\/network$/, 'network'", "[/^\\/network\\/firewall$/, 'network'"} {
+	for _, want := range []string{"'/api/network/' + tab + '?'", "'/api/network/status'", "'/static/world.json'", "'/api/network/devices?range=24h'",
+		"[/^\\/network$/, 'network'", "[/^\\/network\\/firewall$/, 'network'", "[/^\\/network\\/devices$/, 'network'"} {
 		if !strings.Contains(src, want) {
 			t.Errorf("app.js lacks %s", want)
 		}

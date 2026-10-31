@@ -25,9 +25,10 @@ import (
 //     compressed file lacks (stored after the day was compressed, the clock having been set
 //     back) is kept, and both are read until the next compression merges them.
 //
-// It then loads the newest Device List read (Devices) and finds the oldest and the newest read
-// kept (Usage), and returns. The rest goes on in the background (settle), so that the service's
-// start - and with it the evidence collection - never waits for it: the plain files of the days
+// It then loads the newest Device List read (Devices) and the newest LAN scan (LastScan), finds
+// the oldest and the newest read or scan kept (Usage), and returns. The rest goes on in the
+// background (settle), so that the service's start - and with it the evidence collection - never
+// waits for it: the plain files of the days
 // before today are compressed (seconds for a busy day: read, gzip, checked, fsynced) and the size
 // limit (keep_mb) is applied; the writing methods wait for it, the readers read the files as the
 // index lists them meanwhile (a plain day is read like a compressed one), and Close waits for it.
@@ -187,6 +188,7 @@ func (s *Store) load() error {
 	today := dayOf(s.now())
 	s.warnLaterDays(today)
 	s.loadDevices(today)
+	s.loadLastScan(today)
 	oldest, newest := s.edgeTime(true), s.edgeTime(false)
 	s.mu.Lock()
 	s.oldest, s.newest = oldest, newest
@@ -328,9 +330,9 @@ func (s *Store) loadDevices(today day) {
 	}
 }
 
-// edgeTime returns the time of the oldest read kept (oldest) or of the newest one, of either
-// kind; zero when there is none. It reads the oldest (newest) day of each kind that has a read
-// whose time can be told (s.wmu held).
+// edgeTime returns the time of the oldest read kept (oldest) or of the newest one, of any kind
+// (a LAN scan counts as a read); zero when there is none. It reads the oldest (newest) day of each
+// kind that has a read whose time can be told (s.wmu held).
 func (s *Store) edgeTime(oldest bool) time.Time {
 	var edge time.Time
 	for k := range numKinds {
@@ -381,9 +383,12 @@ func (s *Store) dayTimes(k kind, d day) (lo, hi time.Time, ok bool) {
 		t, tok := peekTime(line)
 		if !tok && line != nil {
 			var err error
-			if k == kindNAT {
+			switch k {
+			case kindNAT:
 				t, err = decodeNAT(line, &scratch)
-			} else {
+			case kindScan:
+				t, _, err = decodeScan(line)
+			default:
 				t, _, err = decodeDevices(line)
 			}
 			tok = err == nil

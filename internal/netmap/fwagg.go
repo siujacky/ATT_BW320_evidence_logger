@@ -25,6 +25,11 @@ const maxPorts = 1024
 // outbound rows beyond them are counted by country and in sketches (srcOver, outOver), and the
 // services beyond them as "Other", so that its memory does not grow with what a hostile sender
 // can multiply - the sources of spoofed packets above all.
+//
+// The drops by LAN address (lans) - what each address sent that was dropped on its way out, and
+// what was dropped on its way to it from the Internet - are for the Devices tab: a chunk's
+// builder counts them for its summary, the Devices view's request (limits.lanOnly) counts only
+// them, and the firewall view's request not at all.
 type builder struct {
 	counts   [nDirs]int
 	hours    map[int64]*[nDirs]int // by hour (Unix hours)
@@ -34,6 +39,8 @@ type builder struct {
 	reasons  map[uint8]int
 	outIdx   map[outKey]int32 // index in outs
 	outs     []outSum
+	lanIdx   map[lanKey]int32 // index in lans
+	lans     []lanSum
 	// The earliest and latest receive time of the messages seen (see).
 	hasRX        bool
 	rxMin, rxMax int64
@@ -73,6 +80,23 @@ type outSum struct {
 	last  int64
 }
 
+// lanKey is a LAN address of dropped packets. dev is the device's number in the request's
+// devNamer: 0 when no Device List read names the address then (always 0 in a chunk's builder,
+// whose addresses the request names when it adds them up).
+type lanKey struct {
+	addr [16]byte
+	dev  int32
+}
+
+// lanSum counts the dropped packets of a LAN address: those it sent toward the Internet (out) and
+// those from the Internet that were on their way to it (in: drop.toLAN), with the receive times
+// of the first and the newest of them.
+type lanSum struct {
+	key         lanKey
+	out, in     int
+	first, last int64
+}
+
 // repeat is a repeat line that repeats a message of an earlier chunk - or several such lines of
 // the same kind received in the same hour, one after the other: their repeats added up, at the
 // receive time of the newest (a chunk of millions of them then takes no more room than its
@@ -99,6 +123,7 @@ func newBuilder() *builder {
 		services: map[svcKey]int{},
 		reasons:  map[uint8]int{},
 		outIdx:   map[outKey]int32{},
+		lanIdx:   map[lanKey]int32{},
 	}
 }
 
@@ -111,6 +136,18 @@ func newRequestBuilder(bd bounds, lk lookup, names *devNamer) *builder {
 	return b
 }
 
+// newLANBuilder returns the builder of the Devices view's request: it counts the drops by LAN
+// address alone (lans; and the totals by direction, hour and reason, which cost little), naming
+// each address after the Device List reads of names (devNamer.deviceOrNext). Of the addresses
+// that no read names it keeps at most bd.lans, and only those that could be an unknown device's
+// (lanCandidate): an IPv6 address of the home network's prefix that a scanner tried, or a LAN
+// source a host forged, would otherwise grow it without bound.
+func newLANBuilder(bd bounds, names *devNamer) *builder {
+	b := newBuilder()
+	b.lim = &limits{bounds: bd, names: names, lanOnly: true}
+	return b
+}
+
 // limits are the request builder's bounds and what it counted beyond them.
 type limits struct {
 	bounds
@@ -120,6 +157,14 @@ type limits struct {
 	out   *outOver // nil until an outbound row was beyond the bound
 	// otherServices counts the inbound packets to services beyond the bound.
 	otherServices int
+	// lanOnly: the builder of the Devices view (newLANBuilder), which counts no source, service or
+	// outbound row - only the drops by LAN address. Without it (the firewall view) the drops by LAN
+	// address are not counted.
+	lanOnly bool
+	// unnamed counts the addresses of lans that no Device List read named (lanKey.dev 0), at most
+	// bounds.lans; lanSkipped the packets not counted by address: beyond that bound, or at an
+	// address that no read names and that cannot be an unknown device's.
+	unnamed, lanSkipped int
 }
 
 // srcOver is what a request counted of the inbound sources beyond its bound: their packets by
@@ -178,9 +223,10 @@ func (b *builder) add(d drop, rx int64, n int) {
 	b.counts[d.dir] += n
 	b.hour(hourOf(rx))[d.dir] += n
 	b.reasons[d.reason] += n
+	rows := !b.lanOnly()
 	switch d.dir {
 	case dirIn:
-		if d.srcOK {
+		if rows && d.srcOK {
 			var one [1]uint16
 			ports := one[:0]
 			if d.dpt != 0 {
@@ -189,12 +235,57 @@ func (b *builder) add(d drop, rx int64, n int) {
 			}
 			b.addSource(d.src, n, rx, ports)
 		}
-		b.addService(svcKey{proto: d.proto, port: d.dpt}, n)
+		if rows {
+			b.addService(svcKey{proto: d.proto, port: d.dpt}, n)
+		}
+		if d.toLAN && d.dstOK {
+			b.addLAN(d.dst, rx, rx, 0, n)
+		}
 	case dirOut:
-		if d.srcOK && d.dstOK {
+		if rows && d.srcOK && d.dstOK {
 			b.addOut(outKey{lan: d.src, remote: d.dst, port: d.dpt, proto: d.proto, reason: d.reason}, n, rx)
 		}
+		if d.srcOK {
+			b.addLAN(d.src, rx, rx, n, 0)
+		}
 	}
+}
+
+// lanOnly reports whether b is the Devices view's request builder (newLANBuilder).
+func (b *builder) lanOnly() bool { return b.lim != nil && b.lim.lanOnly }
+
+// addLAN counts out packets the LAN address a sent and in packets sent to it, received from first
+// to last. The firewall view's request builder does not count them. The Devices view's names the
+// address after the Device List read in effect at last - else the next read, within
+// devNextWithin - and keeps at most bounds.lans of the addresses no read names, and only those
+// that could be an unknown device's (newLANBuilder).
+func (b *builder) addLAN(a [16]byte, first, last int64, out, in int) {
+	k := lanKey{addr: a}
+	if l := b.lim; l != nil {
+		if !l.lanOnly {
+			return
+		}
+		if k.dev = l.names.deviceOrNext(a, last); k.dev == 0 && !lanCandidate(netip.AddrFrom16(a).Unmap()) {
+			l.lanSkipped += out + in
+			return
+		}
+	}
+	if i, ok := b.lanIdx[k]; ok {
+		s := &b.lans[i]
+		s.out += out
+		s.in += in
+		s.first, s.last = min(s.first, first), max(s.last, last)
+		return
+	}
+	if l := b.lim; l != nil && k.dev == 0 {
+		if l.unnamed >= l.lans {
+			l.lanSkipped += out + in
+			return
+		}
+		l.unnamed++
+	}
+	b.lanIdx[k] = int32(len(b.lans))
+	b.lans = append(b.lans, lanSum{key: k, out: out, in: in, first: first, last: last})
 }
 
 func (b *builder) hour(h int64) *[nDirs]int {
@@ -307,9 +398,9 @@ func hashOut(k outKey) uint64 {
 }
 
 // tooBig reports whether a chunk's builder holds more than a chunk the store seals can: more
-// than rows distinct sources, services or outbound rows, or more than hours hours.
+// than rows distinct sources, services, outbound rows or LAN addresses, or more than hours hours.
 func (b *builder) tooBig(rows, hours int) bool {
-	return len(b.srcs) > rows || len(b.outs) > rows || len(b.services) > rows || len(b.hours) > hours
+	return len(b.srcs) > rows || len(b.outs) > rows || len(b.services) > rows || len(b.lans) > rows || len(b.hours) > hours
 }
 
 // addPort adds p to the sorted ports (unless maxPorts are kept already).
@@ -394,6 +485,7 @@ type chunkAgg struct {
 	services     []svcRow
 	reasons      []reasonRow
 	outbound     []outRow
+	lans         []lanRow
 	leading      []repeat
 	// last is the chunk's last drop and tail what its last message was (whatever the period):
 	// a repeat line at the start of the next chunk repeats them.
@@ -433,6 +525,13 @@ type outRow struct {
 	proto, reason uint8
 }
 
+// lanRow is a LAN address of a chunk's drops (lanSum).
+type lanRow struct {
+	addr        [16]byte
+	first, last int64
+	out, in     uint32
+}
+
 // Sizes of the rows (asserted by a test), for chunkAgg.size.
 const (
 	sizeHourRow   = 24
@@ -440,6 +539,7 @@ const (
 	sizeSvcRow    = 8
 	sizeReasonRow = 8
 	sizeOutRow    = 48
+	sizeLANRow    = 40
 	sizeRepeat    = 16
 	sizeChunkAgg  = 320 // the struct and its slice headers, rounded up
 )
@@ -448,7 +548,7 @@ const (
 func (a *chunkAgg) size() int64 {
 	return sizeChunkAgg + sizeHourRow*int64(cap(a.hours)) + sizeSrcRow*int64(cap(a.sources)) +
 		2*int64(cap(a.ports)) + sizeSvcRow*int64(cap(a.services)) + sizeReasonRow*int64(cap(a.reasons)) +
-		sizeOutRow*int64(cap(a.outbound)) + sizeRepeat*int64(cap(a.leading))
+		sizeOutRow*int64(cap(a.outbound)) + sizeLANRow*int64(cap(a.lans)) + sizeRepeat*int64(cap(a.leading))
 }
 
 // inside reports whether every message of the summarized chunk was received in [from, to).
@@ -523,6 +623,14 @@ func (b *builder) compact() *chunkAgg {
 		}
 		slices.SortFunc(a.outbound, compareOutRows)
 	}
+	if len(b.lans) > 0 {
+		// A chunk's builder keys its LAN addresses by address alone (lanKey.dev 0).
+		a.lans = make([]lanRow, len(b.lans))
+		for i, s := range b.lans {
+			a.lans[i] = lanRow{addr: s.key.addr, first: s.first, last: s.last, out: sat32(s.out), in: sat32(s.in)}
+		}
+		slices.SortFunc(a.lans, func(x, y lanRow) int { return bytes.Compare(x.addr[:], y.addr[:]) })
+	}
 	return a
 }
 
@@ -543,20 +651,27 @@ func (b *builder) merge(a *chunkAgg) {
 			c[d] += int(h.n[d])
 		}
 	}
-	off := 0
-	for _, s := range a.sources {
-		end := min(off+int(s.nports), len(a.ports))
-		b.addSource(s.addr, int(s.count), s.last, a.ports[off:end])
-		off = end
-	}
-	for _, s := range a.services {
-		b.addService(svcKey{proto: s.proto, port: s.port}, int(s.count))
-	}
 	for _, r := range a.reasons {
 		b.reasons[r.reason] += int(r.count)
 	}
-	for _, o := range a.outbound {
-		b.addOut(outKey{lan: o.lan, remote: o.remote, port: o.port, proto: o.proto, reason: o.reason}, int(o.count), o.last)
+	if !b.lanOnly() {
+		off := 0
+		for _, s := range a.sources {
+			end := min(off+int(s.nports), len(a.ports))
+			b.addSource(s.addr, int(s.count), s.last, a.ports[off:end])
+			off = end
+		}
+		for _, s := range a.services {
+			b.addService(svcKey{proto: s.proto, port: s.port}, int(s.count))
+		}
+		for _, o := range a.outbound {
+			b.addOut(outKey{lan: o.lan, remote: o.remote, port: o.port, proto: o.proto, reason: o.reason}, int(o.count), o.last)
+		}
+	}
+	if b.lim == nil || b.lim.lanOnly {
+		for _, r := range a.lans {
+			b.addLAN(r.addr, r.first, r.last, int(r.out), int(r.in))
+		}
 	}
 }
 

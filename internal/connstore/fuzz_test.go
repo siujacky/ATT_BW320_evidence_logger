@@ -146,7 +146,7 @@ func FuzzDecodeDevices(f *testing.F) {
 
 func FuzzParseFileName(f *testing.F) {
 	for _, s := range []string{"nat-2026-10-06.jsonl", "devices-2026-10-06.jsonl.gz", "nat-2026-10-06.jsonl.gz.tmp",
-		"last-nattable.html", "nat-2026-02-29.jsonl", "nat-2028-02-29.jsonl"} {
+		"last-nattable.html", "nat-2026-02-29.jsonl", "nat-2028-02-29.jsonl", "scan-2026-10-06.jsonl"} {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, name string) {

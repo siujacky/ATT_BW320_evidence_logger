@@ -20,13 +20,14 @@ import (
 )
 
 // fakeNetwork is a running service's API as the network command sees it: GET
-// /api/network/connections, /api/network/firewall and /api/network/status answered from its
-// fields, every request recorded.
+// /api/network/connections, /api/network/firewall, /api/network/devices and /api/network/status
+// answered from its fields, every request recorded.
 type fakeNetwork struct {
 	t       *testing.T
 	mu      sync.Mutex
 	conns   model.NetConnections
 	fw      model.NetFirewall
+	devs    model.NetDevicesView
 	status  *model.NetworkStatus // nil: /api/network/status answers 404
 	fail    int                  // answer the views with this status …
 	failMsg string               // … and error
@@ -57,17 +58,20 @@ func (f *fakeNetwork) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch r.URL.Path {
-	case "/api/network/connections", "/api/network/firewall":
+	case "/api/network/connections", "/api/network/firewall", "/api/network/devices":
 		if f.fail != 0 {
 			w.WriteHeader(f.fail)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": f.failMsg})
 			return
 		}
-		if r.URL.Path == "/api/network/firewall" {
+		switch r.URL.Path {
+		case "/api/network/firewall":
 			_ = json.NewEncoder(w).Encode(f.fw)
-			return
+		case "/api/network/devices":
+			_ = json.NewEncoder(w).Encode(f.devs)
+		default:
+			_ = json.NewEncoder(w).Encode(f.conns)
 		}
-		_ = json.NewEncoder(w).Encode(f.conns)
 	case "/api/network/status":
 		if f.status == nil {
 			w.WriteHeader(http.StatusNotFound)
@@ -161,6 +165,10 @@ func TestNetworkArguments(t *testing.T) {
 		{[]string{"--to", "2026-10-07"}, "--to 2026-10-07: that day has not begun yet"},
 		{[]string{"--from", "2026-10-05T21:00:00Z", "--to", "2026-10-06T00:00:00Z"}, "--to may be at most an hour from now"},
 		{[]string{"--firewall", "--device", "gateway"}, "--device: the firewall view is not per device"},
+		{[]string{"--devices", "--device", "gateway"}, "--device: the Devices view lists every device"},
+		{[]string{"--devices", "--firewall"}, "--devices and --firewall are two views of the Network page: give one of them"},
+		{[]string{"--devices", "--range", "2h"}, `--range "2h": use one of 1h, 24h, 7d, 30d`},
+		{[]string{"--devices", "--limit", "0"}, "--limit must be 1 to 1000"},
 		{[]string{"--device", "mac 00"}, "--device: a device key"},
 		{[]string{"--device", strings.Repeat("k", web.MaxNetworkDeviceChars+1)}, "--device: a device key"},
 		{[]string{"--device", "ip:192.168.1.7\x1b"}, "--device: a device key"},

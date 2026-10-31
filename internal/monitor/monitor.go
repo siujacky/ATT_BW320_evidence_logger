@@ -6,7 +6,8 @@
 // (contracts.StatusSource) as well as operator actions (contracts.Actions), the syslog controls
 // (contracts.SyslogControl: how much is kept, and the gateway's Syslog page) and the flow meter
 // (contracts.LiveTrafficSource). It also samples the gateway's NAT table and Device List for the
-// dashboard's Network page (connections.go, into Options.Conns).
+// dashboard's Network page (connections.go, into Options.Conns), and sweeps the home network by
+// ARP for it (scans.go, into Options.Scans).
 //
 // Everything the monitor learns is appended to the evidence ledger; its in-memory state is
 // a cache that is rebuilt from the ledger at startup (state/monitor-state.json only speeds
@@ -16,7 +17,7 @@
 // Concurrency: one goroutine per activity (fast cycle, gateway poll, service checks, local
 // link, clock, heartbeat, anchoring, notification check, traceroutes, incident close,
 // segment compression, syslog receiver and syslog flush, NAT table and Device List samplers, the
-// connection store's retention).
+// LAN scan, the connection store's retention).
 // Locks, always acquired in this order:
 //
 //	notifMu   makes "read the redirect and Syslog settings, then enforce them" atomic w.r.t.
@@ -106,6 +107,13 @@ type Options struct {
 	// whether or not it does, it applies the store's retention limits every hour. None of it is
 	// evidence: nothing of it is written to the ledger (connections.go).
 	Conns contracts.ConnStore
+	// Scanner sweeps the home network by ARP and Scans keeps its sweeps (docs/dhcp-table.md §6;
+	// nil either: no sweeps). With Conns, connections.enabled and connections.scan_interval above
+	// 0 the monitor sweeps every scan_interval - the first time a few minutes after the start,
+	// after the first Device List round - but never while the gateway is needed for evidence (it
+	// sweeps once that ends), and appends each sweep to Scans; never to the ledger (scans.go).
+	Scanner contracts.LANScanner
+	Scans   contracts.ScanStore
 }
 
 // Compile-time interface conformance.
@@ -544,7 +552,7 @@ func New(opts Options) (*Monitor, error) {
 	m.syslogOn = opts.Syslog != nil && opts.SyslogStore != nil && opts.Config.Syslog.Enabled
 	m.syslog = bookOf(opts.SyslogStore, m.log)
 	m.syslogMarkLater, m.syslogUnverified = map[string]uint64{}, map[string]bool{}
-	m.conns = newConnSamplers(opts.Conns, opts.Config.Connections, m.set.gwTimeout)
+	m.conns = newConnSamplers(opts.Conns, opts.Scanner, opts.Scans, opts.Config.Connections, m.set.gwTimeout)
 	m.st.incidents = map[string]model.Incident{}
 	m.st.points = newPointStore()
 	m.st.alarms = map[string]alarmMark{}
@@ -631,6 +639,9 @@ func (m *Monitor) Run(ctx context.Context) error {
 	}
 	if m.samplersOn() {
 		workers = append(workers, worker{"connections-nat", m.natLoop}, worker{"connections-devices", m.devicesLoop})
+	}
+	if m.scansOn() {
+		workers = append(workers, worker{"connections-scan", m.scanLoop})
 	}
 	if m.conns != nil {
 		// Whether or not the samplers run: the store's retention limits and the raw page copies'

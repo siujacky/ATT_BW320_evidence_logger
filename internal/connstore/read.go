@@ -9,10 +9,21 @@ import (
 	"time"
 )
 
-// openAttempts bounds how often a reader looks again at a day that the writer was changing
-// (compressing, merging or pruning it) while the reader opened its files; it waits a little
-// longer each time (90 ms in all: a compression keeps a day marked for one rename).
+// openAttempts bounds how often dayStamps looks again at a day that the writer was changing
+// (compressing, merging or pruning it): a day it cannot stamp is only not cached.
 const openAttempts = 10
+
+// openWait bounds how long openDay waits for a day that the writer is changing while a reader
+// opens its files: it looks again after openPauseMin, then twice as long each time up to
+// openPauseMax. A compression keeps a day marked for one rename only, but on a busy machine - or
+// while an antivirus scanner holds the new compressed file - that rename can take longer than the
+// few milliseconds it usually does: a reader then waits rather than fail (and leave the day's
+// devices unnamed in the view it was building).
+const (
+	openWait     = 2 * time.Second
+	openPauseMin = 2 * time.Millisecond
+	openPauseMax = 100 * time.Millisecond
+)
 
 // errChanged says that the writer changed a day's files while a reader opened them.
 var errChanged = errors.New("the files kept changing while they were opened")
@@ -38,10 +49,13 @@ type dayReader struct {
 // day (pruned meanwhile). What it opens is always one state of the day the writer left it in,
 // never one in between - such as a compressed file that holds a plain file's lines and that
 // plain file: the writer marks the day's entry (an odd generation) while it replaces or deletes
-// its files, and a day whose generation changed while its files were opened is opened again.
-// Files changed by another program are read as they are (their complete lines).
+// its files, and a day whose generation changed while its files were opened is opened again
+// (for openWait at most). Files changed by another program are read as they are (their complete
+// lines).
 func (s *Store) openDay(k kind, d day) (*dayReader, error) {
-	for attempt := 1; ; attempt++ {
+	deadline := time.Now().Add(openWait)
+	pause := openPauseMin
+	for {
 		f, ok := s.entry(k, d)
 		if !ok {
 			return nil, nil
@@ -65,13 +79,14 @@ func (s *Store) openDay(k kind, d day) (*dayReader, error) {
 				return nil, fmt.Errorf("connstore: read %s: %w", fileName(k, d, f.gz >= 0), err)
 			}
 		}
-		if attempt == openAttempts {
+		if !time.Now().Before(deadline) {
 			if err == nil {
 				err = errChanged
 			}
 			return nil, fmt.Errorf("connstore: read %s: %w", fileName(k, d, f.gz >= 0), err)
 		}
-		time.Sleep(time.Duration(2*attempt) * time.Millisecond)
+		time.Sleep(pause)
+		pause = min(2*pause, openPauseMax)
 	}
 }
 

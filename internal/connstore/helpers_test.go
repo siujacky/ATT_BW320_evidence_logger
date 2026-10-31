@@ -361,8 +361,9 @@ func checkConsistent(t testing.TB, a model.ConnAggregate) {
 
 // consistent returns how an aggregate breaks the invariants every aggregate keeps: each
 // device's weight is the sum of its flows' weights, no flow or device is seen in more reads than
-// the period has, and the flows' first and last reads are within the period's. It may be called
-// from any goroutine.
+// the period has, the flows' first and last reads are within the period's, and the devices'
+// sessions in the newest read (Open) are within their weight and add up to at most the sessions
+// that read listed. It may be called from any goroutine.
 func consistent(a model.ConnAggregate) []string {
 	var problems []string
 	parse := func(s string) time.Time {
@@ -373,6 +374,7 @@ func consistent(a model.ConnAggregate) []string {
 		return v
 	}
 	sum := map[string]int{}
+	open := 0
 	for _, f := range a.Flows {
 		sum[f.Device] += f.Weight
 		if f.Samples < 1 || f.Samples > a.Samples || f.Weight < f.Samples {
@@ -390,10 +392,17 @@ func consistent(a model.ConnAggregate) []string {
 		if d.Samples < 1 || d.Samples > a.Samples {
 			problems = append(problems, fmt.Sprintf("device %s: samples %d of %d reads", d.Key, d.Samples, a.Samples))
 		}
+		if d.Open < 0 || d.Open > d.Weight || d.Open > 0 && d.Samples < 1 {
+			problems = append(problems, fmt.Sprintf("device %s: %d sessions open in the newest read, weight %d", d.Key, d.Open, d.Weight))
+		}
+		open += d.Open
 		delete(sum, d.Key)
 	}
 	if len(sum) > 0 {
 		problems = append(problems, fmt.Sprintf("flows of devices the result does not list: %v", sum))
+	}
+	if open > max(a.Open, 0) {
+		problems = append(problems, fmt.Sprintf("the devices have %d sessions open in the newest read, which listed %d", open, a.Open))
 	}
 	return problems
 }

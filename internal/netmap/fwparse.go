@@ -31,6 +31,10 @@ type drop struct {
 	proto        uint8    // codes.protos
 	reason       uint8    // codes.reasons
 	dir          uint8
+	// toLAN: an inbound packet that was to go out on a LAN interface (OUT=br*, lan*, wl*): one
+	// addressed to a device of the home network (its IPv6 address, a port forward), not to the
+	// gateway itself. The Devices tab counts them for that device (dst).
+	toLAN bool
 }
 
 // Kinds of a syslog line.
@@ -126,6 +130,7 @@ func (c *codes) parseDrop(text []byte) (drop, bool) {
 		return drop{}, false
 	}
 	d := drop{dir: direction(f.in, f.out)}
+	d.toLAN = d.dir == dirIn && len(f.out) > 0 && lanLike(f.out)
 	d.src, d.srcOK = parseAddr(f.src)
 	d.dst, d.dstOK = parseAddr(f.dst)
 	d.spt, d.dpt = parsePort(f.spt), parsePort(f.dpt)

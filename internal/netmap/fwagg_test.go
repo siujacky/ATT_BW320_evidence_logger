@@ -231,6 +231,7 @@ func TestRowSizes(t *testing.T) {
 		"svcRow":    {unsafe.Sizeof(svcRow{}), sizeSvcRow},
 		"reasonRow": {unsafe.Sizeof(reasonRow{}), sizeReasonRow},
 		"outRow":    {unsafe.Sizeof(outRow{}), sizeOutRow},
+		"lanRow":    {unsafe.Sizeof(lanRow{}), sizeLANRow},
 		"repeat":    {unsafe.Sizeof(repeat{}), sizeRepeat},
 	} {
 		if c[0] != c[1] {
@@ -239,6 +240,71 @@ func TestRowSizes(t *testing.T) {
 	}
 	if s := unsafe.Sizeof(chunkAgg{}); s > sizeChunkAgg {
 		t.Errorf("chunkAgg takes %d bytes, the estimate says %d", s, sizeChunkAgg)
+	}
+}
+
+// TestDropsByLANAddress: a chunk's summary counts each LAN address's dropped packets - those it
+// sent toward the Internet, and those from the Internet on their way to it (OUT a LAN interface),
+// repeats included - with the first and the newest; neither the gateway's own packets nor those
+// to it count. The firewall view's request does not count them; the Devices view's request counts
+// only them, each named after the Device List read in effect.
+func TestDropsByLANAddress(t *testing.T) {
+	c := newCodes()
+	events := []event{
+		{at(1), lineOutbound}, // from 192.168.1.64
+		{at(2), repeatLine(4)},
+		{at(3), lineToLAN}, // to 192.168.1.64
+		{at(4), lineInbound},
+		{at(5), lineGateway},
+		{at(6), lineV6},
+		{at(7), inLine("192.0.2.17", "2001:db8:5::64", 22)},
+		{at(8), outLine("192.168.1.65", "192.0.2.44", 443, "POLICY")},
+	}
+	a := scanAll(c, events, time.Time{}, time.Time{}).fullAgg()
+	want := []lanRow{
+		{addr: srcKey("192.168.1.64"), first: at(1).UnixNano(), last: at(3).UnixNano(), out: 5, in: 1},
+		{addr: srcKey("192.168.1.65"), first: at(8).UnixNano(), last: at(8).UnixNano(), out: 1},
+		{addr: srcKey("2001:db8:5::64"), first: at(7).UnixNano(), last: at(7).UnixNano(), in: 1},
+	}
+	if !reflect.DeepEqual(a.lans, want) {
+		t.Errorf("lans %+v\nwant %+v", a.lans, want)
+	}
+
+	names := newDevNamer()
+	names.add(at(0).UnixNano(), sampleDevices) // Study PC: 192.168.1.64 and 2001:db8:5::64
+	fw := newRequestBuilder(defaultBounds, lookup{}, names)
+	fw.merge(a)
+	if len(fw.lans) != 0 || len(fw.outs) != 2 || len(fw.srcs) == 0 {
+		t.Errorf("the firewall view's request: %d LAN addresses, %d rows, %d sources", len(fw.lans), len(fw.outs), len(fw.srcs))
+	}
+	byDevice := func(b *builder) map[string][2]int {
+		got := map[string][2]int{}
+		for _, s := range b.lans {
+			key, _ := names.describe(s.key.dev, netip.AddrFrom16(s.key.addr).Unmap())
+			v := got[key]
+			got[key] = [2]int{v[0] + s.out, v[1] + s.in}
+		}
+		return got
+	}
+	dev := newLANBuilder(defaultBounds, names)
+	dev.merge(a)
+	if len(dev.srcs) != 0 || len(dev.outs) != 0 || len(dev.services) != 0 || dev.counts != a.counts {
+		t.Errorf("the devices view's request counted sources, rows or services: %d, %d, %d; counts %v, want %v", len(dev.srcs),
+			len(dev.outs), len(dev.services), dev.counts, a.counts)
+	}
+	// Study PC by its IPv4 and IPv6 addresses; 192.168.1.65 is the entry without a name.
+	if got, want := byDevice(dev), map[string][2]int{"mac:00:00:5e:00:53:10": {5, 2}, "mac:00:00:5e:00:53:11": {1, 0}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("merged, by device %v, want %v", got, want)
+	}
+	direct := newLANBuilder(defaultBounds, names) // a chunk read straight into the request's sums
+	for _, e := range events {
+		if kind, d, _ := c.parse([]byte(e.text)); kind == lineDrop {
+			direct.add(d, e.rx.UnixNano(), 1)
+		}
+	}
+	if got, want := byDevice(direct), map[string][2]int{"mac:00:00:5e:00:53:10": {1, 2}, "mac:00:00:5e:00:53:11": {1, 0}}; !reflect.DeepEqual(got, want) ||
+		len(direct.srcs) != 0 || len(direct.services) != 0 {
+		t.Errorf("added, by device %v, want %v (%d sources, %d services)", got, want, len(direct.srcs), len(direct.services))
 	}
 }
 

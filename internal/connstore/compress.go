@@ -10,7 +10,7 @@ import (
 // opCompress names the compression of a day's file in Usage().Error.
 func opCompress(k kind, d day) string { return "compress " + fileName(k, d, false) }
 
-// compressBefore compresses the plain files of both kinds of the days before d: those days are
+// compressBefore compresses the plain files of every kind of the days before d: those days are
 // over. A day whose compression failed is tried again after compressRetry, or with force (s.wmu
 // held).
 func (s *Store) compressBefore(d day, force bool) {
@@ -173,11 +173,13 @@ func copyLines(w io.Writer, src io.Reader) error {
 }
 
 // dropCached forgets what the caches hold about the files of kind k and day d: their keys no
-// longer match, and the memory is freed now rather than when the entries age out.
+// longer match, and the memory is freed now rather than when the entries age out. The LAN scans
+// are not cached (a day holds a few dozen small lines: EachScan reads them).
 func (s *Store) dropCached(k kind, d day) {
-	if k == kindNAT {
+	switch k {
+	case kindNAT:
 		s.sums.removeIf(func(key sumKey) bool { return key.day == d })
-		return
+	case kindDevices:
+		s.devs.removeIf(func(key devKey) bool { return key.day == d })
 	}
-	s.devs.removeIf(func(key devKey) bool { return key.day == d })
 }

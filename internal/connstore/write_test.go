@@ -31,7 +31,7 @@ func TestAppendAndAggregateRoundTrip(t *testing.T) {
 		t.Errorf("aggregate = %+v", a)
 	}
 	wantDevices := []model.ConnDevice{
-		{Key: macKey(1), Name: "test-laptop", IPv4: lanIP(10), MAC: macOf(1), Connection: "Wi-Fi 5 GHz", Samples: 2, Weight: 3},
+		{Key: macKey(1), Name: "test-laptop", IPv4: lanIP(10), MAC: macOf(1), Connection: "Wi-Fi 5 GHz", Samples: 2, Weight: 3, Open: 1},
 		{Key: macKey(2), Name: "test-phone", IPv4: lanIP(11), MAC: macOf(2), Connection: "Wi-Fi 2.4 GHz", Samples: 1, Weight: 1},
 	}
 	if !reflect.DeepEqual(a.Devices, wantDevices) {

@@ -3,6 +3,8 @@ package connstore
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"slices"
 	"testing"
 	"time"
@@ -121,6 +123,55 @@ func TestEachDevices(t *testing.T) {
 	}
 	if got := eachDevices(t, h.s, at(0, 0, 0), at(9, 0, 0)); !slices.Equal(got, want("r4", "r5")) {
 		t.Errorf("after the days older than a day were pruned: %q", got)
+	}
+}
+
+// TestDevicesKeepTheirSignal: the Wi-Fi signal the Device List drew (LANDevice.Signal) is kept with
+// the read - by Devices and EachDevices, in plain and in compressed days - and a read stored before
+// the field existed has none.
+func TestDevicesKeepTheirSignal(t *testing.T) {
+	h := newHarness(t, at(0, 23, 0), Options{})
+	if err := h.s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	older := `{"t":"2026-10-05T08:00:00Z","devices":[{"mac":"00:00:5e:00:53:01","name":"older","ipv4":"192.168.1.10",` +
+		`"status":"on","connection":"Wi-Fi 5 GHz"}]}` + "\n"
+	if err := os.WriteFile(h.file("devices-2026-10-05.jsonl"), []byte(older), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.open()
+	weak := device(10, 1, "laptop", "Wi-Fi 2.4 GHz")
+	weak.Signal = 2
+	h.devices(at(0, 10, 0), weak)
+	signals := func() []string {
+		var got []string
+		err := h.s.EachDevices(context.Background(), at(0, 0, 0), at(2, 0, 0), func(at time.Time, devices []model.LANDevice) error {
+			for _, d := range devices {
+				got = append(got, fmt.Sprintf("%s %s %d", rfc(at), d.Name, d.Signal))
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	want := []string{rfc(at(0, 8, 0)) + " older 0", rfc(at(0, 10, 0)) + " laptop 2"}
+	if got := signals(); !slices.Equal(got, want) {
+		t.Errorf("EachDevices: %q, want %q", got, want)
+	}
+	if devices, _ := h.s.Devices(); len(devices) != 1 || devices[0].Signal != 2 {
+		t.Errorf("Devices = %+v", devices)
+	}
+	// The next day compresses the day: the signal is still there.
+	h.clk.Set(at(1, 1, 0))
+	h.devices(at(1, 1, 0), device(10, 1, "laptop", "Ethernet LAN-1"))
+	if !h.exists("devices-2026-10-05.jsonl.gz") {
+		t.Fatal("the day was not compressed")
+	}
+	h.reopen()
+	if got := signals(); !slices.Equal(got, append(want, rfc(at(1, 1, 0))+" laptop 0")) {
+		t.Errorf("EachDevices after compressing and reopening: %q", got)
 	}
 }
 

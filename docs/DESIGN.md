@@ -178,6 +178,7 @@ internal/syslogstore   syslog store: chunk files within syslog.keep_mb / keep_da
 internal/connstore     Network page: NAT table and Device List reads in daily files, retention (§19)
 internal/ipintel       Network page: offline IP database (IPtoASN), port names, reverse DNS cache (§19)
 internal/netmap        Network page: the connections and firewall views (§19)
+internal/lanscan       Network page: sweeps of the home network by ARP (Windows SendARP) (§19)
 tools/verify_bundle.py standalone third-party verifier (Python 3 stdlib + optional extras)
 ```
 
@@ -222,6 +223,7 @@ connections/                      the Network page's samples (§19) — NOT evid
                                   connections.keep_days within connections.keep_mb:
 connections/nat-YYYY-MM-DD.jsonl      the NAT table reads of a UTC day, one line each (appended)
 connections/devices-YYYY-MM-DD.jsonl  the Device List reads of a UTC day
+connections/scan-YYYY-MM-DD.jsonl     the LAN scans (sweeps of the home network by ARP) of a UTC day
 connections/<name>.jsonl.gz       a day's file, gzip, once the day is over
 connections/last-nattable.html    raw copies of a NAT table / Device List page (the first read that
 connections/last-devices.html     worked since the start, or one not understood; at most hourly; the
@@ -581,6 +583,8 @@ Static assets are embedded (`embed.FS`), no external URLs (the UI must work duri
 | GET `/api/traffic/live` | `model.LiveTraffic`: the flow meter (§18): the newest WAN rates from an on-demand read of the gateway's counters (at most every 5 s whoever asks), this computer's rates and about 15 minutes of history; never recorded |
 | GET `/api/network/connections?range=\|from=&to=&device=&limit=` | `model.NetConnections` (§19), not evidence: which device talked to which remote address in the period, from the NAT table samples - the NAT reads (count, first, last, the newest one's totals), the summary totals, every device of the period, the flow diagram (organisations, services, bands), the countries and the rows (`limit`, 200 unless given, at most 1000; `rows_total` counts them all). `range` is `1h`, `24h` (the default), `7d` or `30d`, ending now; or `from`/`to` as for `/api/syslog`; at most 31 days, ending at most an hour after the server's clock. `device` (a key as `devices` lists it: `mac:…`, `ip:…`, `gateway`; at most 128 printable ASCII characters) keeps that device's rows and bands |
 | GET `/api/network/firewall?range=\|from=&to=&limit=` | `model.NetFirewall` (§19), not evidence: what the gateway's firewall dropped in the period, from the syslog store - drops by direction, every hour's drops, the inbound sources' countries, the top sources, the probed services, the reasons, and the LAN devices' blocked packets by destination (`limit` rows; `outbound_total` and `outbound_devices` count them all); `oldest` is the oldest syslog message kept. A `device` parameter is refused (400) |
+| GET `/api/network/devices?range=\|from=&to=&limit=` | `model.NetDevicesView` (§19, `docs/dhcp-table.md`), not evidence: the gateway's Device List - its DHCP table - as the newest read shows it (`list_at`), each device with its reads, open connections, sites, blocked packets (out and in) and issues; the LAN addresses no Device List read of the period names (`unknown`, `limit` of them, `totals.unknown` counts them all); the period's IPv4 address history (`addresses`); `nat_reads` and `nat_at` say which NAT reads the open connections come from; the period's LAN scans (`scans`, the newest in `scan`, `totals.scanned`; per device `scan_addr`, `scan_seen`, `scan_hits`). A `device` parameter is refused (400); 503 without a connection store |
+| GET `/api/network/device?key=\|addr=&range=\|from=&to=&limit=` | `model.NetDeviceDetail` (§19, `docs/dhcp-table.md` §7), not evidence: one device of `/api/network/devices` (`key`) or one unknown address (`addr`, IPv4) as that view lists it, the address history of its addresses, the period's LAN scans as it answered them (newest first, at most 800), `match` (what its syslog messages are found by) and `syslog`: those messages, newest first, `limit` of them (100 unless given, at most 500; also ending within 16 MiB of JSON; `syslog_truncated`), each with its `chunk` and `seq` as `/api/syslog` gives them; `syslog_error` when the syslog store could not be read. Exactly one of `key` and `addr`; 404 (worded) when the period knows neither |
 | GET `/api/network/status` | `model.NetworkStatus`: the samplers (`Status.connections`), the connection store's volume and limits, the IP database (`model.IPIntelStatus`), the syslog kept and `config_warnings` - the page's settings in config.json the service could not use as written, each with what it uses instead (§15; left out when none) |
 
 API details (as implemented): `/api/records` adds `hash_ok` (h == SHA-256(b)) per record, an
@@ -630,9 +634,10 @@ Network page (as implemented, §19): the parameters are checked before the view 
 `limit` above 1000 is read as 1000); a view's work - also after the samples are read, while the view
 is put together - ends with the request and after 30 s (504); a missing source (no connection store,
 no syslog store) answers 503 - the dashboard's Firewall tab then explains that no syslog store is
-kept - and a server given no network view 404. Every list of an answer is present (never `null`),
-the rows are capped at the limit asked for while the totals count them all, and `outbound_devices`
-is at least the number of devices the rows listed name. `Status.connections`
+kept - and a server given no network view 404. Every list of an answer is present (never `null`,
+also each device's and unknown address's `issues`), the rows - and the Devices view's unknown
+addresses - are capped at the limit asked for while the totals count them all, and
+`outbound_devices` is at least the number of devices the rows listed name. `Status.connections`
 (`model.ConnSamplerStatus`, absent without a connection store): `enabled`, the intervals, the newest
 NAT read that worked (time, sessions listed, the page's sessions in use and available),
 `nat_problem` (why the newest round did not read the table, or why its read failed: no access code,
@@ -640,7 +645,9 @@ a changed certificate pending, an incident, the login policy, the reads' login b
 `nat_note` (what the newest read, which worked, could not keep: rows not understood, or the read
 itself when the store refused it; never with a problem), `nat_next`, `nat_logins` (the gateway
 logins the NAT reads needed in the last 24 hours), the newest Device List read with
-`devices_problem`, and the store's volume and limits.
+`devices_problem`, and the store's volume and limits. The LAN scan (§19) adds `scan_interval` (""
+while no sweeps are made), `scan_at` and `scan_hosts` (the newest sweep that worked, and how many
+addresses answered it), `scan_problem` and `scan_next`.
 
 Dashboard views (hash routes): Overview (a summary dashboard, docs/overview-redesign.md: the
 status card with state/cause/attribution, key facts, the open incident and the 24-hour strip of
@@ -670,13 +677,15 @@ most 500 characters of the text and 100 of the host and the app as shown (an esc
 length), each with at most 16 runs of hidden characters, one element per run, and the exact
 datagram on request; "Load more" doubles the limit up to 5000, and is not offered when an answer
 ended at its size; the store's use and the retention form, which asks first when a change deletes
-messages now and says when the limits saved were already in force), Network (§19; two tabs with one
+messages now and says when the limits saved were already in force), Network (§19; three tabs with one
 period - 1 h, 24 h, 7 d, 30 d or a custom one of at most 31 days - kept in the URL and read again
 every minute while the page is visible: Connections, with a device filter - tiles, the flow diagram
 devices → organisations → services, a world map of the sites' countries and the table of each
 device's remote addresses with search, sort and "Show all"; Firewall - tiles, the drops per hour,
 a world map of the blocked sources' countries, the most probed services, the top sources and the
-packets blocked on the way out; a table view for every chart; notes that say why the NAT table is
+packets blocked on the way out; Devices - the gateway's DHCP table with each device's issues, the
+unknown LAN addresses and a find box that says who held an IPv4 address when (`docs/dhcp-table.md`
+§3); a table view for every chart; notes that say why the NAT table is
 not read or the IP database not loaded; and what the data are and are not), Evidence (ledger
 head, key fingerprint, anchors, verify, exports, notes), Records (raw ledger browser). Charts are
 hand-written inline SVG (no libraries); the world map is `static/world.json` (Natural Earth 1:110m
@@ -780,8 +789,11 @@ att-monitor syslog [--since 24h] [--grep T] [--severity L] [--limit N] [--json]
                                                             the syslog store's messages (GET /api/syslog), oldest first
 att-monitor syslog retention [--keep-mb N] [--keep-days D] [--yes]
                                                             show the store's use and limits, or change them
-att-monitor network [--range 1h|24h|7d|30d | --from T --to T] [--device KEY] [--firewall] [--limit N] [--json]
+att-monitor network [--range 1h|24h|7d|30d | --from T --to T] [--device KEY] [--firewall] [--devices [--key KEY | --addr A]] [--limit N] [--json]
                                                             the Network page in short (§19), through the service
+att-monitor scan [--json]                                   one sweep of the home network by ARP, now (§19): the
+                                                            addresses that answer, their MAC addresses and the
+                                                            service's Device List names; stores nothing
 att-monitor verify [--data DIR]                             verify the full ledger
 att-monitor verify-bundle FILE.zip                          MANIFEST, REPORT, SYSLOG lines and the ledger verification
 att-monitor export --from YYYY-MM-DD[THH:MM] --to … [--incident ID] [--prepared-by NAME] [--out DIR]
@@ -831,14 +843,26 @@ totals, the devices (each with its key for `--device`), the organisations, the c
 connections most seen (device -> remote address with its reverse DNS name, organisation,
 country, service, first and last seen, reads); with `--firewall` the drops by direction, the
 sources and their countries, the probed services, the reasons and the packets blocked on the way
-out (from how many devices); the settings of the page that the service could not use as written
-(`config_warnings`, §15) end either summary. The period is `--range` (`1h`, `24h` - the default -,
+out (from how many devices); with `--devices` (`/api/network/devices`) the Device List and NAT
+reads of the period, the DHCP table (status, name, IPv4, MAC, connection with its Wi-Fi bars or
+link speed, allocation, last seen on, open connections, sites, blocked out/in, issues), each
+device's issues in words and the unknown LAN addresses (`--limit` of them) - with the LAN scans: a
+line for the newest scan of the period (its network, when, how many of the addresses asked
+answered, the next one due), a SCAN column (answered at a time - and where, when not at its
+address -, no answer, not scanned) and the unknown addresses' MAC address and scan time; with
+`--devices --key KEY` (a key, or a MAC address alone) or `--addr ADDRESS` (`/api/network/device`)
+one device's or unknown address's details - what the period says about it, its issues, who held its
+addresses, the newest scans, what its syslog messages are found by and those messages, newest first
+(`--limit` of them, at most 500); the settings of the
+page that the service could not use as written (`config_warnings`, §15) end every summary. The
+period is `--range` (`1h`, `24h` - the default -,
 `7d`, `30d`) or `--from`/`--to` (TIME as for `export`; a date alone as `--to` includes that whole
 day, up to now, and without `--from` is that day alone, from its local midnight - 23 or 25 hours
 when the clocks change; otherwise `--from` defaults to 24 hours before `--to`, `--to` to now),
 checked as the service checks it: at most 31 days of 24 hours, so 31 whole days that include the
-change back from summer time are refused, with that reason; `--device` only without `--firewall`;
-`--limit` 1 to 1000 rows (20 by default); `--json` prints the answer as it is.
+change back from summer time are refused, with that reason; `--device` only without `--firewall`
+and `--devices`, which exclude each other; `--limit` 1 to 1000 rows (20 by default); `--json` prints
+the answer as it is.
 Text from the gateway, the IP database and reverse DNS is escaped as syslog text is. The CLI never
 opens the connection store (a single writer: the monitor): without the service the command fails
 and says where the samples are kept.
@@ -874,7 +898,9 @@ to this computer and `syslog_level` ("") names the Log Level to set (§18); the 
 The `connections` section configures the Network page's samples (§19): `enabled` (true),
 `interval` (4m; 2m to 4m: the gateway client reuses its login session for 5 minutes, and a longer
 interval would need a login for every read), `devices_interval` (15m; 5m to 24h), `keep_days` (30; 1
-to 3650), `keep_mb` (200; 10 to 1,048,576) and `reverse_dns` (true). The `geo` section its IP
+to 3650), `keep_mb` (200; 10 to 1,048,576) and `reverse_dns` (true). `scan_interval` (1h; 15m to 24h,
+or 0: no sweeps) is how often the home network is swept by ARP (§19); a config.json written before it
+existed sweeps hourly, and only its 0 is not replaced by the default (a value below 0 is). The `geo` section its IP
 database: `enabled` (true), `download` (true), `url_v4` / `url_v6` (IPtoASN's files; https, without
 credentials, query or fragment: the configuration is recorded in the ledger, so a URL must carry no
 secret) and `refresh` (7 days, `168h0m0s`; 1 to 90 days). These two sections configure what is not
@@ -1165,12 +1191,14 @@ own timeout, not the gateway timeout), so an evidence snapshot waits at most tha
 and while the newest recorded snapshot found the gateway unreachable no live read is made at all
 (the next poll that reaches the gateway resumes them).
 
-## 19. The Network page: connections and the firewall (not evidence)
+## 19. The Network page: connections, the firewall and the devices (not evidence)
 
 The owner's goal of 2026-10-06 and the plan are in `docs/syslog-map-graphic.md` (its §5 lists where
 this differs from the plan). The dashboard's **Network** page shows which device on the home network
 talked to which remote address, organisation, country and service - from samples of the gateway's
-NAT table - and what the gateway's firewall dropped - from its syslog (§18).
+NAT table - and what the gateway's firewall dropped - from its syslog (§18). Its Devices tab (the
+owner's goal of 2026-10-30, `docs/dhcp-table.md`) is the gateway's Device List - its DHCP table:
+which device has which address - with each device's issues, from the same samples.
 
 **Not evidence.** These data describe the household's own traffic, not AT&T's faults. Nothing of
 them is written to the ledger (which can never delete anything, and would keep browsing patterns
@@ -1181,6 +1209,7 @@ on them (`RulesVersion` is unchanged). They live in their own folders with their
 ```
 gateway nattable.ha (login)    --connections.interval-->         NAT sampler    --+
 gateway devices.ha (no login)  --connections.devices_interval--> Device sampler --+--> connection store (connections\)
+home network: ARP (SendARP)    --connections.scan_interval-->    LAN scan       --+
 syslog store (§18): the firewall's drop lines ------------------------------------+        |
 IP database (geo\): IPtoASN tables, port names, reverse DNS cache ---------------> netmap view --> GET /api/network/* --> dashboard,
                                                                                                                         att-monitor network
@@ -1205,7 +1234,10 @@ for checking a new firmware (below). `Client.Devices` GETs
 posts its form (*Clear and Rescan for Devices* empties the gateway's device table); `ParseDevices`
 reads each device's MAC, name, IPv4 and IPv6 addresses, status, allocation, connection type
 (summarized: the Wi-Fi network's name is never kept in the samples, nor in the page's copy below),
-speed and last activity (`testdata/gateway/devices_real.html` is a sanitized capture).
+speed, last activity and, for a Wi-Fi device that is on, its signal in bars (`signal`, 1-5: the
+text of the signal image in the Connection Type cell, `alt="Wi-Fi 5 bars"`, else its file name
+`signal-strength-5-bar.png`; 0 when none is drawn, and in the reads stored before it was read)
+(`testdata/gateway/devices_real.html` is a sanitized capture).
 
 **Samplers** (`internal/monitor`, connections.go; only with a connection store and
 `connections.enabled`). The evidence comes first, and logins stay rare:
@@ -1266,6 +1298,22 @@ speed and last activity (`testdata/gateway/devices_real.html` is a sanitized cap
   unreachable: the gateway is polled for evidence then. A read in progress is stopped as soon as
   that happens (looked at every 250 ms), and holds the gateway lock for at most three gateway
   timeouts (NAT table: a login and the page) or one gateway timeout and 5 s (Device List).
+* The LAN scan (scans.go, `docs/dhcp-table.md` §6; with `Options.Scanner`, `Options.Scans` and
+  `connections.scan_interval` above 0): every `connections.scan_interval` (1 hour) the home network is
+  swept by ARP (*LAN scan*, below), the first time 3 minutes after the start and not before the
+  Device List sampler's first round (the Devices view compares a sweep with the Device List read
+  before it), then an interval after the previous sweep began. It takes no lock of the gateway - ARP
+  does not use its web server - but is held as the readers are, so that the monitor's own traffic
+  stays out of the evidence's way: a round that finds the gateway needed for evidence says why
+  (`scan_problem`) and looks again half a minute later, so the sweep is made once the hold ends; a
+  sweep in progress when it begins is stopped (looked at every 250 ms) and not kept - part of a sweep
+  would make the devices it did not reach look silent. Besides the scanner's own 2 minutes the
+  monitor bounds a sweep at 2.5 minutes. Each sweep is appended to the connection store dated by the
+  monitor's clock when its round began (its `at`); a sweep that stopped short is kept, with its
+  `problem`. `Status.connections` gives `scan_interval` ("" while there are no sweeps), `scan_at`
+  and `scan_hosts` (the newest sweep that worked, and how many addresses answered it),
+  `scan_problem` (a hold, a failure, a sweep that stopped short, or one the store refused) and
+  `scan_next`. Failures are logged as the readers' are; the first sweep that works is logged.
 * What a read gives is appended to the connection store; `Status.connections` (§12) reports the
   newest reads, why a round did not read and when the next is due. Failures are logged when they
   start and every 6 hours while they go on.
@@ -1280,13 +1328,41 @@ speed and last activity (`testdata/gateway/devices_real.html` is a sanitized cap
   an incident and nothing is appended - the monitor applies the connection store's retention limits
   every hour, and deletes the raw copies older than `connections.keep_days` (a worker of its own).
 
+**LAN scan** (`internal/lanscan`, `contracts.LANScanner`). `Scanner.Scan` finds this computer's IPv4
+interface - up, not the loopback - whose network holds `gateway.host` (of several: the most specific
+network, then the lowest interface index) and refuses, each with an error that says why, an interface
+without a MAC address (ARP does not apply), a network that is not private (RFC 1918) and one of more
+than 1,024 addresses (a /22). It then asks every host address of the network but this computer's own
+by ARP, from this computer's address on that interface, at most 32 at a time: Windows' `SendARP`
+(iphlpapi.dll, which `golang.org/x/sys/windows` does not wrap: no administrator rights, no raw
+socket; it answers from this computer's ARP cache when that holds the address, else sends ARP
+requests and waits a few seconds; `ERROR_BAD_NET_NAME`, `ERROR_GEN_FAILURE` on old Windows: nobody
+answered). Nothing leaves the home network, and nothing else is sent to the devices. A sweep ends
+after 2 minutes: what answered by then is kept and the scan's `problem` says that it stopped short
+(the questions in flight, which SendARP cannot call back, are not waited for); when the caller's
+context ends, Scan returns at once with what answered and the context's error. A scan
+(`model.LANScan`) gives when the sweep began (`at`) and how long it took, the network (`subnet`), this
+computer's address (`self`), how many addresses were asked (this computer's own included) and the
+addresses that answered (`hosts`) in address order, each with the MAC address that answered - lower
+case, colon separated; an answer that is not a station's six-byte address counts as none - and this
+computer's own addresses, never asked, with their interfaces' MAC addresses. Questions that fail
+otherwise than without an answer are counted in the `problem`; when every question fails, the sweep
+fails. A /24 takes about half a minute (8 rounds of 32 questions, an address nobody holds taking a
+few seconds). On other systems Scan fails with `ErrUnavailable`. `att-monitor scan` (§14) makes one
+sweep from the command line and names the addresses after the service's newest Device List read; it
+stores nothing.
+
 **Connection store** (`internal/connstore`, `connections\`). One file per kind and UTC day:
 `nat-YYYY-MM-DD.jsonl` holds the NAT reads of the day, one JSON line each - `t` first (the read's
 time, RFC 3339 UTC with nanoseconds, so that lines outside a period are skipped without being
 decoded), `in_use` and `available` (the page's totals, -1 when it shows none), `strs` (the distinct
 strings of the sessions) and `s` (six integers per session: protocol, TCP state and source address
 as indexes into `strs`, source port, destination address, destination port);
-`devices-YYYY-MM-DD.jsonl` holds the Device List reads (`t`, `devices`). A line is written with one
+`devices-YYYY-MM-DD.jsonl` holds the Device List reads (`t`, `devices`), and `scan-YYYY-MM-DD.jsonl`
+the LAN scans (`t`, when the sweep began, then `model.LANScan`'s members, whose `at` repeats `t`:
+`contracts.ScanStore` - `EachScan` gives the scans that began in [from, to), oldest first, read as
+they are, without a cache, a day holding a few dozen small lines; `LastScan` the newest, chosen as
+the newest Device List read is). A line is written with one
 write at the end of the file's complete lines and fsynced; a failed write is cut back. A day's
 files are gzipped (`.jsonl.gz`) by the first append of a later day and after open: the copy is checked
 to decompress to the same bytes, fsynced and renamed into place, and the plain file deleted. Open
@@ -1401,24 +1477,129 @@ stops them).
   at or before it, else the first after it (`connstore.Store.EachDevices`), as the NAT reads'
   addresses are - so that a device whose address DHCP gave to another one is not blamed for the
   other's packets; an address that read does not list is named after itself (`ip:<address>`).
+* *Devices* (`docs/dhcp-table.md`): every entry of the connection store's newest Device List read -
+  the gateway's own table - keyed `mac:<mac>` (an entry without a MAC address `ip:` and its IPv4,
+  else first IPv6 address, as the other views key it; `name:<name>` without either; a key the read
+  gives twice gets `#2`, ...), with its fields as listed and what the period says about it:
+  - *The Device List reads of the period* (`EachDevices`: the read in effect at its start - made
+    before it, as a rule - then every later one before its end; without it, the newest read alone):
+    how many of those made in the period listed the device (`reads`) and showed it on (`on_reads`),
+    the newest that showed it on (`seen`), the IPv4 addresses it held (`addresses`, newest first),
+    and the period's address history (`addresses` of the view): for each IPv4 address, which device
+    held it from which read to which. Of several entries that give one address, those that are on
+    hold it (the gateway keeps showing the last address of a device that left, which DHCP may have
+    given to another one since), else all of them; two that are on hold it together - an address
+    conflict, counted in the tenure's `shared`. A tenure goes on over reads that show nobody with
+    the address and ends when another device holds it. At most 5,000 tenures, those that ended last.
+  - *The NAT samples* (`Aggregate` of the period, whose addresses are named as above): `open`, its
+    sessions in the period's newest NAT read (`ConnDevice.Open`; `nat_at` is when that read was
+    made, `nat_reads` how many the period has), and `sites`, the distinct remote addresses of its
+    flows (estimated beyond 50,000 flows, as in the connections view).
+  - *The firewall's drops* (the syslog store, through the firewall view's chunk cache: each chunk's
+    summary also counts its drops by LAN address): `blocked`, the packets it sent that were dropped
+    (outbound, by source), and `blocked_in`, the packets from the Internet dropped on their way to
+    it (inbound with `OUT=` a LAN interface: unsolicited IPv6 to the device, a port forward; by
+    destination) - each named after the Device List read in effect when it was received, else the
+    next read within 20 minutes (a device that has just joined, as the NAT samples are); a sealed
+    chunk's drops of one address are named at the newest of them (a chunk holds at most 5 minutes).
+  - *The LAN scans* (`netmap.Options.Scans`: `EachScan` of the period; without a scan store none,
+    and a store that cannot be read gives none, logged once): `scans` and `scan` of the view (how
+    many, and the newest: when, subnet, asked, answered, took, problem), `totals.scanned` (the
+    addresses that answered the newest), and per device `scan_addr` (where it answered the newest),
+    `scan_seen` (the newest it answered) and `scan_hits`. An answer counts for the listed device of
+    its MAC address; else for nobody when a read of the period names that MAC address (a device that
+    left the list); else for the entry without a MAC address that the read in effect at the scan
+    (or the next within 20 minutes) gives the address to (nobody when it left); else the address is
+    an unknown one - also when a read gives the address to another device. The gateway's own answer
+    is nobody's (`netmap.Options.Gateway`, gateway.host). Of several addresses one device answered a
+    scan at, the one it is listed with counts. Issues comparing the newest scan with the newest read,
+    when the scan began within an hour of the read: `no_answer` (info) - shown on, its IPv4 address
+    in the network swept by a sweep that asked every address, no answer; `scan_mac` (warning) - shown
+    on, its IPv4 address answered by another MAC address, named after the device it belongs to or
+    said to be no read's; `scan_addr` (info) - it answered at another IPv4 address than it is listed
+    with. An unknown address the scans found has `mac` and `scan_seen` (the newest scan that found
+    it), its scans count in its first and last seen and its `unlisted` text ("perhaps a device with a
+    fixed address"); at most 4,096 of them, as for the drops.
+  - *Issues*, each a sentence that names the other device or gives the figures: `address_shared`
+    (critical) - another entry of the newest read, neither of them shown off, claims the same IPv4
+    address (both are flagged, each naming the other; an entry that is off and shows an address
+    another holds now says so in its `offline` text instead); `weak_wifi` (warning) - 1 or 2 bars;
+    `slow_link` (warning) - a link that is not Wi-Fi at 10 Mb/s or less, or at half duplex;
+    `blocked` (warning) - 100 or more packets dropped per day of the period (whole days, rounded
+    up; 100 in a period of a day or less), out and in together - per day, as a month brought a
+    handful of the owner's devices to 100-200 drops while the one worth a look had thousands a day;
+    `address_changed` (info) - more than one IPv4 address in the period (at most 5 named);
+    `offline` (info) - off in the newest read, with how long before it the last read showed it on,
+    and the gateway's own last activity.
+  - *Unknown addresses*: private (RFC 1918) or self-assigned (169.254/16) IPv4 addresses that the
+    NAT samples (devices keyed `ip:<address>`) or the drops show and that no Device List read of the
+    period names, each with first and last seen, `open`, `sites`, `blocked`/`blocked_in` and the
+    issue `unlisted` (warning); the most recently seen first, at most the limit (`totals.unknown`
+    counts them all). IPv6 addresses are never unknown: a device's temporary addresses are not
+    listed, and a scan of the home prefix tries addresses nobody has.
+  - *Totals*: listed, on, on Wi-Fi, on Ethernet, with an issue (warning or critical: devices and
+    unknown addresses), unknown. The devices come critical first, then warning, then the others;
+    on before off; by name, then address.
+  Only the connection store is required (without it the view fails, 503): the NAT samples or the
+  syslog store missing - or failing, which is logged once - leave their figures at 0. The gateway
+  does not show lease times; its DHCP Server page needs the login, and the monitor does not read it.
+* *A device's details* (`Device`, `docs/dhcp-table.md` §7): one device of the Devices view by its
+  key - as the view lists it, with the same issues - or one unknown address (any of the period's,
+  listed or not), from the Devices view built for the period (for 1,000 unknown addresses, as the
+  tab asks; reused like the views, never built twice for a tab and its details): the address
+  history entries of its IPv4 addresses (its own holds and the others'), the newest 800 of the
+  period's scans with where it answered each, and `match`, what its syslog messages are found by -
+  its IPv4 holds (its tenures, each widened by the Device List interval on each side - the median
+  time between the period's reads, 5 minutes to 24 hours, 15 minutes with fewer than two reads -,
+  clipped to the period and joined where they meet, at most 128, the newest), its IPv6 addresses
+  (the newest read's, then those the period's reads gave it, at most 32) and its MAC address, the
+  last two for the whole period; an unknown address's own address for the whole period.
+  `contracts.ErrNotFound` when the period knows neither.
 * *Bounds*: a period is at most 31 days (a timeline of at most 745 hours). A sealed syslog chunk
   never changes: it is read once and its summary kept by its name and SHA-256 (at most 64 MiB by
   estimate and 16,384 chunks, least recently used first; chunks the store no longer lists leave
   the cache); only the chunks at the edges of a period and the open chunk are read again, exactly.
-  One connections view and one firewall view are built at a time, and a view built for the same
-  request less than 30 s earlier is returned again (both views) - for a period that ends now, the
-  same range (`24h`) is the same request, so that a second tab, a refresh or the CLI share the view.
-  Protocols and reasons are numbered in tables that stop growing at 254 entries, so a hostile log
-  cannot grow them.
+  One connections view, one firewall view and one devices view are built at a time (a devices view
+  takes the connections slot for its NAT samples, then the firewall slot for its drops, one after
+  the other), and a view built for the same request less than 30 s earlier is returned again
+  (every view) - for a period that ends now, the same range (`24h`) is the same request, so that a
+  second tab, a refresh or the CLI share the view. Protocols and reasons are numbered in tables that
+  stop growing at 254 entries, so a hostile log cannot grow them. A devices view counts the drops of
+  every address a Device List read names and of at most 4,096 other LAN addresses, only IPv4 ones
+  that could be an unknown device's: a host forging its source addresses, or a scan of the home
+  network's IPv6 prefix, cannot grow it.
 
-**API** (§12): `GET /api/network/connections`, `/api/network/firewall` and `/api/network/status`, the
-same protections as every other GET (another site's page is refused, 403); parameters checked
-before the view is asked; at most 31 days and 1,000 rows; 30 s per request, tied to it. The
-dashboard asks for 1,000 rows every minute while the page is visible. `att-monitor network` (§14) reads the same endpoints.
+**API** (§12): `GET /api/network/connections`, `/api/network/firewall`, `/api/network/devices` and
+`/api/network/status`, the same protections as every other GET (another site's page is refused,
+403); parameters checked before the view is asked (a device filter only for the connections); at
+most 31 days and 1,000 rows (connections, outbound destinations, unknown addresses); 30 s per
+request, tied to it. The dashboard asks for 1,000 rows every minute while the page is visible.
+`att-monitor network` (§14) reads the same endpoints (`--firewall`, `--devices`).
+
+`GET /api/network/device?key=|addr=` (a device's details, `docs/dhcp-table.md` §7) takes the same
+period parameters, exactly one of `key` (1 to 512 bytes of text without control characters: keys
+hold the gateway's names) and `addr` (an IPv4 address), and `limit` - the syslog messages, 100 by
+default, at most 500. It answers the view's details with the gateway's syslog messages of the period
+that `match` finds (`SyslogReader.Query`, newest first, within `MaxSyslogAnswerBytes`;
+`syslog_truncated`), each with its chunk and that chunk's `syslog_chunk` record, the ledger's
+integrity problems in `X-ATT-Monitor-Warning`, as `GET /api/syslog` does. A term is found in the
+datagram (`raw`, else the bytes of `raw_b64`, else `msg`) as a whole address: an IPv4 address as a
+whole run of digits and dots (192.168.1.7 never in 192.168.1.70, 10.192.168.1.7 or 192.168.1.7.5),
+and only in a message received within its times; an IPv6 address in its canonical (Go's) or full
+form, a MAC address in colon or dash notation, both ignoring case, as a whole run of their
+characters - and a MAC address also as the destination or the source of the firewall's `MAC=` field,
+where the gateway runs them together with the frame's type; at most 256 terms. Without a syslog store
+the details have no messages; a store that cannot be read leaves them out and says why
+(`syslog_error`). 404 says which is not known (no device with this key, no such unknown address), so
+that a client tells it from an older version's unknown path; `att-monitor network --devices --key
+KEY` (or a MAC address; `--addr ADDRESS`) prints the details and the messages, newest first.
 
 **Wiring** (`cmd/att-monitor`). Only the service and console modes open the connection store
 (`Paths.Connections`) and the IP database (`Paths.Geo`) and build the view over them and the syslog
-store; the CLI opens neither. The store is opened also with `connections.enabled` off - the samplers
+store; the CLI opens neither. They also make the LAN scanner of `gateway.host`'s network (`lanscan.New`;
+it sends nothing until the monitor sweeps) and pass the connection store as the scan store to the
+monitor (`monitor.Options.Scanner`, `Scans`) and to the view (`netmap.Options.Scans`).
+The store is opened also with `connections.enabled` off - the samplers
 then do not run and `Status.connections` says so, the page still shows what was recorded before, and
 the retention limits keep deleting old samples (the monitor applies them every hour, and deletes the
 raw page copies at its start) - and the database also with `geo.enabled` off. A

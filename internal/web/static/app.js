@@ -495,22 +495,28 @@
     return String(code == null ? '' : code).toLowerCase().replace(/_/g, ' ');
   }
 
-  /** hiddenChar reports whether the UTF-16 code unit c would act on the display instead of
-   *  showing: C0 and C1 controls, DEL, the bidirectional marks, embeddings, overrides and
-   *  isolates, zero-width characters and joiners, the line and paragraph separators, the byte
-   *  order mark. */
-  function hiddenChar(c) {
-    return c < 0x20 || (c >= 0x7f && c <= 0x9f) || c === 0x61c || (c >= 0x200b && c <= 0x200f) ||
-      (c >= 0x2028 && c <= 0x202e) || (c >= 0x2060 && c <= 0x2069) || c === 0xfeff;
+  /** hiddenChar says how many UTF-16 code units, from c (and the next one, d), make a character
+   *  that would act on the display or hide instead of showing - 0 for one that shows: C0 and C1
+   *  controls, DEL, the soft hyphen, the Arabic letter mark, the bidirectional marks, embeddings,
+   *  overrides and isolates, zero-width characters and joiners, the line and paragraph
+   *  separators, the byte order mark (1); a tag character, U+E0000 to U+E007F, two code units
+   *  (2). Invisible, the soft hyphen and the tags can make two names look the same. */
+  function hiddenChar(c, d) {
+    if (c < 0x20 || (c >= 0x7f && c <= 0x9f) || c === 0xad || c === 0x61c || (c >= 0x200b && c <= 0x200f) ||
+      (c >= 0x2028 && c <= 0x202e) || (c >= 0x2060 && c <= 0x2069) || c === 0xfeff) return 1;
+    return c === 0xdb40 && d >= 0xdc00 && d <= 0xdc7f ? 2 : 0;
   }
 
-  /** charEscape writes a hidden character as an escape: \t, \n, \r, \xHH or \uHHHH. */
-  function charEscape(c) {
+  /** charEscape writes a hidden character (its code units c and d: hiddenChar) as an escape: \t,
+   *  \n, \r, \xHH, \uHHHH, or \u{e00HH} for a tag character. */
+  function charEscape(c, d) {
     switch (c) {
       case 0x09: return '\\t';
       case 0x0a: return '\\n';
       case 0x0d: return '\\r';
-      default: return c < 0x100 ? '\\x' + c.toString(16).padStart(2, '0') : '\\u' + c.toString(16).padStart(4, '0');
+      default:
+        if (c === 0xdb40 && d >= 0xdc00 && d <= 0xdc7f) return '\\u{' + (0xe0000 + d - 0xdc00).toString(16) + '}';
+        return c < 0x100 ? '\\x' + c.toString(16).padStart(2, '0') : '\\u' + c.toString(16).padStart(4, '0');
     }
   }
 
@@ -523,30 +529,31 @@
    *  (pretty-printed JSON). Returns the parts for h(). */
   function visibleText(text, keepNewlines) {
     const t = String(text == null ? '' : text);
-    const hidden = (i) => {
-      const c = t.charCodeAt(i);
-      return hiddenChar(c) && !(keepNewlines && c === 0x0a);
-    };
+    // How many code units of a hidden character start at i (0: it shows).
+    const hidden = (i) => (keepNewlines && t.charCodeAt(i) === 0x0a ? 0 : hiddenChar(t.charCodeAt(i), t.charCodeAt(i + 1)));
     const out = [];
     let start = 0;
-    for (let i = 0; i < t.length; i++) {
-      if (!hidden(i)) continue;
-      let end = i + 1;
-      while (end < t.length && hidden(end)) end++;
-      if (i > start) out.push(t.slice(start, i));
+    for (let i = 0; i < t.length;) {
+      let n = hidden(i);
+      if (!n) {
+        i++;
+        continue;
+      }
+      let end = i;
       let esc = '';
-      for (let j = i; j < end; j++) esc += charEscape(t.charCodeAt(j));
+      for (; end < t.length && (n = hidden(end)); end += n) esc += charEscape(t.charCodeAt(end), t.charCodeAt(end + 1));
+      if (i > start) out.push(t.slice(start, i));
       out.push(h('span', { class: 'ctl', title: ctlTitle(t.slice(i, end)) }, esc));
       start = end;
-      i = end - 1;
+      i = end;
     }
     if (start < t.length) out.push(t.slice(start));
     return out;
   }
 
   /** ctlTitle names the characters of a run of hidden characters for its tooltip: their code
-   *  points ("U+001B", "U+0000 U+007F"), a repeated one once with its count ("U+0001 ×8192"),
-   *  at most eight of them. */
+   *  points ("U+001B", "U+0000 U+007F", "U+E0041"), a repeated one once with its count ("U+0001
+   *  ×8192"), at most eight of them. */
   function ctlTitle(run) {
     const parts = [];
     for (let i = 0; i < run.length;) {
@@ -554,11 +561,12 @@
         parts.push('…');
         break;
       }
-      const c = run.charCodeAt(i);
+      const c = run.codePointAt(i);
+      const w = c > 0xffff ? 2 : 1;
       let n = 1;
-      while (i + n < run.length && run.charCodeAt(i + n) === c) n++;
+      while (i + n * w < run.length && run.codePointAt(i + n * w) === c) n++;
       parts.push('U+' + c.toString(16).toUpperCase().padStart(4, '0') + (n > 1 ? ' ×' + n : ''));
-      i += n;
+      i += n * w;
     }
     return parts.join(' ');
   }
@@ -573,12 +581,16 @@
     let end = 0;
     let shown = 0;
     let runs = 0;
-    for (; end < t.length; end++) {
+    let after = false; // the character before end is a hidden one
+    while (end < t.length) {
       const c = t.charCodeAt(end);
-      const hidden = hiddenChar(c);
-      if (hidden && (end === 0 || !hiddenChar(t.charCodeAt(end - 1))) && ++runs > maxRuns) break;
-      shown += hidden ? charEscape(c).length : 1;
+      const d = t.charCodeAt(end + 1);
+      const n = hiddenChar(c, d);
+      if (n && !after && ++runs > maxRuns) break;
+      shown += n ? charEscape(c, d).length : 1;
       if (shown > maxChars) break;
+      after = n > 0;
+      end += n || 1;
     }
     if (end > 0 && end < t.length && (t.charCodeAt(end) & 0xfc00) === 0xdc00 && (t.charCodeAt(end - 1) & 0xfc00) === 0xd800) end--;
     let more = 0;
@@ -598,9 +610,12 @@
   function escapedText(text) {
     const t = String(text == null ? '' : text);
     let out = '';
-    for (let i = 0; i < t.length; i++) {
+    for (let i = 0; i < t.length;) {
       const c = t.charCodeAt(i);
-      out += hiddenChar(c) ? charEscape(c) : t[i];
+      const d = t.charCodeAt(i + 1);
+      const n = hiddenChar(c, d);
+      out += n ? charEscape(c, d) : t[i];
+      i += n || 1;
     }
     return out;
   }
@@ -995,6 +1010,7 @@
     [/^\/syslog$/, 'syslog', (c, m, q, ctx) => renderSyslog(c, q, ctx)],
     [/^\/network$/, 'network', (c, m, q, ctx) => renderNetwork(c, q, ctx, 'connections')],
     [/^\/network\/firewall$/, 'network', (c, m, q, ctx) => renderNetwork(c, q, ctx, 'firewall')],
+    [/^\/network\/devices$/, 'network', (c, m, q, ctx) => renderNetwork(c, q, ctx, 'devices')],
     [/^\/evidence$/, 'evidence', (c, m, q, ctx) => renderEvidence(c, ctx)],
     [/^\/records$/, 'records', (c, m, q, ctx) => renderRecords(c, q, ctx)],
   ];
@@ -1271,19 +1287,22 @@
   }
 
   /** loadNetSummary reads the Network card's figures: the last 24 hours of the gateway's
-   *  firewall (its five heaviest outbound rows only: the card shows totals) and of the connections
-   *  (one row: the card names the most used organisations), which the server keeps for the
-   *  period. A monitor without the Network page answers 404 to both: the card says so (none), and
-   *  is not asked again. The details of the Network card, when open, show them too. */
+   *  firewall (its five heaviest outbound rows only: the card shows totals), of the connections
+   *  (one row: the card names the most used organisations) and of the Device List (the card counts
+   *  its devices and those with issues), which the server keeps for the period. A monitor without
+   *  the Network page answers 404 to them: the card says so (none), and is not asked again. The
+   *  details of the Network card, when open, show them too. */
   async function loadNetSummary(ov) {
     if (ov.netBusy) return;
     ov.netBusy = true;
     const read = (path) => api(path).then((d) => ({ d: d && typeof d === 'object' ? d : {} }), (err) => ({ err }));
     try {
-      const [fw, conn] = await Promise.all([read('/api/network/firewall?range=24h&limit=5'), read('/api/network/connections?range=24h&limit=1')]);
+      const [fw, conn, dev] = await Promise.all([read('/api/network/firewall?range=24h&limit=5'), read('/api/network/connections?range=24h&limit=1'),
+        read('/api/network/devices?range=24h')]);
       if (!ov.ctx.alive) return;
       const gone = (x) => !!(x.err && x.err.status === 404);
-      ov.net = { fw: fw.d || null, fwErr: fw.err || null, conn: conn.d || null, connErr: conn.err || null, none: gone(fw) && gone(conn) };
+      ov.net = { fw: fw.d || null, fwErr: fw.err || null, conn: conn.d || null, connErr: conn.err || null, dev: dev.d || null, devErr: dev.err || null,
+        none: gone(fw) && gone(conn) };
       ov.netAt = Date.now();
       paintCard(ov, 'network');
       if (ov.detail.key === 'network') ov.detail.update(app.status);
@@ -2571,9 +2590,41 @@
     return topOrgs(conn).slice(0, n).map((o) => netText(o.name || o.key, 32));
   }
 
+  /** netDevicesFacts counts the gateway's Device List as the Network card and its details say it,
+   *  from the Devices tab of the last 24 hours (net.dev): the devices listed, how many are on, those
+   *  with an issue worth a look (a warning or a critical one) and with a critical one, and the
+   *  unknown addresses; without those figures, the devices the monitor's status says the Device
+   *  List lists (smp), the issues unknown (null). null when there is nothing to count. */
+  function netDevicesFacts(net, smp) {
+    const dv = net && net.dev && !net.devErr ? net.dev : null;
+    if (dv && (dv.list_at || netList(dv.devices).length)) {
+      const devices = netList(dv.devices);
+      const t = dv.totals && typeof dv.totals === 'object' ? dv.totals : {};
+      return {
+        listed: Number(t.listed) >= 0 && t.listed != null ? Number(t.listed) : devices.length,
+        online: devices.filter((d) => devState(d) === 'on').length,
+        issues: devices.filter((d) => devRank(d) > 0).length,
+        critical: devices.filter((d) => devRank(d) === 2).length,
+        unknown: netList(dv.unknown).length,
+      };
+    }
+    if (smp && Number(smp.devices) > 0) return { listed: Number(smp.devices), online: null, issues: null, critical: 0, unknown: 0 };
+    return null;
+  }
+
+  /** netDevicesWords says netDevicesFacts in a line ("16 devices listed · 5 with issues · 2 unknown
+   *  addresses"); '' with nothing to say. */
+  function netDevicesWords(f) {
+    if (!f) return '';
+    return fmtInt(f.listed) + ' device' + (f.listed === 1 ? '' : 's') + ' listed' +
+      (f.issues == null ? '' : ' · ' + (f.issues ? fmtInt(f.issues) + ' with issues' : 'none with issues')) +
+      (f.unknown ? ' · ' + fmtInt(f.unknown) + ' unknown address' + (f.unknown === 1 ? '' : 'es') : '');
+  }
+
   /** summaryNetwork: the connections open at the last read of the NAT table, the devices the
-   *  gateway lists, the most used organisations, and what the firewall blocked in 24 h. A monitor
-   *  without the Network page, or a feature it does not have, is said so. */
+   *  gateway lists and those with issues, the most used organisations, and what the firewall
+   *  blocked in 24 h. A monitor without the Network page, or a feature it does not have, is said
+   *  so. */
   function summaryNetwork(ov, st) {
     const smp = st.connections && typeof st.connections === 'object' ? st.connections : null;
     const net = ov.net;
@@ -2585,11 +2636,12 @@
       : !smp.enabled ? ['none', 'Off'] : smp.nat_problem ? ['warning', 'Not reading']
         : smp.nat_at ? ['info', 'Read ' + read + ' ago'] : ['none', 'Not read yet'];
     const body = [];
+    const devFacts = netDevicesFacts(net, smp);
+    const devLine = devFacts ? sumLine(netDevicesWords(devFacts), devFacts.issues > 0) : null;
     if (smp && smp.nat_at) {
       const every = goDurMs(smp.interval);
       const fresh = age != null && age * 1000 <= Math.max(10 * 60e3, 2.5 * (every || 4 * 60e3));
-      const listed = Number(smp.devices) > 0 ? ' · ' + fmtInt(smp.devices) + ' devices listed' : '';
-      body.push(sumFigure(fmtInt(smp.sessions), (fresh ? 'connections open' : 'connections open at the last read, ' + fmtDur(age) + ' ago') + listed));
+      body.push(sumFigure(fmtInt(smp.sessions), fresh ? 'connections open' : 'connections open at the last read, ' + fmtDur(age) + ' ago'), devLine);
       if (smp.nat_problem) body.push(sumLine(sentence(capitalize(String(smp.nat_problem))), true));
     } else if (smp && !smp.enabled) {
       body.push(sumLine('Reading the gateway’s NAT table is turned off in the configuration.'));
@@ -2600,6 +2652,7 @@
     } else {
       body.push(sumLine('This monitor reports nothing about its reads of the NAT table.'));
     }
+    if (!(smp && smp.nat_at)) body.push(devLine); // the Device List is read without the NAT table's login
     const orgs = net && net.conn ? orgNames(net.conn, 3) : [];
     if (orgs.length) body.push(sumLine('Most used: ' + orgs.join(', ')));
     const fw = net && net.fw;
@@ -2614,7 +2667,12 @@
     } else if (net && net.fwErr && net.fwErr.status !== 404) {
       body.push(sumLine('The firewall figures could not be read: ' + sentence(net.fwErr.message)));
     }
-    return { tone: chipV[0], chip: chipV, body, context: smp && smp.nat_at ? 'NAT table read ' + sinceText(smp.nat_at, st.now) + ' ago' + (Number(smp.devices) > 0 ? ' · ' + fmtInt(smp.devices) + ' devices listed' : '') : 'Which device talks to which site, and what the firewall blocks' };
+    const devWords = netDevicesWords(devFacts);
+    return {
+      tone: chipV[0], chip: chipV, body,
+      context: smp && smp.nat_at ? 'NAT table read ' + sinceText(smp.nat_at, st.now) + ' ago' + (devWords ? ' · ' + devWords : '')
+        : devWords || 'Which device talks to which site, what the firewall blocks, and which device has which address',
+    };
   }
 
   /** firewallFacts says what the firewall's figures (net.fw: counted from the syslog the store
@@ -2794,15 +2852,38 @@
     }
   }
 
+  // The redraws of a details body that keepReading put off while text was selected in it: the
+  // newest, by body.
+  const putOff = new WeakMap();
+
   /** keepReading runs render, which rebuilds parts of a details modal's body (dlg, body) for a
    *  status update, so that the reader keeps their place: the scroll position, the <details>
    *  they opened and the keyboard focus (keepFocus, by stampKeys' keys). When the element with
    *  the focus is gone without a successor, the body takes it: the focus stays in the dialog.
    *  While the reader has text selected in the body (an address or a hash to copy), nothing is
-   *  rebuilt: the first update after the selection is gone is. */
+   *  rebuilt: the newest redraw asked for is made once the selection is gone (selectionchange).
+   *  Returns whether it redrew now. */
   function keepReading(dlg, body, render) {
-    const sel = typeof window.getSelection === 'function' ? window.getSelection() : null;
-    if (sel && !sel.isCollapsed && sel.anchorNode && body.contains(sel.anchorNode)) return;
+    const selected = () => {
+      const sel = typeof window.getSelection === 'function' ? window.getSelection() : null;
+      return !!(sel && !sel.isCollapsed && sel.anchorNode && body.contains(sel.anchorNode));
+    };
+    if (selected()) {
+      const waiting = putOff.has(body);
+      putOff.set(body, render);
+      if (!waiting) {
+        const watch = () => {
+          if (selected()) return;
+          document.removeEventListener('selectionchange', watch);
+          const next = putOff.get(body);
+          putOff.delete(body);
+          if (next && dlg.open && document.contains(body)) keepReading(dlg, body, next);
+        };
+        document.addEventListener('selectionchange', watch);
+      }
+      return false;
+    }
+    putOff.delete(body); // drawn now: what was put off is older
     stampKeys(body);
     const opened = new Set(Array.from(body.querySelectorAll('details')).filter((d) => d.open).map((d) => d.getAttribute('data-fk')));
     const top = body.scrollTop;
@@ -2814,22 +2895,24 @@
     });
     body.scrollTop = top;
     if (inside && !dlg.contains(document.activeElement)) body.focus();
+    return true;
   }
 
-  /** detailModal is the Overview's details modal (docs/overview-redesign.md §3): one card's
-   *  details at a time on a native <dialog> opened with showModal() - the page behind is inert,
-   *  and does not scroll (lockScroll) -, labelled by its heading, with a line of context and a
-   *  close button. Esc, the close button and a click on the backdrop close it; the keyboard focus
-   *  goes to the close button, and back to the card's button. The address names it: opened by a
-   *  click it is added to the history (#/?detail=<key>: Back closes it, a reload opens it again)
-   *  and closing it goes back; opened from the address (a link, a reload, Back or Forward), closing
-   *  it replaces the address. While open its content follows every status update (update;
-   *  keepReading keeps the reader's place) and its charts their series; while the status cannot
-   *  be read, it says so (stale). Its body is a scroll region of its own (a Tab stop: the keyboard
-   *  scrolls it), and it has its own live region for announce(), as the page's is inert behind
-   *  it. Returns {open(key, how), sync(query) (the route's onQuery), update(st), stale(err),
-   *  key}. */
-  function detailModal(c, ov) {
+  /** detailShell is the dashboard's details modal (docs/overview-redesign.md §3), as the Overview's
+   *  cards (detailModal) and the Network page's devices (netDevices) open it: one thing's details at
+   *  a time on a native <dialog> opened with showModal() - the page behind is inert, and does not
+   *  scroll (lockScroll) -, labelled by its heading, with a line of context and a close button. Esc,
+   *  the close button and a click on the backdrop close it; the keyboard focus goes to the close
+   *  button, and back to what opened it (o.closed). The address names it (o.hashOf(key), its query
+   *  parameter o.param): opened by a click it is added to the history (Back closes it, a reload opens
+   *  it again) and closing it goes back; opened from the address (a link, a reload, Back or
+   *  Forward), closing it replaces the address (o.closedHash()). Its body is a scroll region of its
+   *  own (a Tab stop: the keyboard scrolls it), and it has its own live region for announce(), as
+   *  the page's is inert behind it. o: {ctx (the view's), container, param, known(key), title(key),
+   *  attrs(key) (the dialog's attributes), mount(e) (builds the content in e.body; returns the part,
+   *  kept as e.part), opened(e), closed(e), hashOf(key), closedHash()}. Returns {open(key, how),
+   *  sync(query) (the route's onQuery), cur (the details open, or null), key}. */
+  function detailShell(o) {
     let cur = null; // {key, how, dlg, body, ico, titles, context, contextText, staleNote, ctx, from, why, done, part}
     let backPending = false; // our history.back() has not arrived yet: a click now would race it
     let backTimer = 0;
@@ -2838,27 +2921,26 @@
       window.clearTimeout(backTimer);
     };
     window.addEventListener('hashchange', backDone);
-    ov.ctx.cleanup(() => {
+    o.ctx.cleanup(() => {
       window.removeEventListener('hashchange', backDone);
       window.clearTimeout(backTimer);
       if (cur) close(cur, 'dispose');
     });
 
     function open(key, how) {
-      const d = DETAILS[key];
-      if (!d || backPending || !ov.ctx.alive) return;
+      if (!o.known(key) || backPending || !o.ctx.alive) return;
       if (cur) {
         if (cur.key === key) return;
         close(cur, 'address');
       }
       const ico = h('span', { class: 'detail-ico-box' }, icon('none', 'detail-ico'));
       const context = h('p', { class: 'detail-context', id: 'detail-context' }, 'Loading…');
-      const titles = h('div', { class: 'detail-titles' }, h('h2', { id: 'detail-title' }, d.title), context);
+      const titles = h('div', { class: 'detail-titles' }, h('h2', { id: 'detail-title' }, o.title(key)), context);
       const closeBtn = h('button', { type: 'button', class: 'btn detail-close', title: 'Close (Esc)' }, closeIcon(), h('span', { class: 'sr-only' }, 'Close'));
       // The body is the dialog's scroll region and a Tab stop of its own, so that PageDown and the
       // arrow keys scroll it where it holds no control (the focus starts on Close, in the header).
       const body = h('div', { class: 'detail-body', tabindex: '0', role: 'region', 'aria-labelledby': 'detail-title' });
-      const dlg = h('dialog', { class: 'dlg dlg-detail', 'aria-labelledby': 'detail-title', 'aria-describedby': 'detail-context', 'data-detail': key },
+      const dlg = h('dialog', Object.assign({ class: 'dlg dlg-detail', 'aria-labelledby': 'detail-title', 'aria-describedby': 'detail-context' }, o.attrs(key)),
         h('div', { class: 'detail-head' }, ico, titles, closeBtn), body, announcer());
       const e = { key, how, dlg, body, ico, titles, context, contextText: '', staleNote: null, ctx: newViewCtx(), from: window.location.hash, why: '', done: false, part: null };
       closeBtn.addEventListener('click', () => close(e, 'user'));
@@ -2885,23 +2967,21 @@
         fromBackdrop = false;
       });
       cur = e;
-      e.part = d.mount(ov, e);
-      c.append(dlg);
+      e.part = o.mount(e);
+      o.container.append(dlg);
       lockScroll(true);
       dlg.showModal();
       closeBtn.focus();
       if (how === 'click') {
-        window.history.pushState(null, '', '#/?detail=' + encodeURIComponent(key));
-        ov.ctx.hash = window.location.hash;
+        window.history.pushState(null, '', o.hashOf(key));
+        o.ctx.hash = window.location.hash;
       }
-      update(app.status);
-      if (app.statusError) stale(app.statusError); // opened while the status cannot be read
-      ov.flow.wake();
+      if (o.opened) o.opened(e);
     }
 
     /** close closes the details shown (e) for why: "user" (the reader: the close button, the
      *  backdrop; Esc closes the dialog itself), "address" (the address no longer names them) or
-     *  "dispose" (the Overview is left). */
+     *  "dispose" (the view is left). */
     function close(e, why) {
       if (e.done) return;
       e.why = why;
@@ -2918,47 +2998,75 @@
       lockScroll(false);
       if (e.why === 'dispose') return;
       if (e.why !== 'address') forget(e);
-      const card = ov.cards[e.key];
-      if (card && document.contains(card.btn)) card.btn.focus();
-      ov.flow.wake();
+      if (o.closed) o.closed(e);
     }
 
     /** forget takes closed details out of the address: details a click added to the history are
      *  gone back from (the history is as before they opened), details opened from the address
-     *  replace it with the Overview's. */
+     *  replace it with the view's own (o.closedHash). */
     function forget(e) {
       if (e.how === 'click') {
-        ov.ctx.hash = e.from;
+        o.ctx.hash = e.from;
         backPending = true;
         backTimer = window.setTimeout(backDone, 500);
         window.history.back();
       } else {
-        window.history.replaceState(null, '', '#/');
-        ov.ctx.hash = window.location.hash;
+        window.history.replaceState(null, '', o.closedHash());
+        o.ctx.hash = window.location.hash;
       }
     }
 
     /** sync follows the address (route's onQuery): it opens the details it names, closes those it
-     *  no longer names, and ignores a card it does not know. false: nothing to do in place (the
-     *  Overview is rendered again, as for any visit). */
+     *  no longer names, and ignores what it does not know. false: nothing to do in place (the view
+     *  is rendered again, as for any visit). */
     function sync(query) {
       backDone();
-      const key = query.get('detail');
+      const key = query.get(o.param);
       if (key == null) {
         if (!cur) return false;
         close(cur, 'address');
         return true;
       }
-      if (DETAILS[key]) open(key, 'address');
+      if (o.known(key)) open(key, 'address');
       else if (cur) close(cur, 'address');
       return true;
     }
+
+    return { open, sync, get cur() { return cur; }, get key() { return cur ? cur.key : ''; } };
+  }
+
+  /** detailModal is the Overview's details modal (docs/overview-redesign.md §3): a card's details
+   *  in the dashboard's details modal (detailShell), which the address names (#/?detail=<key>), the
+   *  focus going back to the card's button when they close. While open its content follows every
+   *  status update (update; keepReading keeps the reader's place) and its charts their series; while
+   *  the status cannot be read, it says so (stale). Returns {open(key, how), sync(query) (the
+   *  route's onQuery), update(st), stale(err), key}. */
+  function detailModal(c, ov) {
+    const shell = detailShell({
+      ctx: ov.ctx, container: c, param: 'detail',
+      known: (key) => !!DETAILS[key],
+      title: (key) => DETAILS[key].title,
+      attrs: (key) => ({ 'data-detail': key }),
+      mount: (e) => DETAILS[e.key].mount(ov, e),
+      hashOf: (key) => '#/?detail=' + encodeURIComponent(key),
+      closedHash: () => '#/',
+      opened() {
+        update(app.status);
+        if (app.statusError) stale(app.statusError); // opened while the status cannot be read
+        ov.flow.wake();
+      },
+      closed(e) {
+        const card = ov.cards[e.key];
+        if (card && document.contains(card.btn)) card.btn.focus();
+        ov.flow.wake();
+      },
+    });
 
     /** update follows a status update: the header's icon and line of context, and the content.
      *  While the status cannot be read (a part read the details' own figures meanwhile), the
      *  header keeps saying so (stale). */
     function update(st) {
-      const e = cur;
+      const e = shell.cur;
       if (!e || !e.part || !st) return;
       const v = DETAILS[e.key].summary(ov, st);
       e.contextText = v.context || '';
@@ -2981,7 +3089,7 @@
      *  once, when the status stops being read, so that its alert is read once. The next status
      *  read takes both away (update). */
     function stale(err) {
-      const e = cur;
+      const e = shell.cur;
       if (!e) return;
       const since = app.statusAt ? 'not updated since ' + F.time.format(app.statusAt) : 'no status read yet';
       replace(e.ico, icon('none', 'detail-ico'));
@@ -2993,7 +3101,7 @@
       e.titles.append(e.staleNote);
     }
 
-    return { open, sync, update, stale, get key() { return cur ? cur.key : ''; } };
+    return { open: shell.open, sync: shell.sync, update, stale, get key() { return shell.key; } };
   }
 
   /** detailLinks is a details modal's pointer to the page that shows more. */
@@ -3098,10 +3206,12 @@
    *  Its figures are read again when it opens and every minute while it is open. */
   function detailsNetwork(ov, m) {
     const samplers = h('section', { class: 'detail-part' }, h('p', { class: 'loading' }, 'Loading…'));
+    const devs = h('section', { class: 'detail-part' });
     const day = h('div', { class: 'detail-cols' });
     const fw = h('div', { class: 'detail-stack' });
-    m.body.append(samplers, day, fw, detailLinks('Which device talks to which site, hour by hour, and what the firewall blocks are on the Network page: its ',
-      h('a', { href: netHash('connections', { range: '24h' }, '') }, 'Connections'), ' and ', h('a', { href: netHash('firewall', { range: '24h' }, '') }, 'Firewall'), ' tabs.'));
+    m.body.append(samplers, devs, day, fw, detailLinks('Which device talks to which site, hour by hour, what the firewall blocks and which device has which address are on the Network page: its ',
+      h('a', { href: netHash('connections', { range: '24h' }, '') }, 'Connections'), ', ', h('a', { href: netHash('firewall', { range: '24h' }, '') }, 'Firewall'),
+      ' and ', h('a', { href: netHash('devices', { range: '24h' }, '') }, 'Devices'), ' tabs.'));
     loadNetSummary(ov);
     m.ctx.interval(() => { if (!document.hidden) loadNetSummary(ov); }, NET_REFRESH_MS);
     const err = (e) => (e ? [e.status, e.message] : null);
@@ -3109,12 +3219,40 @@
       update(st) {
         const net = ov.net;
         const smp = st.connections && typeof st.connections === 'object' ? st.connections : null;
-        keyed(samplers, JSON.stringify([smp, net && net.none, net && err(net.fwErr), smp && [sinceText(smp.nat_at, st.now), sinceText(smp.devices_at, st.now)]]),
+        keyed(samplers, JSON.stringify([smp, net && net.none, net && err(net.fwErr), smp && [sinceText(smp.nat_at, st.now), sinceText(smp.devices_at, st.now), sinceText(smp.scan_at, st.now)]]),
           () => netSamplersPart(st, net));
+        const shown = net && !(net.devErr && net.devErr.status === 404);
+        devs.hidden = !shown; // a monitor without the Devices tab: nothing to say (an empty part would double the gap)
+        keyed(devs, JSON.stringify(net && [net.dev, err(net.devErr)]), () => (shown ? netDevicesPart(net) : null));
         keyed(day, JSON.stringify(net && [net.conn, err(net.connErr)]), () => netDayParts(net));
         keyed(fw, JSON.stringify(net && [net.fw, err(net.fwErr), firewallFacts(net, st)]), () => netFirewallPart(net, st));
       },
     };
+  }
+
+  /** netDevicesPart is the Network details' look at the gateway's Device List, as the Devices tab
+   *  shows it for the last 24 hours: how many devices it lists, how many are on and how many have
+   *  an issue worth a look - those listed (the critical ones first) with what is wrong, each a link
+   *  to its details on the Devices tab. */
+  function netDevicesPart(net) {
+    const head = h('h3', { class: 'subhead' }, 'The gateway’s Device List, last 24 hours');
+    if (net.devErr) return [head, callout('warning', 'The Device List could not be read: ', sentence(net.devErr.message))];
+    const dv = net.dev || {};
+    const f = netDevicesFacts(net, null);
+    if (!f) return [head, emptyNote('The gateway’s Device List has not been read yet.')];
+    const day = { range: '24h' };
+    const worth = devSort(netList(dv.devices).filter((d) => devRank(d) > 0), { key: 'issues', dir: -1 });
+    const shown = worth.slice(0, 6);
+    return [head,
+      h('p', null, fmtInt(f.listed) + (f.listed === 1 ? ' device' : ' devices') + ' listed, ' + fmtInt(f.online) + ' on · ' + (f.issues ? fmtInt(f.issues) + ' with issues' : 'none with issues') +
+        (f.unknown ? ' · ' + fmtInt(f.unknown) + ' unknown address' + (f.unknown === 1 ? '' : 'es') + ' (seen, but not in the Device List)' : '') + '.'),
+      shown.length ? h('ul', { class: 'dev-issues' }, shown.map((d) => {
+        const issues = devIssues(d).filter((x) => (DEV_LEVEL_RANK[x.level] || 0) > 0).sort((a, b) => DEV_LEVEL_RANK[b.level] - DEV_LEVEL_RANK[a.level]);
+        return h('li', null, h('a', { href: netHash('devices', day, '', { detail: String(d.key == null ? '' : d.key) }) }, netShown(devName(d), 48)),
+          d.ipv4 ? h('span', { class: 'mono small muted' }, ' ', netShown(d.ipv4, 40)) : null, ' ', h('span', { class: 'chips' }, issues.map(devIssueChip)),
+          issues[0] && issues[0].text ? h('span', { class: 'sub small muted' }, netShown(issues[0].text, 300)) : null);
+      })) : null,
+      worth.length > shown.length ? h('p', { class: 'small muted' }, 'And ' + fmtInt(worth.length - shown.length) + ' more on the Devices tab.') : null];
   }
 
   /** netSamplersPart tells how the monitor reads the gateway's NAT table and Device List
@@ -3135,8 +3273,12 @@
       ['Next read', smp.enabled && smp.nat_next ? timeEl(smp.nat_next, F.time) : null],
       ['Problem', smp.nat_problem ? [chip('warning', 'not read'), ' ', sentence(capitalize(String(smp.nat_problem)))]
         : smp.nat_note ? sentence(capitalize(String(smp.nat_note))) : null],
-      ['Device List', smp.devices_at ? [fmtInt(smp.devices) + ' devices listed, read ', agoEl(smp.devices_at, st.now)] : 'not read yet'],
+      ['Device List', smp.devices_at ? [fmtInt(smp.devices) + (Number(smp.devices) === 1 ? ' device' : ' devices') + ' listed, read ', agoEl(smp.devices_at, st.now)] : 'not read yet'],
       ['Device List problem', smp.devices_problem ? sentence(capitalize(String(smp.devices_problem))) : null],
+      // The LAN scan (docs/dhcp-table.md §6), when this monitor makes them.
+      ['LAN scan', smp.scan_at ? [fmtInt(smp.scan_hosts) + (Number(smp.scan_hosts) === 1 ? ' address' : ' addresses') + ' answered, ', agoEl(smp.scan_at, st.now),
+        goDurMs(smp.scan_interval) ? ' · every ' + fmtDur(goDurMs(smp.scan_interval) / 1000) : ''] : smp.scan_interval ? 'not made yet' : null],
+      ['LAN scan problem', smp.scan_problem ? sentence(capitalize(String(smp.scan_problem))) : null],
       ['Gateway logins, 24 h', Number(smp.nat_logins) > 0 ? fmtInt(smp.nat_logins) : null],
     ])];
   }
@@ -6671,9 +6813,16 @@
   }
 
   /** syslogDetails offers a message's exact datagram, its parsed header and its chunk's ledger
-   *  record. */
+   *  record. It is keyed by the message (when it was received, from where, in which chunk), not by
+   *  its place in the list: a refresh that adds messages above keeps the one opened open, and the
+   *  keyboard focus on it (keepReading, keepFocus). */
   function syslogDetails(m) {
-    const det = h('details', { class: 'syslog-raw' }, h('summary', null, 'Exact datagram'));
+    // Two datagrams received at the same instant are told apart by what they hold (FNV-1a).
+    const body = String(m.raw || m.raw_b64 || m.msg || '');
+    let fnv = 0x811c9dc5;
+    for (let i = 0; i < body.length; i++) fnv = Math.imul(fnv ^ body.charCodeAt(i), 16777619) >>> 0;
+    const id = 'syslog:' + [m.rx, m.src, m.chunk, body.length + '.' + fnv.toString(16)].map((x) => String(x == null ? '' : x)).join('|');
+    const det = h('details', { class: 'syslog-raw', 'data-fk': id + ':raw' }, h('summary', { 'data-fk': id + ':sum' }, 'Exact datagram'));
     let filled = false;
     det.addEventListener('toggle', () => {
       if (!det.open || filled) return;
@@ -6887,22 +7036,35 @@
     return out;
   }
 
-  /** netHash is the URL of a tab of the Network page with a period and, on Connections, a device. */
-  function netHash(tab, p, device) {
+  /** netHash is the URL of a tab of the Network page with a period and, on Connections, a device;
+   *  on Devices, extra may add the find box's text (q) and the device whose details are open
+   *  (detail). */
+  function netHash(tab, p, device, extra) {
     const params = netPeriodParams(p);
     if (tab === 'connections' && device) params.set('device', device);
-    return '#/network' + (tab === 'firewall' ? '/firewall' : '') + '?' + params.toString();
+    if (tab === 'devices' && extra) {
+      if (extra.q) params.set('q', extra.q);
+      if (extra.detail) params.set('detail', extra.detail);
+    }
+    return '#/network' + (tab === 'firewall' ? '/firewall' : tab === 'devices' ? '/devices' : '') + '?' + params.toString();
+  }
+
+  /** samePeriod reports whether two periods of the Network page (netPeriod) are the same. */
+  function samePeriod(a, b) {
+    return a.range === b.range && (a.range !== 'custom' || (a.from === b.from && a.to === b.to));
   }
 
   // ------------------------------------------------------------------ network view: the page
 
   /** renderNetwork shows the Network page (docs/syslog-map-graphic.md §2.3): which device on the
    *  home network talks to which remote address, organisation, country and service, from samples
-   *  of the gateway's NAT table (tab "connections"), and what the gateway's firewall drops, from
-   *  its syslog (tab "firewall"). One period for both tabs (1 h to 30 days ending now, or a
-   *  custom one) and, on Connections, a device filter; both are kept in the URL. The data are read
-   *  again every minute while the page is visible; the controls, the search box and the keyboard
-   *  focus stay where they are. None of it is evidence. */
+   *  of the gateway's NAT table (tab "connections"), what the gateway's firewall drops, from its
+   *  syslog (tab "firewall"), and which device has which address, from the gateway's Device List
+   *  (tab "devices", docs/dhcp-table.md). One period for the tabs (1 h to 30 days ending now, or a
+   *  custom one), on Connections a device filter, on Devices the find box and the device whose
+   *  details are open; all are kept in the URL. The data are read again every minute while the
+   *  page is visible; the controls, the search box and the keyboard focus stay where they are.
+   *  None of it is evidence. */
   function renderNetwork(c, q, ctx, tab) {
     let token = 0; // the newest load: an older answer is dropped
     let abort = null; // cancels the requests out: a newer load replaces them
@@ -6911,11 +7073,13 @@
     if (tab === 'connections') netLast.device = device;
     const ipdbLine = h('p', { class: 'small muted' });
     c.append(h('div', { class: 'view-head' },
-      h('div', { class: 'net-head-text' }, h('h1', null, 'Network'), h('p', { class: 'muted' }, 'Which device talks to which site, and what the gateway’s firewall blocks.')),
+      h('div', { class: 'net-head-text' }, h('h1', null, 'Network'),
+        h('p', { class: 'muted' }, 'Which device talks to which site, what the gateway’s firewall blocks, and which device has which address.')),
       ipdbLine));
     const tabConn = h('a', { href: netHash('connections', period, netLast.device), 'aria-current': tab === 'connections' ? 'page' : null }, 'Connections');
     const tabFw = h('a', { href: netHash('firewall', period, ''), 'aria-current': tab === 'firewall' ? 'page' : null }, 'Firewall');
-    c.append(h('nav', { class: 'tabs', 'aria-label': 'Network views' }, tabConn, tabFw));
+    const tabDev = h('a', { href: netHash('devices', period, ''), 'aria-current': tab === 'devices' ? 'page' : null }, 'Devices');
+    c.append(h('nav', { class: 'tabs', 'aria-label': 'Network views' }, tabConn, tabFw, tabDev));
 
     const seg = rangeControl(period.range, setRange, 'Period', NET_RANGES.concat([['custom', 'Custom…']])).querySelector('.seg');
     const devSel = h('select', { name: 'device', 'data-fk': 'net-device' }, h('option', { value: '' }, 'All devices'));
@@ -6936,9 +7100,22 @@
     const content = h('div', { class: 'net-content' }, h('p', { class: 'loading' }, 'Loading…'));
     c.append(notes, content);
 
-    const parts = tab === 'connections'
-      ? { flow: netFlow(ctx, setDevice), map: netMap(ctx, NET_CONN_MAP), table: netConnTable(ctx) }
-      : { timeline: fwTimeline(ctx), map: netMap(ctx, NET_FW_MAP) };
+    const parts = tab === 'connections' ? { flow: netFlow(ctx, setDevice), map: netMap(ctx, NET_CONN_MAP), table: netConnTable(ctx) }
+      : tab === 'firewall' ? { timeline: fwTimeline(ctx), map: netMap(ctx, NET_FW_MAP) }
+        : {
+          devices: netDevices(ctx, {
+            container: c, q: q.get('q') || '', detail: q.get('detail'), period: () => period,
+            hash: (detail) => netHash('devices', period, '', { q: parts.devices.find(), detail }), onFind: syncUrl,
+          }),
+        };
+    if (tab === 'devices') {
+      // The address may open or close a device's details (Back, Forward, a link): in place, as long
+      // as it names the same period and find box; anything else renders the tab again.
+      ctx.onQuery = (q2) => {
+        if (!samePeriod(netPeriod(q2), period) || (q2.get('q') || '').trim() !== parts.devices.find()) return false;
+        return parts.devices.sync(q2);
+      };
+    }
     let lastNs = null; // the network status shown
     let shown = false; // data shown at least once
     let devKey = null; // the devices listed in the select
@@ -7026,12 +7203,15 @@
     }
     devSel.addEventListener('change', () => setDevice(devSel.value));
 
-    /** syncUrl keeps the period and the device in the URL, without routing again, and in the tabs' links. */
+    /** syncUrl keeps the period and the device (on Devices, the find box's text and the device whose
+     *  details are open) in the URL, without routing again, and the period in the tabs' links. */
     function syncUrl() {
-      const hash = netHash(tab, period, device);
+      const hash = tab === 'devices' ? netHash('devices', period, '', { q: parts.devices.find(), detail: parts.devices.key }) : netHash(tab, period, device);
       if (window.location.hash !== hash) window.history.replaceState(null, '', hash);
+      ctx.hash = window.location.hash; // the address the view shows (route's onQuery)
       setAttr(tabConn, 'href', netHash('connections', period, netLast.device));
       setAttr(tabFw, 'href', netHash('firewall', period, ''));
+      setAttr(tabDev, 'href', netHash('devices', period, ''));
     }
 
     ctx.cleanup(() => { if (abort) abort.abort(); });
@@ -7046,7 +7226,7 @@
       content.setAttribute('aria-busy', 'true');
       const params = netPeriodParams(period);
       if (device) params.set('device', device);
-      params.set('limit', String(NET_LIMIT));
+      params.set('limit', String(NET_LIMIT)); // the table's rows (on Devices: the unknown addresses; the Device List is whole)
       const statusReq = api('/api/network/status', { signal }).then((ns) => ({ ns }), (err) => ({ err }));
       try {
         const data = await api('/api/network/' + tab + '?' + params.toString(), { signal });
@@ -7055,11 +7235,12 @@
         show(st.ns && typeof st.ns === 'object' ? st.ns : null, data && typeof data === 'object' ? data : {});
       } catch (e) {
         if (!ctx.alive || mine !== token) return;
-        // Without a syslog store the firewall view is unavailable (503): the status says so, and
-        // the tab explains it (fwNotes, fwAbout) rather than show the error alone.
-        if (tab === 'firewall' && e.status === 503) {
+        // Without a syslog store the firewall view is unavailable (503), without a connection store
+        // the Device List's: the status says so, and the tab explains it (fwNotes, fwAbout; devNoStore)
+        // rather than show the error alone.
+        if ((tab === 'firewall' || tab === 'devices') && e.status === 503) {
           const st = await statusReq;
-          if (ctx.alive && mine === token && st.ns && typeof st.ns === 'object' && !st.ns.syslog) {
+          if (ctx.alive && mine === token && st.ns && typeof st.ns === 'object' && !(tab === 'firewall' ? st.ns.syslog : st.ns.store)) {
             show(st.ns, {});
             return;
           }
@@ -7082,6 +7263,7 @@
       }
       replace(notes, errorNotice(e));
       if (!shown) replace(content);
+      if (tab === 'devices') parts.devices.stale(e); // the details open say so: the notes are behind them
     }
 
     function show(ns, d) {
@@ -7092,18 +7274,27 @@
         replace(ipdbLine, updated ? ['Address data: IPtoASN, ', timeEl(updated, F.date)] : 'No IP address database loaded yet');
         readNote();
         if (tab === 'connections') showConnections(ns, d);
-        else showFirewall(ns, d);
+        else if (tab === 'firewall') showFirewall(ns, d);
+        else showDevices(ns, d);
       });
     }
 
-    /** readNote says when the data were last read: the NAT table, or the gateway's syslog. The
-     *  monitor's status (every 10 s) is fresher than the network status (every minute). */
+    /** readNote says when the data were last read: the NAT table, the gateway's syslog, or its
+     *  Device List. The monitor's status (every 10 s) is fresher than the network status (every
+     *  minute). */
     function readNote() {
       const now = app.status && app.status.now;
-      if (tab === 'connections') {
+      if (tab === 'connections' || tab === 'devices') {
         const smp = (app.status && app.status.connections) || (lastNs && lastNs.samplers);
         if (!smp || typeof smp !== 'object') {
           replace(readLine);
+          return;
+        }
+        if (tab === 'devices') {
+          const every = goDurMs(smp.devices_interval);
+          replace(readLine, smp.devices_at ? ['Device List last read ', agoEl(smp.devices_at, now)] : 'Device List not read yet',
+            smp.enabled && every ? ' · every ' + fmtDur(every / 1000) : '');
+          parts.devices.onStatus();
           return;
         }
         const every = goDurMs(smp.interval);
@@ -7228,6 +7419,8 @@
       // it; the others have left the network since.
       const gw = !device && netList(d.devices).some((dv) => dv.key === 'gateway');
       const inList = Math.min(listed, Math.max(0, Math.floor(Number(t.listed)) || 0));
+      // The others of the period: addresses the Device List never named, devices it no longer lists.
+      const others = Math.max(0, (Math.floor(Number(t.devices)) || 0) - inList - (gw ? 1 : 0));
       const nc = Number(t.countries) || 0;
       // Under a device filter the open connections are that device's (open_device): the NAT
       // table's own count, every device's, goes to the tooltip.
@@ -7238,7 +7431,7 @@
           + (device ? '; every device’s connections at that read: ' + fmtInt(d.open) : '') : null;
       return h('section', { 'aria-label': 'Summary' }, h('div', { class: 'tiles net-tiles' },
         netTile('Devices active', fmtInt(t.devices), device ? 'the device chosen'
-          : listed ? fmtInt(inList) + ' of the ' + fmtInt(listed) + ' in the gateway’s Device List' + (gw ? ', and the gateway' : '')
+          : listed ? fmtInt(inList) + ' of the ' + fmtInt(listed) + ' in the gateway’s Device List' + (others ? ', ' + fmtInt(others) + ' not in it' : '') + (gw ? ', and the gateway' : '')
             : 'in this period'),
         netTile('Sites', fmtInt(t.sites), 'remote addresses'),
         netTile('Organisations', fmtInt(t.orgs), 'in ' + fmtInt(nc) + ' countr' + (nc === 1 ? 'y' : 'ies')),
@@ -7384,7 +7577,8 @@
             h('th', { scope: 'col', class: 'num' }, 'Packets'), h('th', { scope: 'col', class: 'num' }, 'Last'))),
           h('tbody', null, rows.map((r) => h('tr', null,
             h('td', null, h('span', { class: 'dev' }, deviceDot(r.device), h('span', null, netShown(r.name || r.lan || r.device, 48))),
-              r.lan && r.lan !== r.name ? h('span', { class: 'sub small muted' }, netShown(r.lan, 48)) : null),
+              r.lan ? h('span', { class: 'sub small' }, h('a', { href: netHash('devices', period, '', { q: String(r.lan) }), title: 'Which device had this address: the Devices tab' },
+                netShown(r.lan, 48))) : null),
             h('td', null, h('span', { class: 'mono' }, netShown(r.remote, 64))),
             h('td', null, netShown(r.org || (r.remote ? 'Unknown' : '—'), 60), r.asn ? h('span', { class: 'sub small muted' }, 'AS' + r.asn) : null),
             h('td', null, netShown(r.service || '—', 40), portText(r.port, r.proto) ? h('span', { class: 'sub small muted' }, portText(r.port, r.proto)) : null),
@@ -7405,6 +7599,94 @@
         'At its most detailed level the gateway logs only the packets its firewall drops, never the connections it allows; those are on the ',
         h('a', { href: netHash('connections', period, netLast.device) }, 'Connections tab'),
         '. Firewall lines are kept with the rest of the gateway’s syslog, within its size limit', keep ? ' (' + fmtInt(keep) + ' MiB)' : '', '. This is not evidence of an outage.');
+    }
+
+    // ---------------------------------------------------------------- Devices
+
+    /** showDevices shows the Devices tab: the Device List with the period's figures (netDevices),
+     *  or why there is none - no connection store, no read of the Device List yet. */
+    function showDevices(ns, d) {
+      replace(notes, ...devNotes(ns, d),
+        d.list_at && d.nat_reads != null && Number(d.nat_reads) === 0 && !(ns && ns.samplers && ns.samplers.nat_problem)
+          ? callout('info', 'The NAT table was not read in this period, so the devices’ open connections and sites are not known.') : null);
+      if (ns && !ns.store && !d.list_at && !netList(d.devices).length) {
+        placeChildren(content, h('section', { class: 'card' }, emptyNote('This att-monitor keeps no connection store, so it has no read of the gateway’s Device List to show.')), devAbout(ns));
+        return;
+      }
+      if (!d.list_at && !netList(d.devices).length) {
+        placeChildren(content, h('section', { class: 'card' }, emptyNote(devEmptyText(ns))), devAbout(ns));
+        return;
+      }
+      parts.devices.update(d, ns);
+      placeChildren(content, parts.devices.parts, devAbout(ns));
+    }
+
+    /** devEmptyText says why there is no Device List to show: no read of it yet (it is read every
+     *  15 minutes, without the gateway's login), or none worked. */
+    function devEmptyText(ns) {
+      const smp = ns && ns.samplers;
+      const every = smp ? goDurMs(smp.devices_interval) : null;
+      if (smp && !smp.enabled) return 'The gateway’s Device List has not been read: reading the gateway’s pages for the Network page is turned off in the configuration (connections.enabled).';
+      return 'The gateway’s Device List has not been read yet. It is read every ' + (every ? fmtDur(every / 1000) : '15 min') +
+        ', without logging in to the gateway; its devices appear here after the first read.';
+    }
+
+    /** devNotes says what limits the Devices tab (d: its answer): settings in config.json that are
+     *  not used as written, reads that are turned off or fail, blocked packets and syslog messages
+     *  that the syslog kept does not show (no syslog store, the receiver off, the gateway not
+     *  sending its log here, the syslog kept starting after the period does: syslogGaps), open
+     *  connections that are not current (the NAT table is not being read), a LAN scan that did not
+     *  run as planned. */
+    function devNotes(ns, d) {
+      const out = cfgWarnNotes(ns);
+      if (!ns) return out;
+      const smp = ns.samplers && typeof ns.samplers === 'object' ? ns.samplers : null;
+      if (smp && !smp.enabled) {
+        out.push(callout('info', h('strong', null, 'The Device List is not being read. '),
+          'Reading the gateway’s pages for the Network page is turned off in the configuration (connections.enabled); what is shown was recorded before.'));
+      } else if (smp && smp.devices_problem) {
+        out.push(callout('warning', h('strong', null, 'The Device List could not be read. '), sentence(capitalize(String(smp.devices_problem))),
+          smp.devices_at ? [' What is shown is from the newest read that worked, ', timeEl(smp.devices_at, F.short), '.'] : ''));
+      }
+      if (smp && smp.enabled && smp.nat_problem) {
+        out.push(callout('info', h('strong', null, 'Open connections are not current. '), 'The NAT table is not being read: ', sentence(String(smp.nat_problem)),
+          smp.nat_at ? [' They are those of its newest read, ', timeEl(smp.nat_at, F.short), '.'] : ''));
+      }
+      // What the syslog kept does not show: the blocked packets and the devices' syslog messages
+      // come from it (as on the Firewall tab).
+      const g = syslogGaps(ns, d && d.from);
+      if (g.noStore) {
+        out.push(callout('info', 'Blocked packets are not counted: this att-monitor keeps no syslog store.'));
+      } else {
+        if (g.receiverOff) {
+          out.push(callout('info', h('strong', null, 'The syslog receiver is off. '),
+            'It is turned off in the configuration (syslog.enabled): no new syslog message arrives, so the blocked packets and the devices’ syslog messages shown were received before.'));
+        } else if (g.notSending) {
+          out.push(callout('warning', h('strong', null, 'The gateway does not send its log to this PC. '),
+            'Blocked packets and the devices’ syslog messages are not seen until it does. ', h('a', { href: '#/syslog' }, 'Open the Syslog page')));
+        }
+        if (g.oldest) {
+          out.push(callout('info', 'The syslog kept starts at ', timeEl(g.oldest, F.short),
+            ': anything the gateway logged before was not received here or is no longer kept (the syslog’s retention limit deletes the oldest messages), so the blocked packets and syslog messages of the first ',
+            fmtDur(g.gapMs / 1000), ' of this period are not counted.'));
+        }
+      }
+      const live = (app.status && app.status.connections) || smp;
+      if (live && live.scan_problem) {
+        out.push(callout('info', h('strong', null, 'The newest LAN scan did not run as planned. '), sentence(capitalize(String(live.scan_problem)))));
+      }
+      return out;
+    }
+
+    function devAbout(ns) {
+      const smp = ns && ns.samplers;
+      const every = smp ? goDurMs(smp.devices_interval) : null;
+      const keep = ns && ns.store && Number(ns.store.keep_days) > 0 ? Number(ns.store.keep_days) : null;
+      return netAbout('Where this comes from',
+        'The gateway’s Device List, its DHCP table, read ', every ? 'every ' + fmtDur(every / 1000) : 'regularly',
+        ' without logging in to the gateway: each device’s name, MAC address, the IPv4 address the gateway gave it (DHCP) or that is set on it (static), its IPv6 addresses, whether it is on and how it is connected. ',
+        'The gateway does not show when an address’s lease runs out, so no lease time is shown. Open connections and sites come from the NAT table, blocked packets from the gateway’s syslog. ',
+        'This is not evidence: it is never written to the evidence ledger, and it is kept ', keep ? 'for ' + fmtInt(keep) + ' days' : 'for a limited time', '.');
     }
 
     load();
@@ -8274,6 +8556,1069 @@
         totalRows = Math.max(rows.length, Number(d.rows_total) || 0);
         render(false);
       },
+    };
+  }
+
+  // ------------------------------------------------------------------ network view: devices (the DHCP table)
+
+  // The Devices tab's issues (model.NetIssue, docs/dhcp-table.md §2): the words of the chip of each
+  // code the monitor gives (another code is shown as it is), the tone of each level, and its rank -
+  // the table lists the devices with a critical issue first, then those with a warning.
+  const DEV_ISSUE_WORDS = dict({
+    address_shared: 'Address conflict', weak_wifi: 'Weak Wi-Fi', slow_link: 'Slow link', blocked: 'Blocked packets',
+    address_changed: 'New address', offline: 'Off', unlisted: 'Not in the list',
+    // The LAN scan's (docs/dhcp-table.md §6).
+    no_answer: 'No scan answer', scan_mac: 'MAC mismatch', scan_addr: 'Other address',
+  });
+  const DEV_LEVEL_TONE = dict({ critical: 'critical', warning: 'warning', info: 'info' });
+  const DEV_LEVEL_RANK = dict({ critical: 2, warning: 1 });
+  // What the owner can do about an issue, said under its sentence in a device's details.
+  const DEV_ISSUE_HINTS = dict({
+    address_shared: 'Give one of them another address: an address set by hand on a device (static) belongs outside the range the gateway gives out by DHCP.',
+    weak_wifi: 'A device this far from the gateway or an extender, or behind thick walls, may lose its connection: moving one of them, or an extender, helps.',
+    slow_link: 'A wired link at 10 Mb/s or at half duplex usually means a damaged cable, or a port or device that cannot do more.',
+  });
+
+  // The DHCP table's columns: what each sorts by, and in which direction at first. By default the
+  // table is in the order devOrder gives, as sorted by its issues.
+  const NET_DEV_COLS = [
+    { key: 'status', label: 'Status' },
+    { key: 'name', label: 'Name', cls: 'dev-name' },
+    { key: 'ipv4', label: 'IPv4' },
+    { key: 'mac', label: 'MAC' },
+    { key: 'connection', label: 'Connection' },
+    { key: 'allocation', label: 'Allocation' },
+    { key: 'seen', label: 'Last seen on', num: true, desc: true },
+    { key: 'scan', label: 'Scan', desc: true },
+    { key: 'open', label: 'Open', num: true, desc: true },
+    { key: 'sites', label: 'Sites', num: true, desc: true },
+    { key: 'blocked', label: 'Blocked out/in', num: true, desc: true },
+    { key: 'issues', label: 'Issues', desc: true },
+  ];
+
+  // A device's details (GET /api/network/device): the syslog messages asked for (the service's
+  // default; at most 500) and the latest LAN scans listed one by one.
+  const DEV_SYSLOG_LIMIT = 100;
+  const DEV_SCANS_SHOWN = 6;
+  // How far apart the newest LAN scan and the newest Device List read may be for the devices to be
+  // compared with the scan (netmap's scanFresh).
+  const DEV_SCAN_FRESH_MS = 3600e3;
+
+  /** netStrings returns the strings of an answer's list (anything else, or no list, is left out). */
+  function netStrings(v) {
+    return Array.isArray(v) ? v.filter((x) => typeof x === 'string' && x !== '') : [];
+  }
+
+  /** devState is a device's status as the gateway's newest Device List read shows it: "on", "off",
+   *  or "unknown" for anything else (shown as the gateway gives it). */
+  function devState(d) {
+    const st = String(d && d.status != null ? d.status : '').trim().toLowerCase();
+    return st === 'on' || st === 'off' ? st : 'unknown';
+  }
+
+  /** devIssues are a device's (or an unknown address's) issues: the objects of its list. */
+  function devIssues(d) {
+    return netList(d && d.issues);
+  }
+
+  /** devRank says how much a device's issues call for a look: 2 for a critical one, 1 for a
+   *  warning, 0 for neither (an issue that only informs: off, a changed address). */
+  function devRank(d) {
+    return devIssues(d).reduce((r, x) => Math.max(r, DEV_LEVEL_RANK[x.level] || 0), 0);
+  }
+
+  /** devName names a device: the gateway's name, else its IPv4 address, else its MAC address. */
+  function devName(d) {
+    return String((d && (d.name || d.ipv4 || d.mac || d.key)) || '?');
+  }
+
+  function devIsWiFi(d) {
+    return /^wi-?fi/i.test(String(d.connection || ''));
+  }
+
+  /** devAlloc words an allocation: "DHCP" (the gateway gave the address), "Static" (set on the
+   *  device), anything else as the gateway shows it. */
+  function devAlloc(v) {
+    const a = String(v == null ? '' : v).trim();
+    if (/^dhcp$/i.test(a)) return 'DHCP';
+    if (/^static$/i.test(a)) return 'Static';
+    return a;
+  }
+
+  /** devIssueChip shows an issue as a chip: its code's words in its level's tone, its sentence as
+   *  the tooltip (a device's details say it in full). */
+  function devIssueChip(x) {
+    const tone = DEV_LEVEL_TONE[x.level] || 'none';
+    const code = String(x.code == null ? '' : x.code);
+    return chip(tone, DEV_ISSUE_WORDS[code] || capitalize(netText(humanize(code), 40)) || 'Issue', x.text ? netText(x.text, 400) : null);
+  }
+
+  /** devDot shows a device's status as a dot - filled when it is on, hollow when off, a dash
+   *  otherwise -, never alone: its words are beside it. */
+  function devDot(state) {
+    return h('span', { class: 'dev-state is-' + state, 'aria-hidden': 'true' });
+  }
+
+  /** devStatusEl is a device's status: the dot and its words ("on", "off", else as given). */
+  function devStatusEl(d) {
+    const st = devState(d);
+    // A status the dashboard does not know is shown as the gateway wrote it, wrapped in its column.
+    return h('span', { class: 'dev-st' }, devDot(st), st === 'unknown' ? h('span', { class: 'dev-st-odd' }, netShown(d.status || '?', 32)) : h('span', null, st));
+  }
+
+  /** wifiBars draws the Wi-Fi signal the gateway draws for a device - 1 to 5 bars - as a small
+   *  meter with its value in text beside it: "2/5" in a table, read out as "Wi-Fi signal: 2 of 5
+   *  bars"; long, "2 of 5 bars" (a device's details). */
+  function wifiBars(n, long) {
+    const v = Math.max(0, Math.min(5, Math.round(Number(n) || 0)));
+    const svg = s('svg', { class: 'wbars-svg', viewBox: '0 0 19 12', 'aria-hidden': 'true', focusable: 'false' });
+    for (let i = 0; i < 5; i++) {
+      const bh = 3 + i * 2.25;
+      svg.append(s('rect', { class: i < v ? 'wb-on' : 'wb-off', x: i * 4, y: (12 - bh).toFixed(2), width: 3, height: bh.toFixed(2), rx: 0.6 }));
+    }
+    if (long) return h('span', { class: 'wbars' }, svg, h('span', null, v + ' of 5 bars'));
+    return h('span', { class: 'wbars', role: 'img', 'aria-label': 'Wi-Fi signal: ' + v + ' of 5 bars' }, svg, h('span', { class: 'wbars-n', 'aria-hidden': 'true' }, v + '/5'));
+  }
+
+  /** devConnection is a device's connection: as the gateway names it, with its Wi-Fi signal while
+   *  it is on, and (small) a wired link's speed and whether it is a mesh client. */
+  function devConnection(d) {
+    // The gateway's words are short ("Wi-Fi 2.4 GHz", "1000Mbps fullduplex"): longer ones are cut
+    // here, in full in the device's details.
+    return [h('span', { class: 'sub dev-conn-name' }, netShown(d.connection || '—', 24)),
+      devIsWiFi(d) && Number(d.signal) > 0 ? h('span', { class: 'sub' }, wifiBars(d.signal)) : null,
+      d.speed ? h('span', { class: 'sub small muted dev-speed' }, netShown(d.speed, 24)) : null,
+      d.mesh ? h('span', { class: 'sub small muted' }, 'mesh client') : null];
+  }
+
+  /** devFind reads the find box: its words (lower case) and, when the whole text is an IPv4
+   *  address, that address in its usual form ("192.168.001.068" is 192.168.1.68). */
+  function devFind(text) {
+    const t = String(text == null ? '' : text).trim();
+    const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(t);
+    const ipv4 = m && m.slice(1).every((x) => Number(x) <= 255) ? m.slice(1).map(Number).join('.') : '';
+    return { text: t, ipv4, terms: t.toLowerCase().split(/\s+/).filter(Boolean) };
+  }
+
+  /** devHay is what the find box looks in for a device: its name, its IPv4 address and those it
+   *  held in the period, its IPv6 addresses, and its MAC address as the gateway writes it, without
+   *  separators and with dashes. */
+  function devHay(d) {
+    const mac = String(d.mac || '').toLowerCase();
+    return [d.name, d.ipv4, ...netStrings(d.addresses), ...netStrings(d.ipv6), mac, mac.replace(/[^0-9a-f]/g, ''), mac.replace(/:/g, '-')]
+      .filter((x) => x != null && x !== '').join(' ').toLowerCase();
+  }
+
+  /** devMatches reports whether a device matches the find box (devFind): an IPv4 address it has,
+   *  or had in the period; otherwise every word typed, a part of a MAC address also when written
+   *  with other separators ("00-00-5e", "0000.5e00"). */
+  function devMatches(d, f) {
+    if (f.ipv4) return String(d.ipv4 || '') === f.ipv4 || netStrings(d.addresses).includes(f.ipv4);
+    if (!f.terms.length) return true;
+    const hay = devHay(d);
+    return f.terms.every((t) => {
+      if (hay.includes(t)) return true;
+      // A part of a MAC address with separators (not an IPv4 address's digits and dots).
+      return /^[0-9a-f]{1,4}([:.-][0-9a-f]{1,4})+$/.test(t) && !/^[\d.]+$/.test(t) && hay.includes(t.replace(/[:.-]/g, ''));
+    });
+  }
+
+  /** devOrder is the DHCP table's own order, the service's (netmap's sortDevices, which the CLI
+   *  prints too): the devices with a critical issue, then those with a warning, then the others;
+   *  within each, on before the others and off last; then the named ones by name, then by IPv4
+   *  address (those without one last) and key. */
+  function devOrder(a, b) {
+    const on = (d) => ({ on: 0, unknown: 1, off: 2 })[devState(d)];
+    const name = (d) => String(d.name == null ? '' : d.name);
+    const cmp = (x, y) => (x < y ? -1 : x > y ? 1 : 0);
+    const ip = (d) => (/^\d{1,3}(\.\d{1,3}){3}$/.test(String(d.ipv4 || '')) ? ipSortKey(d.ipv4) : '~');
+    return devRank(b) - devRank(a) || on(a) - on(b) || cmp(name(a) === '', name(b) === '') ||
+      cmp(name(a).toLowerCase(), name(b).toLowerCase()) || cmp(name(a), name(b)) || cmp(ip(a), ip(b)) || cmp(String(a.key || ''), String(b.key || ''));
+  }
+
+  /** devSortKey is what a column sorts a device by (NET_DEV_COLS). */
+  function devSortKey(d, key) {
+    switch (key) {
+      case 'status': return ({ on: 0, unknown: 1, off: 2 })[devState(d)];
+      case 'name': return devName(d).toLowerCase();
+      case 'ipv4': return ipSortKey(d.ipv4 || '');
+      case 'mac': return String(d.mac || '');
+      case 'connection': return String(d.connection || '').toLowerCase();
+      case 'allocation': return devAlloc(d.allocation).toLowerCase();
+      case 'seen': return toMs(d.seen) || 0;
+      case 'scan': return (d.scan_addr ? 1e15 : 0) + (toMs(d.scan_seen) || 0); // those that answered the newest scan first
+      case 'open': return Number(d.open) || 0;
+      case 'sites': return Number(d.sites) || 0;
+      case 'blocked': return (Number(d.blocked) || 0) + (Number(d.blocked_in) || 0);
+      default: return devRank(d) * 1000 + devIssues(d).length;
+    }
+  }
+
+  /** devSort sorts a list of devices by a column (sort {key, dir}); ties, and the default sort
+   *  (by issues, the most first), in devOrder. */
+  function devSort(list, sort) {
+    return list.sort((p, q) => {
+      if (sort.key !== 'issues' || sort.dir > 0) {
+        const a = devSortKey(p, sort.key);
+        const b = devSortKey(q, sort.key);
+        const c = typeof a === 'number' && typeof b === 'number' ? a - b : String(a).localeCompare(String(b));
+        if (c) return c * sort.dir;
+      }
+      return devOrder(p, q);
+    });
+  }
+
+  /** devSyslogHash is the Syslog page searching an address over the period (the Syslog page reads
+   *  at most the last 7 days: a longer or another period searches those). */
+  function devSyslogHash(addr, p) {
+    const params = new URLSearchParams();
+    const r = p.range === '1h' || p.range === '7d' ? p.range : p.range === '24h' ? '' : '7d';
+    if (r) params.set('range', r);
+    params.set('q', addr);
+    return '#/syslog?' + params.toString();
+  }
+
+  /** devHeld says when an address was held (model.NetAddrUse): from the first read that showed it
+   *  to the last - "now" when the last is the newest read of the Device List. */
+  function devHeld(u, listAt) {
+    const now = toMs(u.last) != null && toMs(u.last) === toMs(listAt);
+    return [netTimeEl(u.first), ' – ', now ? h('span', { title: 'the newest read of the Device List' }, 'now') : netTimeEl(u.last)];
+  }
+
+  /** syslogGaps says what keeps the syslog kept here from showing all the gateway logged in a
+   *  period that starts at from - the blocked packets and the syslog messages of the Devices tab -,
+   *  as the Firewall tab says it: no syslog store (ns: GET /api/network/status), the receiver off,
+   *  the gateway not sending its log here (the monitor's status), the syslog kept starting after
+   *  the period does (oldest; gapMs: how much of the period it leaves out). */
+  function syslogGaps(ns, from) {
+    const g = { noStore: false, receiverOff: false, notSending: false, oldest: '', gapMs: 0 };
+    if (ns && !ns.syslog) {
+      g.noStore = true;
+      return g;
+    }
+    const sl = syslogStatus(app.status);
+    if (sl && !sl.enabled) g.receiverOff = true;
+    else if (sl && (sl.state === 'off' || sl.state === 'elsewhere')) g.notSending = true;
+    const oldest = ns && ns.syslog ? toMs(ns.syslog.oldest) : null;
+    const start = toMs(from);
+    if (oldest != null && start != null && oldest > start) {
+      g.oldest = String(ns.syslog.oldest);
+      g.gapMs = oldest - start;
+    }
+    return g;
+  }
+
+  /** syslogGapLine is the line a device's details add to their blocked packets (what: 'drops') or
+   *  to their syslog messages ('messages') when the syslog kept does not cover the period
+   *  (syslogGaps, g); null when it does. */
+  function syslogGapLine(g, what) {
+    const drops = what === 'drops';
+    if (g.noStore) return drops ? h('p', { class: 'small muted dev-gap' }, 'Not counted: this att-monitor keeps no syslog store.') : null;
+    const out = [];
+    if (g.receiverOff) out.push('The syslog receiver is off (syslog.enabled): ', drops ? 'drops since it was turned off are not counted. ' : 'messages since it was turned off are not here. ');
+    else if (g.notSending) out.push('The gateway does not send its log to this PC: ', drops ? 'its drops are not seen until it does. ' : 'its messages are not here until it does. ');
+    if (g.oldest) out.push('The syslog kept starts at ', timeEl(g.oldest, F.short), drops ? ': earlier drops of this period are not counted.' : ': earlier messages of this period are not kept.');
+    return out.length ? h('p', { class: 'small muted dev-gap' }, out) : null;
+  }
+
+  /** netDevices is the Devices tab (docs/dhcp-table.md §3): the gateway's Device List - its DHCP
+   *  table - as its newest read shows it, with what the period's reads say of each device. The
+   *  find box filters it by name, IPv4, IPv6 or MAC address and, holding an IPv4 address, says who
+   *  has it now and who had it in the period (the address history); tiles count the devices; the
+   *  table sorts by any column (by its issues at first: the critical ones, then the warnings, off
+   *  devices last), scrolls sideways in its box on a narrow screen with the devices' names kept in
+   *  view, and opens a device's details in the dashboard's details modal (detailShell) - a button in
+   *  each row (its name) or a click on the row -, which the address names (detail=<key>); below it
+   *  the LAN addresses no Device List read names. o: {container (for the modal), q and detail (from
+   *  the address), period() (the period shown), hash(detail) (the tab's address with the find box's
+   *  text and the details open), onFind() (the find box changed: the address follows)}. Returns
+   *  {parts (the tiles, the table's card, the unknown addresses' card), update(d), sync(query),
+   *  stale(err), find() (the find box's text), key (the device whose details are open)}. */
+  function netDevices(ctx, o) {
+    const find = h('input', { type: 'search', name: 'find', placeholder: 'Find a device, IP or MAC address', autocomplete: 'off', spellcheck: 'false', maxlength: '200', 'data-fk': 'net-devs:find' });
+    find.value = String(o.q || '').slice(0, 200);
+    const panel = h('div', { class: 'dev-panel', hidden: true });
+    const missing = h('div', { class: 'dev-missing', hidden: true }); // details the address names, not in this period
+    const box = h('div', { class: 'net-devs-body' });
+    // The DHCP table's scroller stays across refreshes (only its table is replaced): a table the
+    // reader scrolled sideways stays where it is. Scrolled, the names column, which stays in view,
+    // is set apart by a line.
+    const scroller = h('div', { class: 'table-scroll dev-scroll' });
+    scroller.addEventListener('scroll', () => {
+      if (scroller.scrollLeft > 0) scroller.classList.add('is-scrolled');
+      else scroller.classList.remove('is-scrolled');
+    });
+    const status = h('p', { class: 'card-foot' });
+    const scanLine = h('p', { class: 'chart-sub dev-scan-line' });
+    const tiles = h('section', { 'aria-label': 'Summary' });
+    const card = h('section', { class: 'card', 'aria-labelledby': 'net-devs-h' },
+      h('div', { class: 'card-head net-conns-head' },
+        h('div', null, h('h2', { id: 'net-devs-h' }, 'Device List'),
+          h('p', { class: 'chart-sub' }, 'The gateway’s DHCP table: which device has which address, as its newest read shows it. Devices with issues first.'),
+          scanLine),
+        h('label', { class: 'net-search dev-find' }, h('span', { class: 'sr-only' }, 'Find a device, IP or MAC address'), find)),
+      missing, panel, box, status);
+    const unknownBox = h('div');
+    const unknownCard = h('section', { class: 'card', 'aria-labelledby': 'net-unknown-h' },
+      h('div', { class: 'card-head' }, h('div', null, h('h2', { id: 'net-unknown-h' }, 'Unknown addresses'),
+        h('p', { class: 'chart-sub' }, 'LAN addresses that the NAT table, the firewall or a LAN scan showed in this period and no Device List read names, or that a LAN scan found used by a MAC address no read names: a device the gateway does not list (an address set by hand), or one that had the address between two reads.'))),
+      unknownBox);
+    let view = null; // the newest answer
+    let devices = []; // its devices
+    let byKey = new Map();
+    let unknowns = new Map(); // its unknown addresses, by address
+    let sort = { key: 'issues', dir: -1 };
+    let pending = o.detail || null; // details the address names, before the first answer
+    let opener = null; // what opens the details next (the focus goes back to it)
+    let goodAt = null; // when an answer was last shown (the details say so when a refresh fails)
+    let netStat = null; // GET /api/network/status with it: is a syslog store kept
+    let timer = 0;
+    ctx.cleanup(() => window.clearTimeout(timer));
+    find.addEventListener('input', () => {
+      missing.hidden = true;
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        render(true);
+        o.onFind();
+      }, 150);
+    });
+
+    // The details modal: a device's (its key) or an unknown address's ("addr:" and the address).
+    const unknownOf = (key) => (String(key).startsWith('addr:') ? unknowns.get(String(key).slice(5)) || null : null);
+    const modal = detailShell({
+      ctx, container: o.container, param: 'detail',
+      known: (key) => byKey.has(key) || !!unknownOf(key),
+      title: (key) => netText(byKey.has(key) ? devName(byKey.get(key)) : 'Address ' + String(key).slice(5), 80),
+      attrs: (key) => ({ 'data-detail': 'device', 'data-device': key }),
+      mount(e) {
+        e.opener = opener;
+        e.addr = String(e.key).startsWith('addr:') ? String(e.key).slice(5) : '';
+        e.dev = e.addr ? null : byKey.get(e.key);
+        e.unk = e.addr ? unknownOf(e.key) : null;
+        e.detail = null; // GET /api/network/device: the syslog messages, the scans, who held its addresses
+        e.detailWarn = ''; // its integrity warning: problems in the syslog_chunk records read
+        e.detailErr = null;
+        e.detailToken = 0;
+        e.detailAbort = null;
+        e.ctx.cleanup(() => { if (e.detailAbort) e.detailAbort.abort(); });
+        return { update: () => replace(e.body, e.addr ? unknownDetailParts(e) : devDetailParts(e)) };
+      },
+      hashOf: (key) => o.hash(key),
+      closedHash: () => o.hash(''),
+      opened(e) {
+        missing.hidden = true;
+        paint(e);
+      },
+      closed(e) {
+        const sel = e.addr ? 'button.unk-open' : 'button.dev-open';
+        const row = Array.from((e.addr ? unknownCard : card).querySelectorAll(sel)).find((b) => b.getAttribute('data-key') === e.key);
+        const back = e.opener && document.contains(e.opener) ? e.opener : row || find;
+        back.focus();
+      },
+    });
+
+    /** showMissing says that the details the address names (key: a device's, or "addr:" and an
+     *  unknown address) are not in this period's answer - a device no longer listed, an address no
+     *  longer seen -, with a link to look for them over the last 30 days. The next details opened,
+     *  or a search, take it away. */
+    function showMissing(key) {
+      const k = String(key);
+      const addr = k.startsWith('addr:') ? k.slice(5) : '';
+      const p = o.period();
+      replace(missing, callout('info', h('strong', null, addr ? 'That address is not among the unknown addresses of this period. '
+        : 'That device is not in the Device List of this period. '),
+      'The link asked for the details of ', h('span', { class: 'mono' }, netShown(addr || k, 80)),
+      addr ? ', which neither the NAT table, the firewall nor the LAN scans showed in this period.' : ', which no read of this period lists.',
+      p.range !== '30d' ? [' ', h('a', { href: netHash('devices', { range: '30d' }, '', { detail: k }) }, 'Look for it in the last 30 days')] : ''));
+      missing.hidden = false;
+    }
+
+    /** openDevice opens the details of a device (its key) or of an unknown address ("addr:" and the
+     *  address) from a control of the tab (from: the focus goes back to it). */
+    function openDevice(key, from) {
+      opener = from || null;
+      modal.open(key, 'click');
+      opener = null;
+    }
+
+    /** paint draws the details open (e) from the newest answer - the header's icon and line of
+     *  context, the title, and the content (keepReading keeps the reader's place) - and reads what
+     *  they show besides it again (loadDetail): their syslog messages above all. A device the newest
+     *  answer no longer lists keeps what was shown, and says so. */
+    function paint(e) {
+      let tone;
+      if (e.addr) {
+        const u = unknownOf(e.key);
+        e.gone = !u;
+        if (u) e.unk = u;
+        const x = e.unk || {};
+        tone = devRank(x) === 2 ? 'critical' : devRank(x) === 1 ? 'warning' : 'none';
+        replace(e.titles.firstChild, 'Address ', netText(e.addr, 40));
+        e.contextText = [heldBy(e.addr).length ? 'Its MAC address is in no Device List read' : 'Not in the Device List', x.mac ? 'MAC ' + netText(x.mac, 40) : '',
+          netPeriodWords(o.period())].filter(Boolean).join(' · ');
+      } else {
+        const d = byKey.get(e.key);
+        e.gone = !d;
+        if (d) e.dev = d;
+        const dev = e.dev || {};
+        const st = devState(dev);
+        const rank = devRank(dev);
+        tone = rank === 2 ? 'critical' : rank === 1 ? 'warning' : st === 'on' ? 'good' : 'none';
+        replace(e.titles.firstChild, netText(devName(dev), 80));
+        e.contextText = [st === 'unknown' ? netText(dev.status || '?', 48) : capitalize(st), dev.ipv4 ? netText(dev.ipv4, 40) : '',
+          dev.connection ? netText(dev.connection, 40) : '', netPeriodWords(o.period())].filter(Boolean).join(' · ');
+      }
+      replace(e.ico, icon(tone, 'detail-ico'));
+      if (e.staleNote) {
+        e.staleNote.remove();
+        e.staleNote = null;
+      }
+      replace(e.context, e.contextText, ' · updates while open');
+      keepReading(e.dlg, e.body, () => e.part.update());
+      if (!e.gone) loadDetail(e);
+    }
+
+    /** loadDetail reads the details of the device open (e) from the service (GET /api/network/device,
+     *  for the period shown): its syslog messages, newest first, the LAN scans as it answered them
+     *  and who held its addresses. A newer read replaces one still out, and the details' end cancels
+     *  it. What it brings is drawn in place (keepReading); when it fails, the Syslog part says so and
+     *  the rest is drawn from the tab's answer. */
+    function loadDetail(e) {
+      if (e.detailAbort) e.detailAbort.abort();
+      const ab = typeof AbortController === 'function' ? new AbortController() : null;
+      e.detailAbort = ab;
+      const mine = ++e.detailToken;
+      const params = netPeriodParams(o.period());
+      if (e.addr) params.set('addr', e.addr);
+      else params.set('key', e.key);
+      params.set('limit', String(DEV_SYSLOG_LIMIT));
+      api('/api/network/device?' + params.toString(), { withHeaders: true, signal: ab ? ab.signal : null }).then((r) => {
+        if (e.done || mine !== e.detailToken) return;
+        const d = r && r.data;
+        e.detail = d && typeof d === 'object' ? d : {};
+        e.detailWarn = (r && r.headers && typeof r.headers.get === 'function' && r.headers.get('X-ATT-Monitor-Warning')) || '';
+        e.detailErr = null;
+        keepReading(e.dlg, e.body, () => e.part.update());
+      }, (err) => {
+        if (e.done || mine !== e.detailToken) return; // replaced or ended: its abort is no failure
+        e.detailErr = err;
+        keepReading(e.dlg, e.body, () => e.part.update());
+      });
+    }
+
+    /** devDetailParts is a device's details (e.dev): its issues with their sentences, the device as
+     *  the gateway lists it, the addresses it held in the period and the others who held them, the
+     *  LAN scans as it answered them, its connections, its blocked packets and its syslog messages,
+     *  each with a link to where they are shown in full. */
+    function devDetailParts(e) {
+      const d = e.dev || {};
+      const p = o.period();
+      const key = String(d.key == null ? '' : d.key);
+      const st = devState(d);
+      const listAt = view ? view.list_at : '';
+      const part = detailPart;
+      const out = [];
+      if (e.gone) {
+        out.push(callout('info', h('strong', null, 'No longer in the Device List. '), 'The gateway’s newest Device List does not list this device: what is shown here is from the read before.'));
+      }
+      out.push(issuesPart(d));
+      const reads = Number(d.reads) || 0;
+      const bars = Number(d.signal) || 0;
+      out.push(h('div', { class: 'detail-cols' },
+        part('The device', kv([
+          ['Name', d.name ? netShown(d.name, 120) : h('span', { class: 'muted' }, 'none shown')],
+          ['Status', [devStatusEl(d), h('span', { class: 'muted' }, st === 'on' ? ' — in the newest read of the Device List'
+            : st === 'off' ? ' — the gateway keeps a device that is off in its list for a day or more' : ' — as the gateway shows it')]],
+          ['MAC address', d.mac ? h('span', { class: 'mono' }, netShown(d.mac, 40)) : null],
+          ['IPv4 address', d.ipv4 ? h('span', { class: 'mono' }, netShown(d.ipv4, 40)) : h('span', { class: 'muted' }, 'none')],
+          ['IPv6 addresses', netStrings(d.ipv6).length ? h('ul', { class: 'dev-v6' }, netStrings(d.ipv6).map((a) => h('li', { class: 'mono' }, netShown(a, 60)))) : null],
+          ['Allocation', d.allocation ? [netShown(devAlloc(d.allocation), 40), /^dhcp$/i.test(String(d.allocation).trim()) ? ' — the gateway gave it the address'
+            : /^static$/i.test(String(d.allocation).trim()) ? ' — the address is set on the device' : ''] : null],
+          ['Connection', d.connection ? [netShown(d.connection, 60), devIsWiFi(d) && bars > 0 ? [' · signal ', wifiBars(bars, true)] : ''] : null],
+          ['Link speed', d.speed ? netShown(d.speed, 60) : null],
+          ['Mesh client', d.mesh ? 'yes — connected through a Wi-Fi extender' : null],
+          ['Last activity', d.last_activity ? [netShown(d.last_activity, 60), h('span', { class: 'muted' }, ' (as the gateway shows it)')] : null],
+          ['Last seen on', d.seen ? netTimeEl(d.seen) : st === 'off' ? h('span', { class: 'muted' }, 'not in this period') : null],
+          ['Device List reads', reads > 0 ? 'on in ' + fmtInt(d.on_reads) + (reads === 1 ? ' of the 1 read' : ' of the ' + fmtInt(reads) + ' reads') + ' of this period that list it' : null],
+        ])),
+        h('div', { class: 'detail-stack' }, devAddressParts(e, d, key, listAt, part), scansPart(e, d))));
+      const addrs = netStrings(d.addresses).length ? netStrings(d.addresses) : d.ipv4 ? [String(d.ipv4)] : [];
+      // The Connections tab knows a device by its MAC address or its address ("mac:…", "ip:…"): an
+      // entry the list gives twice ("…#2") by the key of its first.
+      const connKey = /^(mac|ip):[\x21-\x7e]+$/.test(key) ? key.replace(/#\d+$/, '') : '';
+      out.push(h('div', { class: 'detail-cols' }, connectionsPart(d, connKey, p), blockedPart(d, p)));
+      out.push(syslogPart(e, addrs, p));
+      out.push(detailLinks('From the gateway’s Device List, read every ', devEveryText(), ' without logging in; LAN scans by ARP from this PC; connections from its NAT table, blocked packets and messages from its syslog. Not evidence.'));
+      return out;
+    }
+
+    /** heldBy names the devices that Device List reads of the period give the address addr to (the
+     *  address history), each once: an unknown address with any answered a LAN scan from a MAC
+     *  address that no read names. */
+    function heldBy(addr) {
+      const out = [];
+      for (const u of netList(view && view.addresses)) {
+        const name = String(u.addr) === addr ? String(u.name || u.mac || u.device || '') : '';
+        if (name && !out.includes(name)) out.push(name);
+      }
+      return out;
+    }
+
+    /** unknownDetailParts is an unknown address's details (e.unk, model.NetUnknownAddr): why it is
+     *  one, what answered for it, when it was seen, who held it in the Device List's reads, the LAN
+     *  scans as it answered them, its connections, blocked packets and syslog messages. */
+    function unknownDetailParts(e) {
+      const u = e.unk || {};
+      const p = o.period();
+      const held = heldBy(e.addr); // a MAC address no read names answered at an address reads give to devices
+      const out = [];
+      if (e.gone) {
+        out.push(callout('info', h('strong', null, 'No longer among the unknown addresses. '), 'The newest answer does not show this address: what is shown here is from the one before.'));
+      }
+      out.push(issuesPart(u));
+      out.push(h('div', { class: 'detail-cols' },
+        detailPart('The address', kv([
+          ['IPv4 address', h('span', { class: 'mono' }, netShown(e.addr, 40))],
+          ['MAC address', u.mac ? [h('span', { class: 'mono' }, netShown(u.mac, 40)), h('span', { class: 'muted' }, ' — what answered for it in the LAN scan')]
+            : h('span', { class: 'muted' }, 'not known: no LAN scan of this period found it')],
+          ['First seen', u.first ? netTimeEl(u.first) : null],
+          ['Last seen', u.last ? netTimeEl(u.last) : null],
+          ['In the Device List', held.length ? ['reads of this period give it to ', held.map((n, i) => [i ? (i === held.length - 1 ? ' and ' : ', ') : '', netShown(n, 48)]),
+            u.mac ? ['; the MAC address that answered for it, ', h('span', { class: 'mono' }, netShown(u.mac, 40)), ', is in none of them'] : ''] : 'no read of this period names it'],
+        ])),
+        h('div', { class: 'detail-stack' }, devAddressParts(e, { ipv4: e.addr }, '', view ? view.list_at : '', detailPart), scansPart(e, null))));
+      out.push(h('div', { class: 'detail-cols' }, connectionsPart(u, 'ip:' + e.addr, p), blockedPart(u, p)));
+      out.push(syslogPart(e, [e.addr], p));
+      out.push(detailLinks(held.length ? 'Answered a LAN scan from a MAC address that no read of the gateway’s Device List names. Not evidence.'
+        : 'Seen in the NAT table, the firewall’s drops or the LAN scans, but in no read of the gateway’s Device List. Not evidence.'));
+      return out;
+    }
+
+    /** detailPart is a part of the details: a heading and its content. */
+    function detailPart(title, ...kids) {
+      return h('section', { class: 'detail-part' }, h('h3', { class: 'subhead' }, title), ...kids);
+    }
+
+    /** issuesPart lists the issues of a device or an unknown address with their sentences, the most
+     *  severe first, and what helps with those the owner can fix. */
+    function issuesPart(x) {
+      const issues = devIssues(x).slice().sort((a, b) => (DEV_LEVEL_RANK[b.level] || 0) - (DEV_LEVEL_RANK[a.level] || 0));
+      return detailPart('Issues', issues.length
+        ? h('ul', { class: 'dev-issues' }, issues.map((i) => h('li', null, devIssueChip(i), ' ', h('span', { class: 'dev-issue-text' }, i.text ? netShown(i.text, 400) : '—'),
+          DEV_ISSUE_HINTS[i.code] && (DEV_LEVEL_RANK[i.level] || 0) > 0 ? h('span', { class: 'sub small muted' }, DEV_ISSUE_HINTS[i.code]) : null)))
+        : emptyNote('No issue in this period.'));
+    }
+
+    /** connectionsPart: the connections open in the newest read of the NAT table and the sites of
+     *  the period (of a device or an unknown address x), and the Connections tab filtered to it (by
+     *  connKey; none for a key the tab does not know). */
+    function connectionsPart(x, connKey, p) {
+      const natAt = view ? toDate(view.nat_at) : null;
+      return detailPart('Connections', natKnown() ? kv([
+        ['Open connections', [fmtInt(x.open) + ' in the newest read of the NAT table', natAt ? [', ', netTimeEl(view.nat_at)] : '']],
+        ['Sites', fmtInt(x.sites) + (Number(x.sites) === 1 ? ' remote address' : ' remote addresses') + ' in this period'],
+      ]) : emptyNote('Not known: the NAT table was not read in this period.'),
+      connKey ? h('p', { class: 'detail-links' }, h('a', { href: netHash('connections', p, connKey) }, 'Show its connections on the Connections tab')) : null);
+    }
+
+    /** blockedPart: the packets of a device or an unknown address that the gateway's firewall dropped
+     *  in the period (and what of the period the syslog kept leaves out: syslogGapLine), and the
+     *  Firewall tab. */
+    function blockedPart(x, p) {
+      return detailPart('Blocked packets', kv([
+        ['It sent', fmtInt(x.blocked) + ' dropped by the gateway’s firewall'],
+        ['Sent to it', fmtInt(x.blocked_in) + ' from the Internet, dropped'],
+      ]), syslogGapLine(syslogGaps(netStat, view && view.from), 'drops'),
+      h('p', { class: 'detail-links' }, h('a', { href: netHash('firewall', p, '') }, 'Open the Firewall tab')));
+    }
+
+    /** scansPart says how a device (d; an unknown address: null) answered the period's LAN scans:
+     *  when it last did, how many of them, at which address, and the latest scans one by one (from
+     *  the details read: e.detail.scans, newest first). */
+    function scansPart(e, d) {
+      const total = Math.max(0, Math.floor(Number(view && view.scans)) || 0);
+      const scans = e.detail ? netList(e.detail.scans) : null;
+      if (!total && !(scans && scans.length)) return detailPart('LAN scans', emptyNote('No LAN scan in this period.'));
+      const hits = d ? Math.floor(Number(d.scan_hits)) || 0 : scans ? scans.filter((s) => s.addr).length : null;
+      const seen = d ? d.scan_seen : e.unk && e.unk.scan_seen;
+      const latest = scans ? scans.slice(0, DEV_SCANS_SHOWN) : null;
+      const all = Math.max(total, scans ? scans.length : 0);
+      return detailPart('LAN scans', kv([
+        ['Last answered', seen ? netTimeEl(seen) : h('span', { class: 'muted' }, 'none of this period')],
+        ['Answered', hits == null ? null : fmtInt(hits) + (all === 1 ? ' of the 1 scan' : ' of the ' + fmtInt(all) + ' scans') + ' of this period'],
+        ['At address', d && d.scan_addr ? [h('span', { class: 'mono' }, netShown(d.scan_addr, 40)),
+          d.ipv4 && d.scan_addr !== d.ipv4 ? h('span', { class: 'muted' }, [' (the gateway lists ', netShown(d.ipv4, 40), ')']) : null] : null],
+      ]),
+      latest == null ? (e.detailErr ? null : h('p', { class: 'loading small' }, 'Reading its scans…'))
+        : latest.length ? h('ul', { class: 'dev-scans' }, latest.map((s) => h('li', null, netTimeEl(s.at), ' — ',
+          s.addr ? ['answered at ', h('span', { class: 'mono' }, netShown(s.addr, 40))] : h('span', { class: 'muted' }, 'no answer')))) : null);
+    }
+
+    /** syslogPart is a device's (or an unknown address's) syslog messages of the period, as the
+     *  details read them: newest first, as the Syslog page lists them (time, severity, host, the
+     *  message - every server string as text), how many and whether more name it, what they are
+     *  found by, and the Syslog page searching each address; a plain sentence when none names it,
+     *  or when no syslog store is kept; why they could not be read (the request failed, or the
+     *  service says so: syslog_error); the integrity warning of the records read, as the Syslog
+     *  page gives it. */
+    function syslogPart(e, addrs, p) {
+      const d = e.detail;
+      // Without a syslog store (GET /api/network/status has no syslog) there are no messages to
+      // show, here or on the Syslog page.
+      const noStore = !!(netStat && !netStat.syslog && !(d && (netList(d.syslog).length || d.syslog_error)));
+      const links = addrs.length && !noStore ? h('ul', { class: 'detail-links dev-links' }, addrs.slice(0, 4).map((a) => h('li', null,
+        h('a', { href: devSyslogHash(a, p) }, 'Messages that name ', h('span', { class: 'mono' }, netShown(a, 40)), ' on the Syslog page')))) : null;
+      let body;
+      if (noStore) {
+        body = emptyNote('This att-monitor keeps no syslog store, so it has no syslog messages to show.');
+      } else if (e.detailErr && !d) {
+        body = callout('warning', 'Its syslog messages could not be read: ', sentence(e.detailErr.message));
+      } else if (!d) {
+        body = h('p', { class: 'loading' }, 'Reading its syslog messages…');
+      } else {
+        const msgs = netList(d.syslog);
+        const terms = netList(d.match);
+        const found = terms.length ? h('p', { class: 'small muted' }, 'Found by ', terms.slice(0, 8).map((t, i) => [i ? (i === Math.min(terms.length, 8) - 1 ? ' and ' : ', ') : '',
+          h('span', { class: 'mono' }, netShown(t.text || '?', 60)), termTimes(t)]), terms.length > 8 ? ' and ' + fmtInt(terms.length - 8) + ' more' : '', '.') : null;
+        body = msgs.length
+          ? [h('p', { class: 'small' }, d.syslog_truncated ? 'The newest ' + fmtInt(msgs.length) + ' messages that name it; more do in this period.'
+            : fmtInt(msgs.length) + ' message' + (msgs.length === 1 ? ' names' : 's name') + ' it in this period, newest first.'),
+          table([{ label: 'Received' }, { label: 'Severity' }, { label: 'Host · app', cls: 'syslog-host' }, { label: 'Message', cls: 'syslog-msg' }],
+            msgs.map(syslogRow), { compact: true, stack: true }), found]
+          // The service read the device but not its syslog messages (syslog_error says why).
+          : d.syslog_error ? [callout('warning', sentence(capitalize(netText(d.syslog_error, 300)))), found]
+            : [emptyNote('No syslog message of this period names it.'), found];
+        // As on the Syslog page: the records that state its messages' chunks did not check out.
+        if (e.detailWarn) {
+          body = [callout('critical', h('strong', null, 'Integrity problem in the syslog_chunk records read. '), netText(e.detailWarn, 400), ' ',
+            h('a', { href: '#/evidence' }, 'Run Verify')), body];
+        }
+        if (e.detailErr) body = [callout('warning', 'Its syslog messages could not be read again: ', sentence(e.detailErr.message), ' What is shown was read before.'), body];
+        body = [body, syslogGapLine(syslogGaps(netStat, view && view.from), 'messages')];
+      }
+      return detailPart('Syslog', body, links);
+    }
+
+    /** termTimes says when a syslog term counts (model.NetSyslogTerm: an IPv4 address while the
+     *  device held it), "" for the whole period. */
+    function termTimes(t) {
+      const from = toDate(t.from);
+      const to = toDate(t.to);
+      if (!from && !to) return '';
+      return [' (', from && to ? [netTimeEl(t.from), ' – ', netTimeEl(t.to)] : from ? ['since ', netTimeEl(t.from)] : ['until ', netTimeEl(t.to)], ')'];
+    }
+
+    /** devAddressParts are the addresses of a device (d; an unknown address: {ipv4}) in the period
+     *  and the others that held them - from the details read (e.detail.addresses), else from the
+     *  tab's address history -, each holder's name a link to its own details; for an address two
+     *  devices claim, what that means for the counts. */
+    function devAddressParts(e, d, key, listAt, part) {
+      const all = netList(e.detail && Array.isArray(e.detail.addresses) ? e.detail.addresses : view && view.addresses);
+      const mine = key ? all.filter((u) => String(u.device) === key).sort((a, b) => (toMs(b.last) || 0) - (toMs(a.last) || 0)) : [];
+      const held = new Set(mine.map((u) => String(u.addr)));
+      if (d.ipv4) held.add(String(d.ipv4));
+      const others = all.filter((u) => held.has(String(u.addr)) && String(u.device) !== key);
+      const who = (u) => {
+        const k = String(u.device == null ? '' : u.device);
+        const name = netShown(u.name || u.mac || k, 48);
+        return byKey.has(k) ? h('a', { href: o.hash(k) }, name) : [name, h('span', { class: 'muted' }, ' (no longer listed)')];
+      };
+      const shared = devIssues(d).some((x) => x.code === 'address_shared');
+      return [
+        key ? part('Addresses in this period', mine.length
+          ? table([{ label: 'Address' }, { label: 'Held' }, { label: 'Reads', num: true }],
+            mine.map((u) => [h('span', { class: 'mono' }, netShown(u.addr, 40)), devHeld(u, listAt), fmtInt(u.reads)]), { compact: true })
+          : emptyNote('No read of this period shows it with an address.')) : null,
+        part(key ? 'Others who held them' : 'Who held it', others.length
+          ? table([{ label: 'Address' }, { label: 'Device' }, { label: 'Held' }],
+            others.map((u) => [h('span', { class: 'mono' }, netShown(u.addr, 40)), who(u), devHeld(u, listAt)]), { compact: true })
+          : emptyNote(key ? 'No other device held its addresses in this period.' : 'No device of the Device List held it in this period.'),
+        shared ? callout('warning', 'While two devices claim one address, the NAT table and the firewall cannot tell them apart (they name addresses, not devices): the connections and blocked packets of the address may be counted for the other one.') : null),
+      ];
+    }
+
+    /** devEveryText is how often the Device List is read, as the monitor reports it. */
+    function devEveryText() {
+      const smp = app.status && app.status.connections;
+      const every = smp && typeof smp === 'object' ? goDurMs(smp.devices_interval) : null;
+      return every ? fmtDur(every / 1000) : '15 min';
+    }
+
+    /** render shows the devices that match the find box, sorted, with the address panel above
+     *  them and the unknown addresses below; after the reader's own change (said), the new count
+     *  is announced (a refresh changes it silently). */
+    function render(said) {
+      if (!view) return;
+      const f = devFind(find.value);
+      const match = devSort(devices.filter((d) => devMatches(d, f)), sort);
+      const natAt = toDate(view.nat_at);
+      const tips = dict({
+        open: natAt ? 'Connections in the newest read of the NAT table, ' + F.full.format(natAt) : 'Connections in the newest read of the NAT table',
+        sites: 'Remote addresses reached in this period', blocked: 'Packets it sent / packets sent to it, dropped by the gateway’s firewall in this period',
+        seen: 'When the newest read of the Device List that showed it on was made',
+      });
+      const head = h('tr', null, NET_DEV_COLS.map((x) => {
+        const on = x.key === sort.key;
+        const btn = h('button', { type: 'button', class: 'th-sort', 'data-fk': 'net-devs:sort:' + x.key, title: tips[x.key] || null }, x.label,
+          h('span', { class: 'th-arrow', 'aria-hidden': 'true' }, on ? (sort.dir < 0 ? ' ▼' : ' ▲') : ''));
+        btn.addEventListener('click', () => {
+          sort = on ? { key: x.key, dir: -sort.dir } : { key: x.key, dir: x.desc ? -1 : 1 };
+          render(true);
+        });
+        return h('th', { scope: 'col', class: [x.num ? 'num' : '', x.cls || ''].join(' ').trim() || null, 'aria-sort': on ? (sort.dir < 0 ? 'descending' : 'ascending') : null }, btn);
+      }));
+      let panelWords = '';
+      keepFocus(card, () => {
+        if (match.length) {
+          const left = scroller.scrollLeft;
+          replace(scroller, h('table', { class: 'tbl net-devs' }, h('thead', null, head), h('tbody', null, match.map(devRow))));
+          if (box.firstChild !== scroller) replace(box, scroller);
+          scroller.scrollLeft = left;
+        } else {
+          replace(box, emptyNote(devices.length ? 'No device of the Device List matches.' : 'The gateway’s newest Device List lists no device.'));
+        }
+        panelWords = fillPanel(f);
+      });
+      const n = fmtInt(devices.length) + ' device' + (devices.length === 1 ? '' : 's');
+      status.textContent = f.terms.length ? fmtInt(match.length) + ' of ' + n + ' match.' : 'Showing all ' + n + ' of the Device List.';
+      keepFocus(unknownCard, () => {
+        // Its table is new each time: the sideways scroll is carried over.
+        const was = unknownBox.querySelector('.table-scroll');
+        const left = was ? was.scrollLeft : 0;
+        replace(unknownBox, unknownTable(f));
+        const now = unknownBox.querySelector('.table-scroll');
+        if (now && left) now.scrollLeft = left;
+      });
+      replace(scanLine, scanWords());
+      if (said) announce(status.textContent + (panelWords ? ' ' + panelWords : ''));
+    }
+
+    /** scanWords says how the newest LAN scan of the period went (docs/dhcp-table.md §6): when, how
+     *  many addresses answered of how many asked on which network, what stopped it short, and when
+     *  the next is due (the monitor's status); that there was none in the period, or that the scans
+     *  are off. Nothing from a service that reports no scans. */
+    function scanWords() {
+      const smp = (app.status && app.status.connections) || {};
+      const sc = view.scan && typeof view.scan === 'object' ? view.scan : null;
+      const next = toDate(smp.scan_next);
+      const nextWords = next && next.getTime() > Date.now() ? [' · next ', netTimeEl(smp.scan_next)] : '';
+      if (sc) {
+        return ['LAN scan ', netTimeEl(sc.at), ': ', fmtInt(sc.answered) + ' of ' + fmtInt(sc.asked) + (Number(sc.asked) === 1 ? ' address' : ' addresses'),
+          sc.subnet ? [' of ', h('span', { class: 'mono' }, netShown(sc.subnet, 40))] : '', ' answered',
+          sc.problem ? [' (', netShown(sentence(capitalize(String(sc.problem))).replace(/\.$/, ''), 200), ')'] : '', nextWords, '.',
+          // Made too far from the newest Device List read, the service compares no device with it.
+          view.list_at && !sc.problem && !scanCompared() ? ' The devices are not compared with it: ' + scanApart() : ''];
+      }
+      // A service that counts no scans knows none; one that does leaves the interval out when the
+      // scans are off (connections.scan_interval 0).
+      if (view.scans == null || !app.status) return '';
+      if (!smp.scan_interval) return 'LAN scans are off (connections.scan_interval is 0).';
+      return ['No LAN scan in this period', nextWords, '.'];
+    }
+
+    /** devRow is a device's row of the DHCP table: its name is the button that opens its details,
+     *  and a click elsewhere on the row (not on a link, not one that selected text) does too. */
+    function devRow(d) {
+      const key = String(d.key == null ? '' : d.key);
+      const st = devState(d);
+      const btn = h('button', { type: 'button', class: 'link-btn dev-open', 'aria-haspopup': 'dialog', 'data-key': key, 'data-fk': 'net-devs:open:' + key },
+        netShown(devName(d), 48));
+      btn.addEventListener('click', () => openDevice(key, btn));
+      const others = netStrings(d.addresses).filter((a) => a !== d.ipv4);
+      const listAt = toMs(view.list_at);
+      const seen = toDate(d.seen);
+      const issues = devIssues(d).filter((x) => x.code !== 'offline'); // off is its status
+      const tr = h('tr', { class: 'dev-row' + (st === 'off' ? ' is-off' : '') },
+        h('td', null, devStatusEl(d)),
+        h('td', { class: 'dev-name' }, btn),
+        h('td', { class: 'dev-ip' }, d.ipv4 ? h('span', { class: 'mono' }, netShown(d.ipv4, 40)) : h('span', { class: 'muted' }, '—'),
+          others.length ? h('span', { class: 'sub small muted' }, 'also had ', others.map((a, i) => [i ? ', ' : '', h('span', { class: 'mono nowrap' }, netShown(a, 40))])) : null),
+        h('td', { class: 'nowrap' }, d.mac ? h('span', { class: 'mono small' }, netShown(d.mac, 40)) : h('span', { class: 'muted' }, '—')),
+        h('td', null, devConnection(d)),
+        h('td', null, d.allocation ? netShown(devAlloc(d.allocation), 24) : h('span', { class: 'muted' }, '—')),
+        h('td', { class: 'num' }, st === 'on' && seen && listAt != null && seen.getTime() === listAt
+          ? h('time', { datetime: seen.toISOString(), title: 'On in the newest read of the Device List, ' + F.full.format(seen) + ' · UTC: ' + utcText(d.seen, seen) }, 'now')
+          : seen ? netTimeEl(d.seen) : h('span', { class: 'muted', title: 'No read of this period showed it on' }, '—')),
+        h('td', { class: 'dev-scan' }, scanCell(d, st)),
+        h('td', { class: 'num' }, natKnown() ? fmtInt(d.open) : natUnknown()),
+        h('td', { class: 'num' }, natKnown() ? fmtInt(d.sites) : natUnknown()),
+        h('td', { class: 'num' }, fmtInt(d.blocked), h('span', { class: 'muted' }, ' / '), fmtInt(d.blocked_in)),
+        h('td', { class: 'dev-issues-cell' }, issues.length ? h('span', { class: 'chips' }, issues.map(devIssueChip)) : h('span', { class: 'muted' }, '—')));
+      tr.addEventListener('click', (ev) => rowClick(ev, tr, () => openDevice(key, btn)));
+      return tr;
+    }
+
+    /** scanCell says how a device (d, its status st) answered the period's newest LAN scan:
+     *  answered, at the scan's time (at another address than the gateway lists: which); no answer
+     *  (and when it last answered); not compared, when the service compares no device with that
+     *  scan (scanCompared: it was made too far from the newest Device List read, or did not run as
+     *  planned); not scanned (no scan in the period). */
+    function scanCell(d, st) {
+      if (!(Number(view.scans) > 0)) return h('span', { class: 'muted', title: 'No LAN scan in this period' }, 'not scanned');
+      const sc = view.scan && typeof view.scan === 'object' ? view.scan : {};
+      if (d.scan_addr) {
+        return [h('span', { class: 'nowrap', title: 'It answered the newest LAN scan' }, 'answered ', netTimeEl(d.scan_seen || sc.at)),
+          d.ipv4 && d.scan_addr !== d.ipv4 ? h('span', { class: 'sub small' }, 'at ', h('span', { class: 'mono' }, netShown(d.scan_addr, 40))) : null];
+      }
+      const last = d.scan_seen ? h('span', { class: 'sub small muted' }, 'last ', netTimeEl(d.scan_seen)) : null;
+      if (!scanCompared()) {
+        return [h('span', { class: 'muted', title: 'Not compared with the newest LAN scan: ' + scanApart() }, 'not compared'), last];
+      }
+      return [h('span', { class: st === 'on' ? null : 'muted' }, 'no answer'), last];
+    }
+
+    /** scanCompared reports whether the devices are compared with the period's newest LAN scan, as
+     *  the service compares them: the scan was begun within DEV_SCAN_FRESH_MS of the newest Device
+     *  List read, and ran as planned. */
+    function scanCompared() {
+      const sc = view && view.scan && typeof view.scan === 'object' ? view.scan : null;
+      const at = sc ? toMs(sc.at) : null;
+      const listAt = toMs(view && view.list_at);
+      return at != null && listAt != null && Math.abs(at - listAt) <= DEV_SCAN_FRESH_MS && !sc.problem;
+    }
+
+    /** scanApart says why the newest LAN scan is not compared with the newest Device List read (as
+     *  text: a tooltip, the scan line): how far apart they are, or that it did not run as planned. */
+    function scanApart() {
+      const sc = view && view.scan && typeof view.scan === 'object' ? view.scan : null;
+      const at = sc ? toMs(sc.at) : null;
+      const listAt = toMs(view && view.list_at);
+      if (at == null || listAt == null) return 'there is no Device List read to compare it with.';
+      if (Math.abs(at - listAt) > DEV_SCAN_FRESH_MS) return 'it was made ' + fmtDur(Math.abs(at - listAt) / 1000) + (at < listAt ? ' before' : ' after') + ' the newest Device List read.';
+      return 'it did not run as planned.';
+    }
+
+    /** fillPanel says, for an IPv4 address in the find box, which device has it now (the newest
+     *  Device List read: two entries that are not off are an address conflict; an entry that is
+     *  off is the gateway's memory of a device that left, which claims nothing, as the service
+     *  counts it) and which held it in the period, from when to when (the address history); and,
+     *  for an unknown address, what showed it, in the service's words. Returns its first sentence
+     *  (announced with the count), '' without an address. */
+    function fillPanel(f) {
+      if (!f.ipv4) {
+        panel.hidden = true;
+        replace(panel);
+        return '';
+      }
+      const addr = f.ipv4;
+      const holders = devices.filter((d) => String(d.ipv4 || '') === addr);
+      const claim = holders.filter((d) => devState(d) !== 'off');
+      const offs = holders.filter((d) => devState(d) === 'off');
+      const uses = netList(view.addresses).filter((u) => String(u.addr) === addr).sort((a, b) => (toMs(a.first) || 0) - (toMs(b.first) || 0));
+      const unk = netList(view.unknown).find((u) => String(u.addr) === addr);
+      // A device's name opens its details; its key says where it is (role, place) and what it opens,
+      // as one device can be named in the sentence and in the history.
+      const nameOf = (d, key, role, i) => {
+        const b = h('button', { type: 'button', class: 'link-btn', 'aria-haspopup': 'dialog', 'data-fk': 'net-devs:panel:' + role + ':' + i + ':' + key }, netShown(devName(d), 48));
+        b.addEventListener('click', () => openDevice(key, b));
+        return b;
+      };
+      const join = (items) => items.map((x, i) => [i ? (i === items.length - 1 ? ' and ' : ', ') : '', x]);
+      const names = (list) => list.map(devName).join(' and ');
+      let words;
+      let now;
+      if (claim.length > 1) {
+        words = addr + ': ' + names(claim) + ' claim it now, an address conflict.';
+        now = [chip('critical', 'Address conflict'), ' ', join(claim.map((d, i) => nameOf(d, String(d.key), 'now', i))),
+          claim.length === 2 ? ' both' : ' all', ' claim it in the newest read of the Device List.'];
+      } else if (claim.length === 1) {
+        words = addr + ': ' + devName(claim[0]) + ' has it now.';
+        now = [nameOf(claim[0], String(claim[0].key), 'now', 0), ' has it in the newest read of the Device List.'];
+      } else if (offs.length) {
+        words = addr + ': no device that is on has it now.';
+        now = ['No device that is on has it in the newest read of the Device List.'];
+      } else {
+        words = addr + ': no device of the Device List has it now.';
+        now = ['No device has it in the newest read of the Device List.'];
+      }
+      if (offs.length) {
+        const one = offs.length === 1;
+        words += ' ' + names(offs) + (one ? ' (off) is' : ' (off) are') + ' still listed with it.';
+        now.push(' ', join(offs.map((d, i) => nameOf(d, String(d.key), 'off', i))), one ? ' is off, but still listed with it' : ' are off, but still listed with it',
+          claim.length || !one ? ': the gateway keeps ' + (one ? 'a device' : 'devices') + ' that left in its list, which is no address conflict.' : '.');
+      }
+      const hist = uses.length
+        ? h('ul', { class: 'dev-panel-list' }, uses.map((u, i) => {
+          const k = String(u.device == null ? '' : u.device);
+          return h('li', null, byKey.has(k) ? nameOf(byKey.get(k), k, 'held', i) : [netShown(u.name || k, 48), h('span', { class: 'muted' }, ' (no longer listed)')],
+            u.mac ? h('span', { class: 'mono small muted' }, ' ', netShown(u.mac, 40)) : null, ' · ', devHeld(u, view.list_at),
+            h('span', { class: 'muted' }, ' · ' + fmtInt(u.reads) + ' read' + (Number(u.reads) === 1 ? '' : 's')));
+        }))
+        : h('p', null, 'No Device List read of this period shows a device with it.');
+      let unkLine = null;
+      if (unk) {
+        const b = h('button', { type: 'button', class: 'link-btn', 'aria-haspopup': 'dialog', 'data-fk': 'net-devs:panel:unknown:' + addr }, 'Its details');
+        b.addEventListener('click', () => openDevice('addr:' + addr, b));
+        // The service's sentence says what showed it, and whether reads give the address to another
+        // device (a MAC address no read names answered for it).
+        const said = devIssues(unk).find((x) => x.code === 'unlisted' && x.text);
+        unkLine = h('p', null, chip('warning', 'Not in the list'), ' ', said ? netShown(said.text, 400) : unknownWords(unk, uses.length > 0 || holders.length > 0), ' ', b);
+      }
+      replace(panel,
+        h('p', { class: 'dev-panel-title' }, 'Address ', h('span', { class: 'mono' }, addr)),
+        h('p', null, now),
+        h('p', { class: 'dev-panel-sub' }, 'In this period (', o.period().range === 'custom' ? netPeriodWords(o.period()) : netPeriodWords(o.period()).toLowerCase(), '):'), hist,
+        unkLine);
+      panel.hidden = false;
+      return words;
+    }
+
+    /** unknownWords says what showed an unknown address (u) when the service does not: the NAT
+     *  table, the firewall's drops, the LAN scans; named: Device List reads of the period give the
+     *  address to a device (what no read names is the MAC address that answered for it). */
+    function unknownWords(u, named) {
+      const mac = u.mac ? netText(u.mac, 40) : '';
+      if (named && (u.scan_seen || mac)) {
+        return 'A LAN scan of this period found it answered by ' + (mac || 'a MAC address') +
+          ', which no Device List read of this period names (the reads give the address to another device).';
+      }
+      const seen = [];
+      if (Number(u.sites) > 0 || Number(u.open) > 0) seen.push('the NAT table showed its connections');
+      if (Number(u.blocked) > 0 || Number(u.blocked_in) > 0) seen.push('the gateway’s firewall dropped its packets');
+      if (u.scan_seen || mac) seen.push('it answered the LAN scan' + (mac ? ' from ' + mac : ''));
+      return 'No Device List read of this period names it' + (seen.length ? ', yet ' + seen.map((x, i) => (i ? (i === seen.length - 1 ? ' and ' : ', ') : '') + x).join('') : '') + '.';
+    }
+
+    /** unknownTable lists the LAN addresses no Device List read names (model.NetUnknownAddr), those
+     *  the find box matches, the most recently seen first (as the service lists them, at most as
+     *  many as an answer holds: the foot says so when there are more): when they were seen, their
+     *  connections and blocked packets, their issue in words, and links to their connections and
+     *  syslog messages. */
+    function unknownTable(f) {
+      const all = netList(view.unknown);
+      // As the devices are found: an address, or its MAC address in any notation.
+      const list = all.filter((u) => devMatches({ ipv4: u.addr, mac: u.mac }, f));
+      const total = Math.max(all.length, Math.floor(Number(view.totals && view.totals.unknown)) || 0);
+      const foot = total > all.length ? h('p', { class: 'card-foot' }, 'The ' + fmtInt(all.length) + ' most recently seen of the ' + fmtInt(total) + ' unknown addresses.') : null;
+      if (!list.length) return [emptyNote(all.length ? 'No unknown address matches.' : 'Every LAN address seen in this period is in the Device List.'), foot];
+      const p = o.period();
+      const nat = natKnown();
+      const cols = [{ label: 'Address' }, { label: 'First seen', num: true }, { label: 'Last seen', num: true }, { label: 'Open', num: true },
+        { label: 'Sites', num: true }, { label: 'Blocked out/in', num: true }, { label: 'Issue' }];
+      const rows = list.map((u) => {
+        const addr = String(u.addr == null ? '' : u.addr);
+        const key = 'addr:' + addr;
+        // The address is the button that opens its details; a click elsewhere on the row does too.
+        const btn = h('button', { type: 'button', class: 'link-btn unk-open', 'aria-haspopup': 'dialog', 'data-key': key, 'data-fk': 'net-unk:open:' + addr },
+          h('span', { class: 'mono' }, netShown(addr || '?', 40)));
+        btn.addEventListener('click', () => openDevice(key, btn));
+        const links = [Number(u.sites) > 0 || Number(u.open) > 0 ? h('a', { href: netHash('connections', p, 'ip:' + addr), 'data-fk': 'net-unk:conn:' + addr }, 'Connections') : null,
+          Number(u.blocked) > 0 || Number(u.blocked_in) > 0 ? h('a', { href: netHash('firewall', p, ''), 'data-fk': 'net-unk:fw:' + addr }, 'Firewall') : null,
+          addr ? h('a', { href: devSyslogHash(addr, p), 'data-fk': 'net-unk:syslog:' + addr }, 'Syslog') : null].filter(Boolean);
+        // One element a cell: stacked on a narrow screen, each cell is a label and one value.
+        const tr = tableRow(cols, [h('span', null, btn, u.mac ? h('span', { class: 'sub small muted mono', title: 'The MAC address that answered for it in the LAN scan' },
+          netShown(u.mac, 40)) : null, links.length ? h('span', { class: 'sub small dev-unk-links' }, links.map((a, i) => [i ? ' · ' : '', a])) : null),
+        netTimeEl(u.first), netTimeEl(u.last), nat ? fmtInt(u.open) : natUnknown(), nat ? fmtInt(u.sites) : natUnknown(),
+        h('span', null, fmtInt(u.blocked), h('span', { class: 'muted' }, ' / '), fmtInt(u.blocked_in)),
+        h('span', null, devIssues(u).map((x) => h('span', { class: 'dev-unk-issue' }, devIssueChip(x), x.text ? h('span', { class: 'sub small muted' }, netShown(x.text, 400)) : null)))],
+        { stack: true });
+        tr.classList.add('unk-row');
+        tr.addEventListener('click', (ev) => rowClick(ev, tr, () => openDevice(key, btn)));
+        return tr;
+      });
+      return [h('div', { class: 'table-scroll' }, h('table', { class: 'tbl compact stack-narrow net-unk' },
+        h('thead', null, h('tr', null, cols.map((c) => h('th', { scope: 'col', class: c.num ? 'num' : null }, c.label)))), h('tbody', null, rows))), foot];
+    }
+
+    /** rowClick opens a row's details (open) on a click that is not on a link or a button of the
+     *  row, nor one that selected text in it to copy. */
+    function rowClick(ev, tr, open) {
+      const t = ev.target;
+      if (t && typeof t.closest === 'function' && t.closest('a, button')) return;
+      const sel = typeof window.getSelection === 'function' ? window.getSelection() : null;
+      if (sel && !sel.isCollapsed && tr.contains(sel.anchorNode)) return;
+      open();
+    }
+
+    /** natKnown reports whether the period's open connections and sites are known: the answer counts
+     *  the period's NAT reads (nat_reads; a service that does not count them is taken to know). */
+    function natKnown() {
+      return !(view && view.nat_reads != null && Number(view.nat_reads) === 0);
+    }
+
+    /** natUnknown stands for a figure of the NAT table when it was not read in the period. */
+    function natUnknown() {
+      return h('span', { class: 'muted', title: 'Not known: the NAT table was not read in this period' }, '—');
+    }
+
+    /** fillTiles counts the devices listed (on and off), how they are connected, those with
+     *  issues (and the unknown addresses with one) and the unknown addresses: the server's totals,
+     *  the lists' own counts where it gives none. */
+    function fillTiles() {
+      const t = view.totals && typeof view.totals === 'object' ? view.totals : {};
+      const num = (v, d) => (v != null && isFinite(Number(v)) ? Number(v) : d);
+      const unknown = netList(view.unknown);
+      const listed = num(t.listed, devices.length);
+      const online = num(t.online, devices.filter((d) => devState(d) === 'on').length);
+      const wifi = num(t.wifi, devices.filter(devIsWiFi).length);
+      const wired = num(t.wired, devices.filter((d) => /^ethernet/i.test(String(d.connection || ''))).length);
+      const both = devices.concat(unknown);
+      const crit = both.filter((x) => devRank(x) === 2).length;
+      // What the total is made of: devices, and unknown addresses - also those beyond the ones
+      // listed (an answer holds at most so many), each with the warning "unlisted", as the server's
+      // total counts them.
+      const devIssuesN = devices.filter((x) => devRank(x) > 0).length;
+      const unkIssuesN = unknown.filter((x) => devRank(x) > 0).length + Math.max(0, num(t.unknown, unknown.length) - unknown.length);
+      const other = Math.max(0, listed - wifi - wired);
+      replace(tiles, h('div', { class: 'tiles net-tiles' },
+        netTile('Devices listed', fmtInt(listed), fmtInt(online) + ' on, ' + fmtInt(Math.max(0, listed - online)) + ' off'),
+        netTile('Wi-Fi / Ethernet', fmtInt(wifi) + ' / ' + fmtInt(wired), 'of the devices listed' + (other ? ', ' + fmtInt(other) + ' otherwise' : '')),
+        netTile('With issues', fmtInt(num(t.issues, devIssuesN + unkIssuesN)), devIssuesN || unkIssuesN
+          ? [fmtInt(devIssuesN) + ' device' + (devIssuesN === 1 ? '' : 's') + (unkIssuesN ? ' and ' + fmtInt(unkIssuesN) + ' unknown address' + (unkIssuesN === 1 ? '' : 'es') : ''),
+            crit ? fmtInt(crit) + ' critical' : ''].filter(Boolean).join(' · ')
+          : 'nothing to look at'),
+        netTile('Unknown addresses', fmtInt(num(t.unknown, unknown.length)), 'seen, but not in the Device List')));
+    }
+
+    return {
+      parts: [tiles, card, unknownCard],
+      /** update shows a new answer (the period's; ns: GET /api/network/status read with it), and
+       *  the details open follow it. */
+      update(d, ns) {
+        view = d;
+        netStat = ns && typeof ns === 'object' ? ns : null;
+        goodAt = new Date();
+        devices = netList(d.devices);
+        byKey = new Map(devices.filter((x) => x.key != null && x.key !== '').map((x) => [String(x.key), x]));
+        unknowns = new Map(netList(d.unknown).filter((u) => typeof u.addr === 'string' && u.addr !== '').map((u) => [u.addr, u]));
+        fillTiles();
+        render(false);
+        if (modal.cur) paint(modal.cur);
+        if (pending) {
+          const key = pending;
+          pending = null;
+          if (byKey.has(key) || unknownOf(key)) modal.open(key, 'address');
+          else showMissing(key);
+        }
+      },
+      /** sync follows the address (the route's onQuery): the details it names, once the devices are read. */
+      sync(q) {
+        if (!view) {
+          pending = q.get('detail');
+          return true;
+        }
+        const key = q.get('detail');
+        if (key && !byKey.has(key) && !unknownOf(key)) showMissing(key);
+        return modal.sync(q);
+      },
+      /** stale says in the details open that the newest refresh failed (err). */
+      stale(err) {
+        const e = modal.cur;
+        if (!e || e.staleNote) return;
+        const since = goodAt ? 'not updated since ' + F.time.format(goodAt) : 'not read yet';
+        replace(e.context, e.contextText ? e.contextText + ' · ' + since : capitalize(since));
+        e.staleNote = notice('critical', h('strong', null, capitalize(since) + ': '), sentence(capitalize((err && err.message) || 'the devices could not be read')),
+          ' What these details show may be out of date.');
+        e.staleNote.classList.add('detail-stale');
+        e.titles.append(e.staleNote);
+      },
+      /** onStatus follows the monitor's status: the line of the newest LAN scan says when the next is due. */
+      onStatus() {
+        if (view) replace(scanLine, scanWords());
+      },
+      find: () => find.value.trim(),
+      /** key is the device whose details are open - or that the address names, before the devices are read. */
+      get key() { return modal.key || pending || ''; },
     };
   }
 

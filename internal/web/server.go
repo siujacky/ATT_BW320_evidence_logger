@@ -113,10 +113,12 @@ type Options struct {
 	SyslogReader  contracts.SyslogReader
 	SyslogControl contracts.SyslogControl
 	LiveTraffic   contracts.LiveTrafficSource
-	// Network builds the dashboard's Network page (GET /api/network/connections, /firewall and
-	// /status, docs/syslog-map-graphic.md): which device talked to which remote address, from the
-	// gateway's NAT table, and what the gateway's firewall dropped, from the syslog store. None of
-	// it is evidence; the samplers' state comes from Status.
+	// Network builds the dashboard's Network page (GET /api/network/connections, /firewall,
+	// /devices, /device and /status, docs/syslog-map-graphic.md, docs/dhcp-table.md): which device
+	// talked to which remote address, from the gateway's NAT table, what the gateway's firewall
+	// dropped, from the syslog store, and the gateway's Device List with each device's details (its
+	// syslog messages from SyslogReader). None of it is evidence; the samplers' state comes from
+	// Status.
 	Network contracts.NetworkView
 	Version string // shown in the dashboard footer ("" = "dev")
 	Logger  *slog.Logger
@@ -539,6 +541,8 @@ func (s *Server) routes() http.Handler {
 	rt.handle(http.MethodGet, "/api/traffic/live", s.handleLiveTraffic)
 	rt.handle(http.MethodGet, "/api/network/connections", s.handleNetworkConnections)
 	rt.handle(http.MethodGet, "/api/network/firewall", s.handleNetworkFirewall)
+	rt.handle(http.MethodGet, "/api/network/devices", s.handleNetworkDevices)
+	rt.handle(http.MethodGet, "/api/network/device", s.handleNetworkDevice)
 	rt.handle(http.MethodGet, "/api/network/status", s.handleNetworkStatus)
 	rt.handle(http.MethodGet, "/api/blobs/{id}", s.handleBlob)
 	rt.handle(http.MethodGet, "/api/blobs/{id}/view", s.handleBlobView)

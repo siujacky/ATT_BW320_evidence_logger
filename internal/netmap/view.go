@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"time"
 
 	"attmonitor/internal/contracts"
@@ -68,6 +69,11 @@ type bounds struct {
 	// flows bounds the flows a connections view names and draws: the heaviest ones; the others
 	// count in the totals and as "Other".
 	flows int
+	// lans bounds the LAN addresses that no Device List read names whose dropped packets a Devices
+	// view counts (each could be an unknown device: a home network has a few dozen addresses, a
+	// host that forges its source addresses millions); the packets of those beyond are left out
+	// of the unknown addresses. The devices' own addresses are always counted.
+	lans int
 }
 
 // defaultBounds keep a request's sums within a few tens of MiB.
@@ -79,17 +85,25 @@ var defaultBounds = bounds{
 	chunkRows:  16_384,
 	chunkHours: 1024,
 	flows:      50_000,
+	lans:       4096,
 }
 
 // Options configures New. Conns, Intel and Syslog may each be nil: without the connection store
-// Connections fails, without the syslog store Firewall fails (both with an error wrapping
-// contracts.ErrUnavailable), and without the IP database addresses are classified (public,
-// private, ...) but get no organisation or country, and ports no service name.
+// Connections and Devices fail, without the syslog store Firewall fails (each with an error
+// wrapping contracts.ErrUnavailable) and Devices counts no dropped packet, and without the IP
+// database addresses are classified (public, private, ...) but get no organisation or country,
+// and ports no service name.
 type Options struct {
 	Conns  contracts.ConnStore
 	Intel  contracts.IPIntel
 	Syslog contracts.SyslogChunkSource
-	Logger *slog.Logger
+	// Scans are the LAN scans kept (docs/dhcp-table.md §6; nil: none - the Devices tab then has no
+	// scan figures).
+	Scans contracts.ScanStore
+	// Gateway is the gateway's own address on the home network (gateway.host; the zero Addr when
+	// not known): a LAN scan's answer from it is the gateway's, never an unknown address.
+	Gateway netip.Addr
+	Logger  *slog.Logger
 	// Now is the clock (default time.Now): the end of a request without one, and the age of
 	// the views kept for reuse.
 	Now func() time.Time
@@ -104,17 +118,33 @@ type Options struct {
 
 // View builds the Network page (contracts.NetworkView). It is safe for concurrent use.
 type View struct {
-	conns  contracts.ConnStore
-	intel  contracts.IPIntel
-	syslog contracts.SyslogChunkSource
-	log    *slog.Logger
-	now    func() time.Time
+	conns   contracts.ConnStore
+	intel   contracts.IPIntel
+	syslog  contracts.SyslogChunkSource
+	scans   contracts.ScanStore
+	gateway netip.Addr // Options.Gateway (unmapped, without zone; the zero Addr when not known)
+	log     *slog.Logger
+	now     func() time.Time
 
 	connResults *resultCache[model.NetConnections]
 	fwResults   *resultCache[model.NetFirewall]
+	// devResults keeps the Devices views built, with what a device's details need (devBuild): the
+	// details of a device reuse the view built for its period.
+	devResults *resultCache[*devBuild]
 
 	// bounds is defaultBounds (tests lower it).
 	bounds bounds
+
+	// devSlot lets one Devices view be built at a time: it reads the period's Device List reads,
+	// then takes the connections slot for the NAT samples and the firewall slot for the syslog,
+	// one after the other (never both: no build waits for a slot while holding the other). It also
+	// guards devWarned.
+	devSlot chan struct{}
+	// devWarned notes the problems of a Devices view's sources that were logged already: the
+	// Device List reads of the period could not be read (history), the NAT samples could not be
+	// added up (nat), the LAN scans could not be read (scans). Each is logged again once its source
+	// works again.
+	devWarned struct{ history, nat, scans bool }
 
 	// connSlot lets one connections view be built at a time: each build adds up a period's NAT
 	// samples, seconds of CPU and up to hundreds of MiB for a month - work that requests side by
@@ -152,11 +182,15 @@ func New(o Options) *View {
 		conns:       o.Conns,
 		intel:       o.Intel,
 		syslog:      o.Syslog,
+		scans:       o.Scans,
+		gateway:     o.Gateway.Unmap().WithZone(""),
 		log:         o.Logger,
 		now:         o.Now,
 		connResults: newResultCache[model.NetConnections](o.ResultTTL, o.Now),
 		fwResults:   newResultCache[model.NetFirewall](o.ResultTTL, o.Now),
+		devResults:  newResultCache[*devBuild](o.ResultTTL, o.Now),
 		bounds:      defaultBounds,
+		devSlot:     make(chan struct{}, 1),
 		connSlot:    make(chan struct{}, 1),
 		fwSlot:      make(chan struct{}, 1),
 		chunks:      newChunkCache(o.CacheBytes, o.CacheChunks),
@@ -225,6 +259,11 @@ func (v *View) releaseFW() { <-v.fwSlot }
 func (v *View) acquireConn(ctx context.Context) error { return acquire(ctx, v.connSlot) }
 
 func (v *View) releaseConn() { <-v.connSlot }
+
+// acquireDev waits for the Devices slot (or for ctx to end).
+func (v *View) acquireDev(ctx context.Context) error { return acquire(ctx, v.devSlot) }
+
+func (v *View) releaseDev() { <-v.devSlot }
 
 // acquire waits for a place in slot (or for ctx to end).
 func acquire(ctx context.Context, slot chan struct{}) error {

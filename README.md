@@ -371,6 +371,39 @@ last hour, 24 hours, 7 or 30 days, or a custom period of up to 31 days):
   most probed service); the blocked packets **per hour**; a **world map** of where the probes came
   from; the most probed services, the most active sources, the reasons the gateway gives, and the
   devices whose outbound packets it blocked, with their destinations.
+* **Devices**: the gateway's **DHCP table** - which device has which address - so that an address
+  seen anywhere (in the syslog, the firewall, a connection) can be tied to its device, and a device
+  with a problem stands out. Every device the gateway's Device List shows, with its status, name,
+  IPv4 address, MAC address, connection (Ethernet port, or Wi-Fi band with its signal in bars),
+  allocation (DHCP or static), when it was last seen on, its connections open now and the sites it
+  reached, and the packets the firewall dropped from it and on their way to it. Each device's
+  **issues** are named in plain words: an address another device claims too (an address conflict,
+  critical), a weak Wi-Fi signal (1 or 2 bars), a wired link at 10 Mb/s or at half duplex, 100 or more
+  of its packets dropped by the firewall per day of the period (at least 100 in a shorter one), an
+  address that changed in the period, and a
+  device that is off (since when it was last seen on). Below it the **unknown addresses**: addresses
+  of the home network that the NAT table or the firewall show but that no Device List read of the
+  period names. A find box takes a name, an IP or a MAC address: for an IPv4 address it says which
+  device holds it now and which held it before in the period, from when to when. A row opens the
+  device's details.
+* **The sweeps in the DHCP table** (the LAN scan, below): a line for the newest sweep of the period
+  and a **Scan** column - when each device last answered, and where when not at the address the
+  gateway lists. The sweep adds three issues when it was made within an hour of the newest Device
+  List read: a device the gateway shows on that did not answer it (info: a device that sleeps may not
+  answer), a device's address answered by another MAC address (warning: two devices on one address,
+  or a list out of date - it names the other device, or says that no read names it), and a device
+  that answered at another address than the gateway lists (info). An address that answered a sweep
+  with a MAC address no Device List read of the period names is an unknown address too (perhaps a
+  device with a fixed address), with that MAC address; the gateway's own answer is not.
+* **A device's details** (a row of the DHCP table, or of the unknown addresses): who it is, what the
+  period says about it and its issues; the addresses it held and who else held them, and when; the
+  latest sweeps and whether it answered them; its connections and blocked packets; and its **syslog
+  messages**, newest first: the gateway's messages of the period that name its IPv4 address while it
+  held it (from a Device List interval before the first read that showed it with the address to one
+  after the last - an address names other devices at other times), its IPv6 addresses or its MAC
+  address (in either notation, also in the firewall's MAC field). An address is only found whole:
+  192.168.1.7 is never found in 192.168.1.70. A message that names the device only by its name is
+  not found.
 
 Every chart has a table view, and the page is read again every minute while it is open.
 
@@ -396,9 +429,25 @@ Every chart has a table view, and the page is read again every minute while it i
   for an hour when the gateway rejects the access code. Without a stored access code the NAT table
   is not read (the rest of the page still works).
 * **The gateway's Device List** (Device → Device List, no login), every 15 minutes: the devices'
-  names, addresses and MAC addresses, which name the NAT table's addresses. A device keeps its name
-  when its address changes, and a device that has just joined is named after the next Device List
-  read.
+  names, addresses and MAC addresses, which name the NAT table's addresses, their status, allocation,
+  connection, link speed and Wi-Fi signal bars - the Devices tab's DHCP table, whose address history
+  comes from the reads kept. A device keeps its name when its address changes, and a device that has
+  just joined is named after the next Device List read.
+* **A sweep of the home network** (the LAN scan), every hour: the service asks every address of this
+  PC's own network - that of its adapter that holds the gateway's address, such as 192.168.1.0/24 -
+  by ARP who has it ("who has 192.168.1.64?"), once, through Windows' SendARP: no administrator
+  rights, nothing leaves the home network, and nothing else is sent to the devices (no ping, no
+  port). The Device List is the gateway's own view; the sweep asks the network itself, so it shows
+  what the list does not: a device with a fixed address that the gateway does not list, a device the
+  gateway shows on that does not answer, an address answered by another MAC address than the gateway
+  lists (two devices on one address, or a list out of date). Only a private network (RFC 1918) of at
+  most 1,024 addresses (a /22) is swept, 32 questions at a time, for 2 minutes at most (a /24 takes
+  about half a minute: an address nobody holds is given a few seconds to answer); this PC's own
+  address is listed with its adapter's MAC address. The first sweep comes a few minutes after the
+  start, after the first Device List read, and none is made while the gateway is needed for evidence
+  (during an outage, after a failed measurement cycle, while the gateway does not answer): the sweep
+  is made once that ends. `connections.scan_interval` sets how often (15 minutes to 24 hours; `0`:
+  no sweeps).
 * **The gateway's syslog** (see [The gateway's syslog](#the-gateways-syslog)): at its most detailed
   level (Notice) the BGW320 logs the packets its firewall drops. The page counts them by direction,
   source, target and reason; a "repeated N times" line counts N more.
@@ -415,7 +464,14 @@ devices and as "Other", and the page says so. The syslog shows only what
 the firewall drops, never the connections it allows. Countries are where the networks are registered,
 not where a server stands (a CDN's server is often much nearer). The gateway does not log the names
 devices look up, so sites are shown by address, organisation and reverse DNS name, not by the web
-address typed.
+address typed. The Devices tab cannot show DHCP **lease times**: the Device List does not show them,
+and the gateway's DHCP Server page is behind its login, which the monitor does not use for it. It
+sees addresses as the Device List shows them every 15 minutes (an address a device held only between
+two reads is not seen), and Wi-Fi signals as the bars the gateway draws (no dBm).
+A sweep sees the devices that answer ARP when it asks: a device that sleeps (a phone with its screen
+off) may not answer, and Windows answers a question from this PC's own ARP cache when that holds the
+address already (a device heard from moments before). A sweep covers only this PC's own network: no
+other network, and no IPv6 address.
 
 **Privacy.**
 
@@ -424,6 +480,9 @@ address typed.
   shown only on the dashboard (and by `att-monitor network`).
 * Connection samples are kept for `connections.keep_days` (30 days) within `connections.keep_mb`
   (200 MiB); older days are deleted - every hour, also while sampling is off.
+* The sweeps of the home network are kept with them, by the same limits:
+  `connections\scan-YYYY-MM-DD.jsonl`, each sweep with the addresses that answered and their MAC
+  addresses (gzipped once the day is over).
 * For checking the parsers against your gateway's firmware, the service keeps a copy of the NAT table
   page and of the Device List page it read (`connections\last-nattable.html`,
   `connections\last-devices.html`: the first page read after each start, and pages it did not
@@ -450,11 +509,15 @@ From the command line, through the running service:
 att-monitor network                               # the last 24 hours: devices, organisations, countries, connections
 att-monitor network --range 7d --device mac:00:00:5e:00:53:01   # one device's connections (keys are listed)
 att-monitor network --firewall --range 1h         # what the gateway's firewall dropped in the last hour
+att-monitor network --devices                     # the DHCP table: which device has which address, and its issues
+att-monitor network --devices --key 00:00:5e:00:53:01   # one device's details and its syslog messages (--addr: an unknown address)
+att-monitor scan                                  # sweep the home network once, now: which addresses answer (stores nothing)
 att-monitor network --from 2026-10-01 --to 2026-10-03 --limit 100 --json
 ```
 
 To stop the sampling, set `connections.enabled` to `false` in `config.json` and restart the service:
-what was recorded stays on the page until the retention limits delete it.
+what was recorded stays on the page until the retention limits delete it. To stop only the sweeps of
+the home network, set `connections.scan_interval` to `0`.
 
 ## Dashboard
 
@@ -476,7 +539,8 @@ what was recorded stays on the page until the retention limits delete it.
   and a severity filter, each linked to the ledger record of its chunk (a very long message is
   shortened in the list; *Exact datagram* under it shows all of it); the space the syslog store uses
   and how much of it to keep.
-* **Network**: which device talks to which site, and what the gateway's firewall blocks (see
+* **Network**: which device talks to which site, what the gateway's firewall blocks, and the
+  gateway's DHCP table - which device has which address, and which device has an issue (see
   [Network page](#network-page-which-device-talks-to-which-site)); not evidence.
 * **Evidence**: ledger head, key fingerprint, time-stamps, *Verify now*, exports and operator notes
   (for example "Called AT&T, ticket 12345").
@@ -634,8 +698,13 @@ att-monitor syslog [--since 24h] [--grep TEXT] [--severity LEVEL] [--limit N] [-
 att-monitor syslog retention [--keep-mb N] [--keep-days D] [--yes]
                                                   how much syslog is kept: shows it, or changes it
 att-monitor network [--range 1h|24h|7d|30d | --from TIME --to TIME] [--device KEY] [--firewall]
-                    [--limit N] [--json]          the Network page in short (through the service): which
-                                                  device talked to which site, or what the firewall dropped
+                    [--devices [--key KEY | --addr ADDRESS]] [--limit N] [--json]
+                                                  the Network page in short (through the service): which
+                                                  device talked to which site, what the firewall dropped,
+                                                  or the DHCP table (which device has which address),
+                                                  or one device's details and syslog messages
+att-monitor scan [--json]                         sweep the home network once by ARP, now: which addresses
+                                                  answer, with their MAC addresses and names (stores nothing)
 att-monitor verify [--json]                       verify the whole ledger
 att-monitor verify-bundle FILE.zip [--expect-fingerprint FP] [--json]
 att-monitor export --from TIME --to TIME | --incident ID [--prepared-by NAME] [--notes TEXT] [--out DIR]
@@ -658,9 +727,24 @@ states the chunk's SHA-256.
 `7d`, `30d`) or `--from`/`--to` (TIME as above; a date-only `--to` without `--from` is that day alone;
 at most 31 days of 24 hours, so 31 whole days that include the change back from summer time are an
 hour too long) say otherwise; `--device` takes a device key as the list of devices shows it (`mac:…`,
-`ip:…`, `gateway`); `--limit` (20 unless given, at most 1000) is how many connections (with
-`--firewall`: blocked outbound destinations) are listed; `--json` prints the service's answer. It
-needs the running service.
+`ip:…`, `gateway`); `--firewall` shows what the firewall dropped instead, `--devices` the Devices tab:
+every device of the gateway's DHCP table with its status, addresses, connection, open connections,
+sites and blocked packets, its issues in words, and the addresses no Device List read names;
+`--limit` (20 unless given, at most 1000) is how many connections (with `--firewall`: blocked
+outbound destinations; with `--devices`: unknown addresses) are listed; `--json` prints the service's
+answer. It needs the running service. With `--devices`, the DHCP table shows how each device
+answered the sweeps of the home network (SCAN), and `--key` - a device's MAC address, or its key as
+`--json` lists it (`mac:…`, `ip:…` for an entry without a MAC address, `name:…`) - prints that
+device's details instead: what the period says about it, its issues, who held its addresses, the
+latest sweeps, what its syslog messages are found by and those messages, newest first (`--limit` of
+them, at most 500); `--addr` does the same for an unknown address.
+`scan` sweeps the home network once, now, as the service does every `connections.scan_interval`
+(see [Network page](#network-page-which-device-talks-to-which-site)), and lists the addresses that
+answered in address order with their MAC addresses and - when the service runs - the names its newest
+Device List read gives them, with a note for this PC, the gateway, a device the Device List does not
+name, one it lists at another address, and an address it gives to another device. `--json` prints the
+sweep itself. It stores nothing and needs no administrator rights; without the service it lists the
+addresses without names.
 
 ## Configuration
 
@@ -687,13 +771,15 @@ after editing it. Main settings:
 | `syslog.keep_mb` / `keep_days` | `100` / `0` | keep at most this many MiB of syslog (1 to 1,048,576) and, above 0, nothing older than this many days |
 | `connections.enabled` | `true` | sample the gateway's NAT table and Device List for the Network page (not evidence) |
 | `connections.interval` / `devices_interval` | `4m` / `15m` | how often the NAT table (2 to 4 min: a longer interval would need a gateway login for every read; needs the access code) and the Device List (5 min to 24 h) are read |
+| `connections.scan_interval` | `1h` | how often the home network is swept by ARP for the Devices tab (15 min to 24 h; `0`: no sweeps) |
 | `connections.keep_days` / `keep_mb` | `30` / `200` | keep the samples this many days (1 to 3650), within this many MiB (10 to 1,048,576) |
 | `connections.reverse_dns` | `true` | look up the reverse DNS names of the remote addresses shown, through this PC's resolver |
 | `geo.enabled` | `true` | name the remote addresses' organisations and countries with the offline IPtoASN database |
 | `geo.download` / `url_v4` / `url_v6` / `refresh` | `true` / iptoasn.com's files / `168h` | download the database (https only, no credentials, query or fragment: the configuration is recorded in the ledger) and look for a newer one every 7 days (1 to 90 days); `false`: use the files placed in `geo\` by hand |
 
 A `connections` or `geo` value outside its range, or one that cannot be read, never stops the
-service: it is replaced (0 or less by the default, a value beyond a limit by that limit, a URL that is
+service: it is replaced (0 or less by the default - but `connections.scan_interval` `0` means no
+sweeps -, a value beyond a limit by that limit, a URL that is
 not https or carries credentials (a user name or password), a query or a fragment by the default
 URL, a switch that is not `true` or `false` by off), and the replacement is logged in
 `logs\service.log`, reported in the Network page's status (`/api/network/status`) and shown by
@@ -736,6 +822,9 @@ order mark is accepted).
   none sooner than a minute after the previous attempt, also across restarts) and its Device List
   (no login) every 15 minutes. While the Overview's Traffic card or its details are on screen, the flow meter reads the gateway's Broadband Status
   page at most every 5 seconds.
+* On the home network itself: one ARP question to each address of this PC's own network once an hour
+  (the LAN scan, `connections.scan_interval`; `0` stops it), never while the gateway is needed for
+  evidence. ARP stays within the home network, and nothing else is sent to the devices.
 
 ## Development
 
@@ -750,12 +839,13 @@ internal/mongostore MongoDB copy and its verifier   internal/web        dashboar
 internal/syslogrx   syslog receiver (UDP)           internal/syslogstore syslog chunks within a size limit
 internal/connstore  Network page: NAT samples       internal/ipintel    Network page: IP database, ports, PTR
 internal/netmap     Network page: the views         internal/winsvc     service control, ACLs
-internal/sysinfo    host and software identity
+internal/sysinfo    host and software identity     internal/lanscan    Network page: sweeps of the LAN by ARP
 ```
 
 ```powershell
 go test ./...                                     # unit tests (no network, no gateway)
 $env:ATTMON_MONGO = "1"; go test ./internal/mongostore/   # live tests against a local MongoDB (throwaway database)
+$env:ATTMON_LIVE_SCAN = "1"; go test -run TestLiveScan ./internal/lanscan/   # one real sweep of the home network (prints counts only)
 .\scripts\e2e.ps1                                 # end-to-end run in a temporary data folder
 ```
 
